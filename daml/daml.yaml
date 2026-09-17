@@ -1,0 +1,12 @@
+sdk-version: 3.5.1
+name: insurance-tokenization-v21
+version: 1.0.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+# No --target override: this project targets Canton 3.4.x / Protocol Version
+# 34 LocalNet bundles, which only understand Daml-LF up to 2.2. PolicyToken
+# previously carried a (insurer, policyId) contract key, which requires LF
+# 2.3 / PV35 -- removed for that reason. Re-add --target=2.3 + the key if
+# you're deploying to a PV35 network instead.

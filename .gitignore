@@ -1,0 +1,51 @@
+# ---------------------------------------------------------------------------
+# Secrets. node/.env holds DAML_PACKAGE_ID, the database password
+# (DATABASE_URL, TEST_DATABASE_URL) and the LocalNet JWT secret
+# (DAML_UNSAFE_JWT_SECRET) or a ledger token (DAML_LEDGER_TOKEN). .env.example is the tracked template
+# and is deliberately NOT excluded by these rules.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------------------
+# Dependencies. package-lock.json IS tracked -- it is what makes an install
+# reproducible.
+# ---------------------------------------------------------------------------
+node_modules/
+
+# ---------------------------------------------------------------------------
+# Daml build output. `.daml/` (with the leading dot) is dpm's build directory;
+# it vendors a full copy of daml-script's and this project's own sources, so
+# it is large, entirely regenerable by `dpm build --all`, and would otherwise
+# bury the three real .daml source files. The source directories `daml/` and
+# `daml-tests/` are NOT matched by this pattern.
+#
+# DARs are build artifacts too, and a stale one committed alongside a changed
+# source is worse than no DAR at all -- the package id is read from the DAR's
+# own manifest, so a wrong one is actively misleading.
+# ---------------------------------------------------------------------------
+.daml/
+*.dar
+
+# ---------------------------------------------------------------------------
+# Scratch and throwaway work. Every package migration in
+# the project's history produced one-off enumeration/archive/verification
+# scripts; the convention is a leading underscore in node/, and they are
+# deliberately not kept -- what they did is the part worth keeping, not the
+# scripts themselves.
+# docs/m*-live-run.txt is rewritten by every verify-all run, and the evidence
+# worth keeping from those runs is recorded in a document outside this copy.
+# ---------------------------------------------------------------------------
+_*.mjs
+_*.js
+scratch-*
+*.log
+docs/m*-live-run.txt
+
+# ---------------------------------------------------------------------------
+# OS noise
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,390 @@
+module Insurance.Types where
+
+-- One row of the parametric payout matrix (Module 2). Bounds are inclusive;
+-- None means unbounded on that side. Confirm inclusive/exclusive boundary
+-- semantics with underwriting before relying on exact-threshold behavior --
+-- this is a real money question at the boundary, not just a style choice.
+data PayoutTier = PayoutTier
+  with
+    tierOrder : Int
+    label     : Text
+    minValue  : Optional Decimal
+    maxValue  : Optional Decimal
+    payoutPct : Decimal
+  deriving (Eq, Show)
+
+-- Shared lifecycle vocabulary -- SQL's policy_status enum (sql/schema.sql)
+-- must use the same states, spelled with the same words (Daml constructor
+-- casing aside -- Daml constructors can't be lowercase). SQL additionally
+-- has a 'pending_mint' state with no entry here, because a state before a
+-- token exists has nothing on-chain to hold a status field in the first
+-- place.
+--
+-- Stage 3 Part 3: this type is now CLAIM/TERM state only. The
+-- premium-default states that used to live here (PS_GracePeriod,
+-- PS_Suspended) moved to DefaultState below, because they are a second,
+-- orthogonal axis -- see that type's comment for the defect that proved
+-- it. PS_Cancelled and PS_ManualReview stay here: cancellation is a
+-- terminal claim/term outcome, not a default state, and manual review is
+-- an operational halt on the claim side.
+data PolicyStatus
+  = PS_Active
+  | PS_PartiallyPaid
+  | PS_Expired
+  | PS_Cancelled
+  | PS_ClaimedAndClosed
+  | PS_ManualReview
+  deriving (Eq, Show)
+
+-- Stage 3 Part 3: the premium-default axis, deliberately separate from
+-- PolicyStatus above. These two are orthogonal -- a policy can be
+-- partially paid AND in its grace period at the same time, and one field
+-- cannot express that.
+--
+-- This is not a theoretical tidy-up. With both packed into one field, a
+-- payout during the grace period re-minted with status = PS_PartiallyPaid
+-- and thereby ERASED the grace period: graceSweeper.js (which filtered on
+-- that same field) never saw the policy again, so it was never suspended
+-- even though the premium was still unpaid, and the notice index blocked
+-- serving a second notice to recover. Found in live verification at the
+-- end of Stage 3 Part 2, fixed here by splitting the axes rather than by
+-- special-casing the trigger.
+--
+-- Movement on the two axes is fully independent: a payout changes
+-- PolicyStatus and never touches DefaultState; serving notice, terminating,
+-- and reinstating change DefaultState and never touch PolicyStatus.
+--
+-- Stage 4 (termination): DS_Suspended is GONE, and its removal is the whole
+-- point of this round. The implemented model had the contract survive the
+-- notice period with coverage merely stopped, which conflicts with TTK 6102
+-- m. 1434(3): at the end of the notice period the contract is
+-- `feshedilmiş olur` -- deemed terminated. That is a consequence, not a
+-- power the insurer may choose to exercise, there is no suspension state in
+-- the paragraph, and m. 1452(3) makes m. 1434 non-derogable against the
+-- insured, so the general conditions cannot introduce one either.
+--
+-- DS_Terminated therefore means the contract has ENDED. It does not mean
+-- the token is gone: the token stays live until every payout raised on the
+-- policy has reached a terminal state, because termination must not orphan
+-- an obligation the insurer still owes (see PolicyToken_Terminate and
+-- PolicyToken_ArchiveForNonPayment).
+data DefaultState
+  = DS_None          -- no notice outstanding; premium not in default
+  -- m. 1434(3), the SUBSEQUENT-premium mechanism: notice, ten days, fesih.
+  | DS_GracePeriod   -- notice served; coverage CONTINUES IN FULL, losses payable
+  | DS_Terminated    -- notice period elapsed unpaid; contract ended (m. 1434(3))
+  -- m. 1434(2), the FIRST-premium mechanism. A different mechanism with
+  -- different consequences, deliberately given its own vocabulary rather than
+  -- folded into the two above: no ihtar, no ten days, no service date, and
+  -- cayma rather than fesih. The two must not be conflated.
+  | DS_FirstPremiumUnpaid
+      -- The insurer has reported a due date for a first instalment (or a
+      -- premium payable in one sum) that has not been paid. m. 1431(1) puts
+      -- that due date at contract formation against delivery of the policy --
+      -- an external fact this platform cannot observe, so it is reported.
+  -- m. 1434(4), the THIRD way a contract ends for non-payment, and it must
+  -- not be conflated with the other two. (2) is withdrawal; (3) is automatic
+  -- termination at the end of a notice period. This one is DISCRETIONARY --
+  -- "sigortaci ... sozlesmeyi FESHEDEBILIR" -- and its effect is DEFERRED:
+  -- "sigorta doneminin sonunda HUKUM DOGURMAK UZERE".
+  --
+  -- Reachable only where (3) did NOT fire, i.e. where payment arrived inside
+  -- the ten days on one or both occasions. That is what the paragraph is for:
+  -- the chronically late payer, who always pays but only after an ihtar. (3)
+  -- cannot help because the debt was cleared each time.
+  --
+  -- The deferral is the other half of the same thought. The premium for the
+  -- current period WAS paid, so ending the contract immediately would take
+  -- back cover already bought; ending it at the period end takes nothing.
+  | DS_TwoNoticeElected
+      -- The insurer has elected. The contract RUNS ON until the period end --
+      -- cover continues in full and a loss in this window is payable, exactly
+      -- as during a notice period. Nothing about the election shortens it.
+  | DS_TwoNoticeTerminated
+      -- The effect has landed at the period end. The contract has ENDED, by a
+      -- different route from DS_Terminated and recorded as such.
+  | DS_WithdrawnForFirstPremium
+      -- Withdrawn under m. 1434(2), by either path. Named for THIS cayma
+      -- specifically: Book Six carries at least two others -- m. 1430(3) (the
+      -- sigorta ettiren's own, before liability begins, against half the
+      -- premium) and m. 1439 (the insurer's, for breach of the disclosure
+      -- obligation) -- and each must be able to take its own name later
+      -- without renaming this one.
+  deriving (Eq, Show)
+
+-- WHY the insurer's liability began. m. 1421(1) makes payment the default
+-- trigger -- "Aksine sözleşme yoksa, sigortacının sorumluluğu primin veya ilk
+-- taksidinin ödenmesi ile başlar" -- but expressly allows the parties to
+-- agree otherwise, and m. 1452(3) lists 1421, so it may be varied only in the
+-- insured's FAVOUR: cover may be agreed to start earlier than payment, never
+-- later.
+--
+-- Recorded because the two cases are legally distinct even though both end in
+-- the same instant. m. 1422 (no premium earned if the risk becomes impossible
+-- before liability begins) and m. 1430(3) (the sigorta ettiren may withdraw
+-- before liability begins, against half the premium) both turn on WHETHER
+-- liability had begun; being able to reconstruct WHY it began is what lets a
+-- later reading tell an agreed early start from a payment.
+data CoverageStartBasis
+  = CSB_PremiumPaid
+      -- m. 1421(1)'s default: the insurer reported receiving the first
+      -- premium, and cover began at that reported instant.
+  | CSB_AgreedWithoutPayment
+      -- "aksine sözleşme": the parties agreed cover starts on a date
+      -- irrespective of payment. Permitted only because it is earlier than
+      -- payment would have been -- the direction m. 1452(3) allows.
+  deriving (Eq, Show)
+
+-- Which of m. 1434(2)'s two routes ended the contract. Both reach the same
+-- state; the paragraph gives them different triggers, and which one applied
+-- is a fact a later reading may turn on.
+data WithdrawalPath
+  = WP_InsurerWithdrew
+      -- Sentence 1: "sigortacı ... sözleşmeden üç ay içinde cayabilir" -- an
+      -- act, exercised within the window while payment has not been made.
+  | WP_DeemedNoEnforcement
+      -- Sentence 2: "Prim alacağının ... üç ay içinde dava veya takip yoluyla
+      -- istenmemiş olması hâlinde, sözleşmeden cayılmış olunur" -- withdrawal
+      -- follows by operation of law from inaction. Nobody exercises anything;
+      -- the sweeper observes that the window elapsed with no suit or
+      -- enforcement reported, and records it.
+  deriving (Eq, Show)
+
+-- Which route the insurer pursued against the sigorta ettiren for the premium
+-- debt, and which one then proved fruitless. Recorded rather than collapsed
+-- into one "enforcement" fact because the Code itself keeps them apart:
+-- m. 1434(2) names both -- "dava veya takip yoluyla" -- while m. 1431(4),
+-- which is what fruitlessness opens, names only "takip semeresiz kalmissa".
+-- Whether `takip` there is meant narrowly or as pursuit generally is not
+-- settled on the text, so the platform records which it actually was and
+-- leaves the question open rather than answering it by flattening.
+data EnforcementRoute
+  = ER_Takip   -- enforcement proceedings (icra takibi)
+  | ER_Dava    -- a lawsuit
+  deriving (Eq, Show)
+
+-- Stage 4: what a known real-right holder (the mortgagee) elected to do
+-- within the continuation window m. 1456(5) opens at termination. Recorded
+-- only -- the takeover itself is deliberately not implemented, so nothing
+-- in this system acts on an election beyond writing it down.
+data MortgageeElection
+  = ME_Continue   -- elected to continue the contract
+  | ME_Decline    -- elected not to
+  deriving (Eq, Show)
+
+data PayoutStatus
+  = PA_Pending
+  | PA_Confirmed
+  | PA_Failed
+  deriving (Eq, Show)
+
+-- Stage 4: why an approved indemnity legitimately never settles. These are
+-- outcomes, not failures to pay -- a failure to pay is
+-- PayoutApproved_MarkFailed, which produces a review item that is still
+-- expected to end somewhere. This enum is where a review item ends when the
+-- answer is "no money moves, and that is final".
+--
+-- Deliberately short and deliberately not a judgement: the system records
+-- which of these the insurer asserted, alongside a mandatory free-text note.
+-- It draws no legal conclusion from any of them, and none of them means the
+-- obligation was lawfully extinguished -- only that the insurer says it will
+-- not be paid and why.
+data UnpaidReason
+  = UR_Waived        -- the claimant relinquished the claim
+  | UR_Disputed      -- contested between the parties, not (yet) in court
+  | UR_Litigation    -- before a court or arbitration
+  | UR_Other         -- anything else; the free-text note carries the detail
+  deriving (Eq, Show)
+
+-- Same taxonomy as sql/schema.sql's `document_type` enum -- keep the two in
+-- sync by hand, there's no way to share a single definition across SQL and
+-- Daml. Not referenced by any template/choice yet: schema only, no
+-- document-type handling is implemented in this stage.
+data DocumentType
+  = DT_Offer
+  | DT_Endorsement
+  | DT_Renewal
+  | DT_Release
+  | DT_FormalNotice
+  deriving (Eq, Show)
+
+-- Same taxonomy as sql/schema.sql's `endorsement_reason` enum. Only
+-- meaningful when the document is DT_Endorsement -- a sum-insured
+-- reduction is not its own DocumentType, it's an endorsement with this
+-- reason.
+data EndorsementReason
+  = ER_SumInsuredIncrease
+  | ER_SumInsuredReduction
+  | ER_InsuredObjectChange
+  | ER_TierChange
+  | ER_Correction
+  deriving (Eq, Show)
+
+-- PolicyToken.amendmentReason reuses this same type rather than defining a
+-- second, identical taxonomy -- a reduction of sum insured is deliberately
+-- not its own document type, it's an endorsement with this reason code,
+-- and that's true whether the reason is read off a policy_documents row or
+-- off the token itself.
+
+-- Which stakeholder role a payout should route to. A list, not a single
+-- value, so a later multi-recipient split (e.g. part to mortgagee, part to
+-- beneficiary) can be expressed without changing the token's field shape
+-- again. Not acted on in this stage -- routing/splitting logic is Stage 2.
+data PayoutDestinationRole
+  = PDR_Beneficiary
+  | PDR_Mortgagee
+  | PDR_Insured
+  -- m. 1457: "Sigortali mal haczedilirse, sigortaci ... sigorta tazminatini
+  -- ICRA MUDURLUGUNE odeyerek borcundan kurtulur." A fourth recipient that is
+  -- none of the other three, and the only one nobody designates: it arises
+  -- from an attachment, years after the policy was written.
+  --
+  -- The article reads as a DISCHARGE mechanism rather than a duty --
+  -- "odeyerek borcundan kurtulur" tells the insurer how to pay validly. But
+  -- the officer's ihtar in the second sentence says the insurer is discharged
+  -- "ANCAK icra mudurlugune odenilmesiyle", so after it the alternatives stop
+  -- discharging. Permissive in form, constraining in effect.
+  | PDR_EnforcementOffice
+  deriving (Eq, Show)
+
+-- Why an indemnity was recorded rather than routed. Two situations, and they
+-- must stay distinguishable: they have different reasons and different
+-- resolutions.
+data UnroutedReason
+  = UNR_MortgageeSurplus
+      -- m. 1456(2): the excess over the mortgagee's remaining secured claim.
+      -- The paragraph forbids paying the sigortali without izin and offers no
+      -- surplus carve-out.
+  | UNR_CompetingClaims
+      -- m. 1456 and m. 1457 both bite on one coverage. The Code does not say
+      -- which prevails -- they sit as `a) Sinirli ayni hak` and `b) Haciz`
+      -- under one heading, `4. Menfaat uzerinde sinirlamalar`, two species of
+      -- one genus with no priority rule between them -- and the substantive
+      -- question is Icra ve Iflas Kanunu territory, which is not in this
+      -- repository. So nothing routes.
+  deriving (Eq, Show)
+
+-- Stage 2 Part 2: one coverage within a package policy (e.g. fire, theft,
+-- glass on a single home policy). Each coverage is fully independent --
+-- its own sum insured, its own remaining limit, its own tier matrix, its
+-- own payout destination, and (if the policy has a mortgagee) its own
+-- mortgagee claim ceiling. `mortgageeClaimAmount` being Some on this
+-- coverage and None on another is exactly how "the mortgagee has a claim
+-- on fire but not on glass" is expressed -- there is no separate
+-- per-coverage mortgagee flag. Deliberately no shared or aggregate limit
+-- across coverages in this version -- see PolicyToken.daml.
+data Coverage = Coverage
+  with
+    coverageCode          : Text
+    sumInsured            : Decimal
+    remainingLimit        : Decimal
+    payoutTiers           : [PayoutTier]
+    payoutDestination     : [PayoutDestinationRole]
+    mortgageeClaimAmount  : Optional Decimal
+    -- m. 1457. The attachment of the insured property, and its lifting.
+    --
+    -- AN APPROXIMATION, stated rather than hidden: the article attaches to
+    -- the PROPERTY -- "Sigortali mal haczedilirse", "Bir malin haczinde" --
+    -- and this system has no property registry. The coverage is its nearest
+    -- honest unit, which is the same approximation v17 already made for the
+    -- mortgagee's charge one field above.
+    --
+    -- Attached NOW means attachedAt is set and attachmentLiftedAt is either
+    -- absent or older than it. The shape follows m. 1456(6)'s outstanding
+    -- request, and it earns its keep the same way: an attachment can be
+    -- lifted and later re-imposed without either date being lost.
+    --
+    -- Lifting is a fact the Code itself anticipates, not one this system
+    -- invented: the officer's ihtar binds "DIGER BIR BILDIRIME KADAR" --
+    -- until a further notification.
+    --
+    -- Both are reported from outside. The platform cannot observe an icra
+    -- file, and holds no case number, court, office identifier or party
+    -- identity for one -- the routing decision needs none.
+    attachedAt            : Optional Time
+    attachmentLiftedAt    : Optional Time
+  deriving (Eq, Show)
+
+-- Coverage codes are a policy's coverages' permanent identity -- never the
+-- list index, which shifts when a future endorsement adds or removes one.
+-- O(n^2), fine at the scale a policy's coverage list actually reaches.
+allDistinct : Eq a => [a] -> Bool
+allDistinct [] = True
+allDistinct (x :: xs) = notElem x xs && allDistinct xs
+
+-- (Stage 3 Part 2 had an `inferActiveStatus` helper here, which
+-- PolicyToken_Reinstate used to reconstruct whether a policy should come
+-- back as PS_Active or PS_PartiallyPaid. Splitting the two status axes in
+-- Part 3 removed the need for it entirely: reinstatement now only clears
+-- DefaultState back to DS_None and never touches PolicyStatus, so there is
+-- nothing left to reconstruct. Deleted rather than left dead, because a
+-- status-inferring helper sitting next to a status field would imply
+-- reinstatement still derives one.)
+
+-- Same taxonomy as sql/schema.sql's `event_type` enum -- the outbox
+-- vocabulary, distinct from DocumentType (a document is paperwork
+-- evidence; an event is the outbox action that may produce one). Not
+-- referenced by any template/choice yet -- only ET_Activation has a
+-- dispatcher handler (node/src/dispatch/dispatcher.js); the rest are
+-- defined now and rejected explicitly when the dispatcher sees them.
+-- Deliberately has no ET_Offer -- offers are pre-contract and never enter
+-- the outbox.
+data EventType
+  = ET_Activation
+  | ET_Endorsement
+  | ET_Renewal
+  | ET_Notice
+  | ET_Release
+  deriving (Eq, Show)
+
+data TriggerResult = TriggerResult
+  with
+    matched          : Bool
+    matchedTierLabel : Optional Text
+    payoutPct        : Decimal
+    payoutAmount     : Decimal
+    isFullSettlement : Bool
+  deriving (Eq, Show)
+
+inRange : Decimal -> PayoutTier -> Bool
+inRange observed tier = aboveMin && belowMax
+  where
+    aboveMin = case tier.minValue of
+      None -> True
+      Some m -> observed >= m
+    belowMax = case tier.maxValue of
+      None -> True
+      Some m -> observed <= m
+
+-- First matching tier wins. Caller is responsible for pre-sorting by
+-- tierOrder (Node.js does this with `ORDER BY tier_order ASC` when it loads
+-- the matrix from SQL at mint time).
+matchTier : [PayoutTier] -> Decimal -> Optional PayoutTier
+matchTier tiers observed = find (inRange observed) tiers
+
+floorTo2dp : Decimal -> Decimal
+floorTo2dp x = intToDecimal (floor (x * 100.0)) / 100.0
+
+-- Percentage is always applied to what is currently LEFT (remainingLimit),
+-- never the original sumInsured, so a second partial claim after an earlier
+-- one can never overpay past the policy's true remaining exposure.
+evaluateAgainstTiers : [PayoutTier] -> Decimal -> Decimal -> TriggerResult
+evaluateAgainstTiers tiers remainingLimit observed =
+  case matchTier tiers observed of
+    None ->
+      TriggerResult with
+        matched = False
+        matchedTierLabel = None
+        payoutPct = 0.0
+        payoutAmount = 0.0
+        isFullSettlement = False
+    Some tier ->
+      let rawAmount = remainingLimit * (tier.payoutPct / 100.0)
+          amount = min (floorTo2dp rawAmount) remainingLimit
+          isFull = tier.payoutPct >= 100.0 || amount >= remainingLimit
+      in TriggerResult with
+        matched = True
+        matchedTierLabel = Some tier.label
+        payoutPct = tier.payoutPct
+        payoutAmount = amount
+        isFullSettlement = isFull

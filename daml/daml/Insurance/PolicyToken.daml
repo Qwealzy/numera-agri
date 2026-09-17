@@ -1,0 +1,1543 @@
+module Insurance.PolicyToken where
+
+import DA.Foldable (forA_)
+import DA.Optional (fromOptional, isNone, isSome, optionalToList)
+import Insurance.Types
+import Insurance.PayoutBridge
+
+-- One approved payout, to one recipient. m. 1427 runs maturity and default
+-- PER CLAIM, so paying the bank does not discharge what is owed to the
+-- insured: each recipient gets its own PayoutApproved, independently
+-- settleable, and never two line items on one contract that would lose the
+-- distinction.
+data PayoutLeg = PayoutLeg
+  with
+    recipient : PayoutDestinationRole
+    amount    : Decimal
+    cid       : ContractId PayoutApproved
+  deriving (Eq, Show)
+
+-- The part of an indemnity on a CHARGED coverage that exceeds the
+-- mortgagee's remaining claim.
+--
+-- It is deliberately NOT a payout leg. m. 1456(2) is a flat prohibition --
+-- "ayni hak sahiplerinin izni bulunmadıkça, sigortacı sigorta tazminatını
+-- sigortalıya ödeyemez" -- and the carve-out it offers is for repair or
+-- restoration against security, not for a surplus above the secured claim.
+-- Whether the excess may be paid to the sigortalı without izin is a reading
+-- the text does not settle, and m. 1456(3) leaves an insurer that gets it
+-- wrong liable to the real-right holder. Routing it automatically would
+-- encode a legal choice; this system does not make those. So the amount, its
+-- coverage and the reason are recorded and a human decides.
+data UnroutedRemainder = UnroutedRemainder
+  with
+    amount    : Decimal
+    -- WHY it was not routed. Two situations reach this record and they must
+    -- stay apart: m. 1456(2)'s surplus above the secured claim, and m. 1457
+    -- colliding with m. 1456 on one coverage where the Code supplies no
+    -- priority rule.
+    reason    : UnroutedReason
+    reviewCid : ContractId ManualReviewRequired
+  deriving (Eq, Show)
+
+-- Result of evaluating one oracle reading against the tiered payout matrix.
+-- Returned to Node.js so it can mirror the outcome into SQL without needing
+-- to re-derive it -- the ledger transaction already is the source of truth.
+data EvaluateTriggerResult = EvaluateTriggerResult
+  with
+    trigger           : TriggerResult
+    newPolicyCid      : Optional (ContractId PolicyToken)
+    -- A list, not an Optional: "no payout" is the empty list, and a split
+    -- adds legs without adding states. Replaces payoutApprovedCid.
+    payouts           : [PayoutLeg]
+    unroutedRemainder : Optional UnroutedRemainder
+  deriving (Eq, Show)
+
+-- The tokenized policy (Module 1's Mint target). Module 2's tier matrix and
+-- Module 3's archive/re-mint/burn lifecycle both live in
+-- PolicyToken_EvaluateTrigger below.
+template PolicyToken
+  with
+    policyNo       : Text
+    version        : Int
+    predecessorRef : Optional Text
+    -- None on a first policy; a renewal (Stage 3 Part 4) mints a NEW token
+    -- with a NEW policyNo carrying its predecessor's policyNo here, rather
+    -- than re-minting the same one, so the chain stays traceable
+    -- on-ledger. The predecessor token itself is never touched by the
+    -- renewal -- it runs to its own term end and is closed by the expiry
+    -- sweeper like any other policy, which is why both tokens are
+    -- legitimately live at once during the overlap between the two terms.
+    --
+    -- This is the one field that distinguishes a renewal from every other
+    -- lifecycle transition in this file: every other one archives and
+    -- re-mints the SAME policyNo at version + 1, whereas a renewal opens a
+    -- new risk period and leaves the old one running. Nothing ever sets
+    -- this on a re-mint (see PolicyToken_Amend, which carries it through
+    -- unchanged, and EvaluateTrigger/Suspend/Reinstate, which do the same).
+
+    insurer        : Party
+    policyholder   : Party
+    insured        : Party
+    beneficiary    : Optional Party
+    beneficiaryDescriptorHash : Optional Text
+    -- A beneficiary can be designated in two ways, and the difference is
+    -- legally material: as a specific person (who gets a Party, above), or
+    -- descriptively -- "my spouse", "my heirs" -- where no Party can exist
+    -- because no specific person is identified yet.
+    --
+    -- TTK 6102 m. 1494(2) attaches a consequence to naming NO beneficiary
+    -- at all, so "none" and "described but not named" must be
+    -- distinguishable from the contract alone. A token carrying
+    -- beneficiary = None and nothing else cannot tell them apart, which is
+    -- why this field is on the ledger rather than in SQL beside
+    -- national_id_hash: it records what the POLICY SAYS, not who a person
+    -- is.
+    --
+    -- Only the hash is ever supplied. The API takes
+    -- beneficiaryDescriptorHash directly, so the descriptive text does not
+    -- reach the ledger, the database, or a log line -- the platform never
+    -- holds it at all. That is deliberately unlike nationalId, which is
+    -- accepted raw and hashed server-side because a caller cannot be
+    -- trusted to have hashed an identifier the system also has to match on;
+    -- nothing here ever matches on this value, so there is no reason to
+    -- see it.
+    --
+    -- The two are mutually exclusive by the ensure clause below: a policy
+    -- names a beneficiary, or describes one, or has none. Not two of those.
+    mortgagee      : Optional Party
+    -- oracleOperator is an observer, not because it is meant to see
+    -- payoutTiers/sumInsured/every other term, but because it has to be:
+    -- a Daml Script run (same privacy/authorization model Canton
+    -- enforces) proved that a controller absent from both signatories and
+    -- observers cannot fetch or exercise the contract at all --
+    -- divulgence doesn't rescue this, since nothing about the mint
+    -- transaction ever gives oracleOperator anything to be divulged from.
+    -- "make it an observer" was confirmed as the required fallback, not a
+    -- default -- see InsuranceTests.daml's oracleOperator exercises,
+    -- which now double as the live evidence for this.
+    oracleOperator : Party
+
+    coverages : [Coverage]
+    -- Stage 2 Part 2: a policy is a package of independent coverages, not
+    -- one implicit coverage -- sumInsured/remainingLimit/payoutTiers/
+    -- payoutDestination/mortgageeClaimAmount all moved onto Coverage
+    -- (Types.daml). There is exactly one source of truth per value now;
+    -- a policy-level total, if one is ever needed, is derived by summing
+    -- this list, never stored -- storing it in two places guarantees they
+    -- drift. Single-coverage policies (e.g. today's frost product) are
+    -- just a one-element list -- no special case, no separate path. No
+    -- shared or aggregate limit across coverages in this version --
+    -- deliberate: each coverage's remainingLimit is exhausted
+    -- independently, a fire payout can never draw down glass's limit.
+
+    termStart             : Time
+    -- Stage 4: the policy term's START instant, added so a premium refund
+    -- under TTK 6102 m. 1419 has the facts it needs recorded on-ledger.
+    -- The token carried expiry and coverageValidThrough but never a start,
+    -- so "days run" and "days unrun" could not be derived from the contract
+    -- alone. Same noon-Europe/Istanbul conversion as expiry.
+
+    coverageBeganAt    : Optional Time
+    coverageStartBasis : Optional CoverageStartBasis
+    retroactiveCoverCheckedAt : Optional Time
+    -- m. 1458: "Sigorta, sigorta korumasi sozlesmenin yapilmasindan onceki
+    -- bir tarihten itibaren saglanacak sekilde yapilabilir." Retroactive
+    -- cover is expressly lawful. What is not lawful is the second sentence's
+    -- case -- the riziko's occurrence already KNOWN at contract formation --
+    -- and m. 1486(1) lists that sentence among those a contract may not
+    -- contravene, making it void rather than merely varied away.
+    --
+    -- Set where cover was backdated and the platform checked its own oracle
+    -- history for a tier-matching reading in the window between the cover
+    -- start and contract formation. NOT SET on a forward-dated policy, where
+    -- there is no window to check.
+    --
+    -- **The timestamp only.** What the check examined and found lives
+    -- off-ledger in policies.retroactive_cover_check_result, because a
+    -- passing check should record that it ran, not the whole search. A
+    -- FAILING check never reaches the ledger at all: the mint is refused, so
+    -- no contract is created, and the matching reading is named on the failed
+    -- outbox row instead.
+    --
+    -- This asserts NOTHING about knowledge. m. 1458 turns on what the
+    -- sigortaci, sigorta ettiren and sigortali knew at formation; the
+    -- platform cannot establish any of that and does not try. This field
+    -- records that a mechanical check of the platform's own data was
+    -- performed, and when -- a fact a lawyer can reason from, not a
+    -- conclusion.
+    -- m. 1421(1): "Aksine sözleşme yoksa, sigortacının sorumluluğu primin
+    -- veya ilk taksidinin ödenmesi ile başlar." The missing partner to
+    -- coverageValidThrough below -- the token has always carried when cover
+    -- ENDS and never when it BEGAN.
+    --
+    -- **None means cover has not begun.** Minting therefore no longer means
+    -- the policy is live: it means the contract exists. That is a change to
+    -- Stage 1's founding assumption, and it is deliberate -- m. 1422 (the
+    -- insurer earns no premium where the risk became impossible before
+    -- liability began) and m. 1430(3) (the sigorta ettiren may withdraw
+    -- before liability begins, against half the premium) both presuppose a
+    -- real interval between formation and cover, with its own consequences.
+    --
+    -- Deliberately a TIMESTAMP and not a new state: a state would be fully
+    -- derivable from this field, giving two sources of truth that can
+    -- disagree -- the failure the notice fields already need an ensure clause
+    -- to prevent. The token has two state axes and does not need a third.
+    --
+    -- Set together with its basis, and never inferred: the platform cannot
+    -- observe a payment any more than it can observe an ihtar being served.
+    -- No timer, no default, no "assume paid after N days".
+
+    expiry                : Time
+    coverageValidThrough  : Time
+    -- Both absolute instants (expiry was a bare Date in an earlier
+    -- package) so they can't disagree about which calendar day a
+    -- night-time event falls on -- see the mint-time conversion in
+    -- dispatcher.js for what instant a policy's term actually ends at and
+    -- why. expiry is the policy term; coverageValidThrough is distinct
+    -- and is what a future suspension-for-nonpayment choice would move --
+    -- it must never be backed by a system-generated timestamp (statutory
+    -- grace periods run from a notice's service date, supplied
+    -- externally, not from when a job happened to notice). Starts equal
+    -- to expiry at mint.
+
+    noticeServiceDate : Optional Time
+    noticeRecordedAt  : Optional Time
+    -- Stage 3 Part 2: set together, once, by PolicyToken_ServeNotice --
+    -- both None on any policy that has never had notice served. Persist
+    -- unchanged through termination and reinstatement: a permanent record
+    -- that notice WAS served and when, not a flag that gets reset.
+    -- noticeServiceDate is the statutory service date, supplied externally
+    -- (never a system-generated timestamp -- the system cannot observe
+    -- when a notice was actually served, only when it was told);
+    -- noticeRecordedAt is when the platform itself was told, so a gap
+    -- between the two stays visible on-ledger instead of collapsing into
+    -- one timestamp.
+
+    noticeCount : Int
+    -- Stage 4, m. 1434(4): a second notice in the SAME insurance period
+    -- gives the insurer a further right, implemented in v20 by
+    -- PolicyToken_ElectTwoNoticeTermination below.
+    --
+    -- COUNTS PER TOKEN, NOT PER INSURANCE PERIOD. That is safe only while a
+    -- contract term does not exceed one insurance period -- true of every
+    -- policy this product writes, but an accident of the product rather than
+    -- a structural guarantee. A multi-year term would over-count here, which
+    -- is exactly why the election checks noticeServiceDates against a
+    -- supplied period instead of trusting this number.
+    --
+    -- It is per insurance period without needing to be reset, because a
+    -- renewal mints a NEW token for the new period starting from 0; this
+    -- token counts only its own period. Reinstatement does NOT reset it:
+    -- paying after the first notice is exactly the case m. 1434(4) is
+    -- about, so zeroing it on payment would erase the only fact that makes
+    -- a second notice a second one.
+
+    -- Every service date, appended -- not just the latest, which
+    -- noticeServiceDate above holds. m. 1434(4) turns on TWO ihtars "bir
+    -- sigorta donemi icinde", and one date plus a count cannot answer
+    -- whether both fell inside a given period. Retaining them turns the
+    -- insurer's assertion into something the ledger checks.
+    --
+    -- Kept equal to noticeCount by the ensure clause below, so the two
+    -- cannot drift.
+    noticeServiceDates : [Time]
+
+    -- m. 1434(4). The insurer's election and the instant its effect lands.
+    -- twoNoticeEffectiveAt is the supplied period END, frozen at election, so
+    -- a sweeper running three days late records the instant it would have
+    -- recorded on time -- the same discipline as the m. 1434(3) termination
+    -- instant.
+    --
+    -- The period itself is SUPPLIED, never derived. m. 1411 ties it to how
+    -- the premium is CALCULATED -- "prim daha kisa zaman dilimlerine gore
+    -- hesaplanmamis ise ... bir yildir" -- and this system holds no
+    -- calculation basis. termStart/expiry are the contract term, which is a
+    -- different thing and coincides only sometimes.
+    twoNoticeElectionAt  : Optional Time
+    twoNoticeEffectiveAt : Optional Time
+
+    -- m. 1431(4): policyholder substitution, as THREE separate externally
+    -- reported facts. The platform cannot observe litigation, cannot serve a
+    -- notice, and cannot witness an undertaking -- so each is reported, each
+    -- carries its own supplied date, and none is ever inferred from another.
+    --
+    --   1. enforcement against the sigorta ettiren for the premium debt
+    --      proved fruitless ("takip semeresiz kalmissa"), by whichever route;
+    --   2. the insurer notified the sigortali of that ("bu durumun sigortaci
+    --      tarafindan kendilerine bildirilmesi halinde") -- a CONDITION on the
+    --      text, not merely an occasion;
+    --   3. the sigortali undertook to pay ("primi odemeyi ustlenirlerse"),
+    --      whereupon "sozlesme bu kisilerle devam eder".
+    --
+    -- The undertaking is an act, NOT a payment. Nothing here records an
+    -- amount, an instalment or a balance, and the premium remains as unpaid
+    -- after a substitution as before it.
+    enforcementFruitlessAt : Optional Time
+    enforcementRoute       : Optional EnforcementRoute
+    substitutionNotifiedAt : Optional Time
+    substitutedAt          : Optional Time
+    -- Who was superseded. The contract continues WITH the sigortali
+    -- ("sozlesme bu kisilerle devam eder"), so `policyholder` above becomes
+    -- `insured` and the old party leaves the observer set with it -- it is no
+    -- longer a party, and 5684 m. 35(8)/(9) makes continued disclosure to a
+    -- non-party the wrong default. This field keeps its identity on the
+    -- record without keeping the observation right.
+    --
+    -- Nothing here says the superseded party was released. m. 1431(4) does
+    -- not address it, and the premise of the whole paragraph is that
+    -- enforcement against them failed -- so arrears plainly exist. Recorded,
+    -- not concluded.
+    supersededPolicyholder : Optional Party
+    premiumDueDate         : Optional Time
+    enforcementCommencedAt : Optional Time
+    withdrawnAt            : Optional Time
+    withdrawalPath         : Optional WithdrawalPath
+    -- m. 1434(2), the FIRST-premium mechanism. Kept apart from the notice
+    -- fields above on purpose: this is not a variant of that flow.
+    --
+    -- premiumDueDate is REPORTED by the insurer, never derived. m. 1431(1)
+    -- puts it at "sözleşme yapılır yapılmaz ve poliçenin teslimi karşılığında"
+    -- -- contract formation against delivery of the policy -- which this
+    -- platform cannot observe, exactly as it cannot observe when an ihtar was
+    -- served. Both of m. 1434(2)'s clocks run from it, so nothing about this
+    -- mechanism can be computed until it is reported.
+    --
+    -- enforcementCommencedAt records that the insurer says it pursued the
+    -- premium claim "dava veya takip yoluyla". Recording COMMENCEMENT only:
+    -- whether the enforcement proved fruitless (semeresiz) is m. 1431(4)'s
+    -- trigger for substitution by the sigortalı, which is a different fact and
+    -- is not implemented. Its presence is what forecloses the deemed path.
+    --
+    -- withdrawnAt and withdrawalPath are set together by
+    -- PolicyToken_WithdrawForFirstPremium and never afterwards.
+    --
+    -- There is deliberately NO refund figure here, and no analogue of
+    -- unrunDays. m. 1419 returns only premiums "ödenmiş" -- actually paid --
+    -- and in first-premium default nothing was. m. 1441's measure ("rizikoyu
+    -- taşıdığı süreye ait primler") is likewise empty where m. 1421 means the
+    -- insurer never bore the risk. There is no arithmetic to support.
+
+    terminationInstant : Optional Time
+    unrunDays          : Optional Int
+    -- Stage 4, set together by PolicyToken_Terminate and never afterwards.
+    -- terminationInstant is DERIVED FROM THE NOTICE, not from a clock:
+    -- the externally supplied service date plus the policy's own grace
+    -- period. unrunDays is the whole days between that instant and expiry.
+    --
+    -- These are the FACTS a refund is computed from (m. 1419 requires
+    -- return of premium for unrun days, and m. 1452(3) protects it). The
+    -- arithmetic is deliberately absent: no premium amount is stored here
+    -- or anywhere else, and no refund figure is computed. The insurer holds
+    -- the premium and does the calculation, exactly as with set-off.
+
+    mortgageeNotifiedAt         : Optional Time
+    mortgageeContinuationEndsAt : Optional Time
+    mortgageeElection           : Optional MortgageeElection
+    -- m. 1456(6): "Sigortaci, ISTEM UZERINE, sinirli ayni hak sahibi oldugunu
+    -- bildiren kisiye sigorta korumasi ile sigorta bedelinin miktari hakkinda
+    -- BILGI VERIR."
+    --
+    -- The information itself was never the problem: a named mortgagee already
+    -- observes this token and can read sumInsured, remainingLimit, the tier
+    -- matrix and coverageValidThrough continuously. What was missing is the
+    -- ACT. The duty is request -> response; standing access is a state, and a
+    -- state cannot evidence a response to a request that was never recorded.
+    --
+    -- Both dates are supplied from outside. The platform does not receive the
+    -- request, does not answer it, and holds no name, address or contact
+    -- detail for the person who asked -- the request is identified by the
+    -- policy, which already names the mortgagee.
+    --
+    -- A request is OUTSTANDING while requestedAt is set and providedAt is
+    -- absent or older than it. That is the only state in this duty worth
+    -- surfacing, and it is why these are two fields rather than a pair of
+    -- lists: what matters is whether the insurer currently owes an answer.
+    mortgageeInfoRequestedAt    : Optional Time
+    mortgageeInfoProvidedAt     : Optional Time
+    -- Stage 4, m. 1456(4) and (5). All three are RECORDED facts, never
+    -- actions: this system generates and sends nothing. mortgageeNotifiedAt
+    -- is the insurer's reported date for having notified a known real-right
+    -- holder of the default and the notice served. The continuation window
+    -- opens at termination; its end is computed off-ledger from configured
+    -- days and passed in, never hardcoded here. The election is recorded if
+    -- one is reported -- the takeover itself is deliberately not
+    -- implemented.
+
+    status            : PolicyStatus
+    -- Claim/term axis ONLY as of Stage 3 Part 3: active, partially paid,
+    -- claimed and closed, expired (plus cancelled / manual review). The
+    -- premium-default states moved to defaultState below -- the two are
+    -- orthogonal and a payout must never disturb the default axis. See
+    -- DefaultState in Types.daml for the live-verification defect that
+    -- forced the split.
+    defaultState      : DefaultState
+
+    documentHash      : Optional Text
+    amendmentReason   : Optional EndorsementReason
+    -- amendmentReason records WHY the most recent endorsement happened
+    -- (Stage 3 Part 3 wires this up via PolicyToken_Amend; before that it
+    -- was declared but never set by anything). None on a token that has
+    -- never been amended.
+  where
+    signatory insurer
+    observer policyholder, insured, oracleOperator, optionalToList beneficiary, optionalToList mortgagee
+
+    ensure
+      not (null coverages) &&
+      allDistinct (map (.coverageCode) coverages) &&
+      all (\c -> c.sumInsured > 0.0 &&
+                 c.remainingLimit >= 0.0 && c.remainingLimit <= c.sumInsured &&
+                 not (null c.payoutDestination) &&
+                 (isNone c.mortgageeClaimAmount || isSome mortgagee))
+          coverages &&
+      coverageValidThrough <= expiry &&
+      -- m. 1421: set together or neither. Cover that began has a reason it
+      -- began, and a reason without an instant says nothing.
+      isNone coverageBeganAt == isNone coverageStartBasis &&
+      -- m. 1458: the check only has a window to run over where cover began at
+      -- a recorded instant. A check timestamp without one describes nothing.
+      (isNone retroactiveCoverCheckedAt || isSome coverageBeganAt) &&
+      -- m. 1456(6). A response with nothing to respond to describes nothing,
+      -- and neither duty exists without a mortgagee to owe it to. The
+      -- ordering only -- NOT providedAt >= requestedAt, because a later
+      -- request deliberately leaves an older response behind it, and that is
+      -- exactly how "outstanding" is expressed.
+      (isNone mortgageeInfoProvidedAt || isSome mortgageeInfoRequestedAt) &&
+      (isNone mortgageeInfoRequestedAt || isSome mortgagee) &&
+      -- m. 1431(4). The three facts happen in one order and only that order,
+      -- enforced here as well as in the choices, so the sequence cannot be
+      -- bypassed by writing a token directly.
+      isNone enforcementFruitlessAt == isNone enforcementRoute &&
+      (isNone substitutionNotifiedAt || isSome enforcementFruitlessAt) &&
+      (isNone substitutedAt || isSome substitutionNotifiedAt) &&
+      isNone substitutedAt == isNone supersededPolicyholder &&
+      -- After substitution the same person holds both roles: m. 1454(1) keeps
+      -- the contract's rights with the sigortali, and m. 1431(4) moves the
+      -- counterparty onto them. The "baskasi lehine" character is spent,
+      -- which is also why this can never happen twice on one policy.
+      (isNone substitutedAt || policyholder == insured) &&
+      -- Cover cannot begin after the policy term ends. Bounded by `expiry`
+      -- and NOT by coverageValidThrough: Terminate rewrites the latter to the
+      -- termination instant, so bounding against it would make a m. 1434(3)
+      -- termination fail with a cover-start error -- the wrong complaint on
+      -- the wrong choice, in a flow that is settled.
+      --
+      -- No lower bound against termStart either: the parties may agree cover
+      -- starts before the term nominally opens, and m. 1452(3) permits
+      -- varying m. 1421 in the insured's favour.
+      (isNone coverageBeganAt || coverageBeganAt <= Some expiry) &&
+      -- The three beneficiary states are exclusive: named (a Party), or
+      -- described (a hash), or none. Allowing both would make "which one
+      -- governs" a question the contract cannot answer, and m. 1494(2)
+      -- turns on exactly that.
+      not (isSome beneficiary && isSome beneficiaryDescriptorHash) &&
+      beneficiaryDescriptorHash /= Some "" &&
+      isNone noticeServiceDate == isNone noticeRecordedAt &&
+      noticeCount >= 0 &&
+      -- A policy that has never had notice served has a count of zero, and
+      -- vice versa: the count and the dates cannot disagree about whether
+      -- notice was ever served at all.
+      (isNone noticeServiceDate) == (noticeCount == 0) &&
+      -- m. 1434(4): the count and the dates are one fact recorded twice, and
+      -- must never drift.
+      noticeCount == length noticeServiceDates &&
+      -- The election and the instant it lands are set together, and the
+      -- effect must land after the election -- a deferred effect needs a
+      -- future instant to defer to.
+      isNone twoNoticeElectionAt == isNone twoNoticeEffectiveAt &&
+      (case (twoNoticeElectionAt, twoNoticeEffectiveAt) of
+         (Some e, Some eff) -> eff > e
+         _ -> True) &&
+      -- Both m. 1434(4) states require the election that produced them.
+      ((defaultState /= DS_TwoNoticeElected && defaultState /= DS_TwoNoticeTerminated)
+         || isSome twoNoticeElectionAt) &&
+      -- A policy cannot succeed itself. Renewal (Stage 3 Part 4) mints a
+      -- new token with a NEW policyNo pointing back at the one it renews;
+      -- a token whose predecessorRef is its own policyNo would be a cycle
+      -- in the supersession chain, and would make the chain unwalkable in
+      -- either direction.
+      predecessorRef /= Some policyNo &&
+      -- m. 1434(2): withdrawal sets both together or neither, and cannot be
+      -- asserted without the due date both of its clocks run from.
+      isNone withdrawnAt == isNone withdrawalPath &&
+      (defaultState == DS_WithdrawnForFirstPremium) == isSome withdrawnAt &&
+      -- Either first-premium state requires the reported due date: without it
+      -- there is no vade for a window to run from, and nothing to withdraw
+      -- against.
+      (not (defaultState == DS_FirstPremiumUnpaid || defaultState == DS_WithdrawnForFirstPremium)
+        || isSome premiumDueDate) &&
+      -- Enforcement can only have been commenced on a premium claim that fell
+      -- due.
+      (isNone enforcementCommencedAt || isSome premiumDueDate) &&
+      -- The two mechanisms are mutually exclusive on one token: m. 1434(2)
+      -- governs the FIRST premium and m. 1434(3) the ones that follow, so a
+      -- policy cannot be in both at once. Enforced rather than assumed --
+      -- conflating them is the specific failure this vocabulary exists to
+      -- prevent.
+      not (isSome premiumDueDate && isSome noticeServiceDate) &&
+      -- Termination sets both together or neither.
+      isNone terminationInstant == isNone unrunDays &&
+      -- A terminated policy has both; one that is not terminated has
+      -- neither. This is what keeps DS_Terminated from being assertable
+      -- without the facts a refund would be computed from.
+      (defaultState == DS_Terminated) == isSome terminationInstant
+
+    -- Modules 2 + 3 combined. oracleOperator (not insurer) controls this so
+    -- the insurer can never trigger -- and thereby effectively approve --
+    -- its own payout. Authorization still works because PolicyToken's
+    -- signatory (insurer) is automatically part of this transaction's
+    -- authority as signatory of the contract being exercised, even though
+    -- insurer isn't the controller: consequences of an exercise are
+    -- authorized by (choice controller UNION contract signatories).
+    --
+    -- Stage 2 Part 2: a trigger names exactly one coverage and evaluates
+    -- only that coverage's own tiers and remaining limit; every other
+    -- coverage is carried into the re-mint byte-for-byte unchanged. The
+    -- policy only closes (no re-mint) once every coverage -- not just the
+    -- triggered one -- is at zero remaining limit.
+    nonconsuming choice PolicyToken_EvaluateTrigger : EvaluateTriggerResult
+      with
+        coverageCode   : Text
+        -- The contract id being exercised, supplied by the caller because
+        -- `show self` renders a redacted placeholder on this participant.
+        -- Recorded onto PayoutApproved as sourcePolicyContractId.
+        selfContractId : Text
+        observedValue  : Decimal
+        metric         : Text
+        attestationRef : Text
+        currency       : Text
+        now            : Time
+      controller oracleOperator
+      do
+        -- Stage 3 Part 3: two independent checks now, one per axis, because
+        -- claimability genuinely depends on both. On the claim/term axis
+        -- the policy must not be in a terminal state; on the default axis
+        -- coverage must not have stopped. A loss during the grace period
+        -- is payable (coverage continues in full there), which is why
+        -- DS_GracePeriod passes and only DS_Terminated fails. Either
+        -- rejection leaves the required `failed` outbox row via
+        -- dispatch/dispatcher.js, recording the observed value and the
+        -- ledger's own reason -- never a silent skip.
+        assertMsg "policy is not in a claimable state (must be active or partially paid)"
+          (status == PS_Active || status == PS_PartiallyPaid)
+        -- Cover during the NOTICE period is real: DS_GracePeriod passes, and
+        -- a loss there is payable exactly as on an ordinary policy. Only a
+        -- terminated contract is refused -- after the termination instant
+        -- there is no contract to claim under. Either rejection leaves a
+        -- `failed` outbox row carrying the observed value and the ledger's
+        -- own reason; nothing is silently skipped.
+        -- m. 1421. Checked FIRST and worded distinctly, because this is not
+        -- a policy that lost cover -- it is one whose cover has not started.
+        -- A policy in first-premium default hits this too, and correctly:
+        -- the two compose rather than duplicating, since an unpaid first
+        -- premium means both "cover not begun" (m. 1421) and "withdrawable"
+        -- (m. 1434(2)). Which message it gets depends only on which fact was
+        -- reported first, and both are true.
+        assertMsg "cover has not begun on this policy (m. 1421) -- the insurer's liability starts with payment of the first premium unless otherwise agreed, and no start has been recorded"
+          (isSome coverageBeganAt)
+        assertMsg "the contract was terminated for premium default -- losses after termination are outside cover"
+          (defaultState /= DS_Terminated)
+        -- m. 1434(4). Note what is NOT refused: DS_TwoNoticeElected passes.
+        -- The election defers the end to the period end and shortens nothing,
+        -- so cover runs in full until then and a loss in that window is
+        -- payable -- exactly as during a notice period under (3).
+        assertMsg "the contract ended under m. 1434(4) at the end of the insurance period -- losses after that are outside cover"
+          (defaultState /= DS_TwoNoticeTerminated)
+        -- m. 1434(2). Deliberately a separate assertion with its own message:
+        -- a policy in first-premium default is not a policy that lost cover,
+        -- it is one whose first premium the insurer has reported unpaid, and
+        -- under m. 1421 the insurer's liability begins with that payment.
+        assertMsg "the first premium is reported unpaid (m. 1434(2)) -- no trigger is evaluated against it"
+          (defaultState /= DS_FirstPremiumUnpaid)
+        assertMsg "the contract was withdrawn from for non-payment of the first premium (m. 1434(2))"
+          (defaultState /= DS_WithdrawnForFirstPremium)
+        assertMsg ("unknown coverage: " <> coverageCode)
+          (any (\c -> c.coverageCode == coverageCode) coverages)
+        let Some targetCoverage = find (\c -> c.coverageCode == coverageCode) coverages
+            result = evaluateAgainstTiers targetCoverage.payoutTiers targetCoverage.remainingLimit observedValue
+        if not result.matched then
+          pure EvaluateTriggerResult with
+            trigger = result
+            newPolicyCid = None
+            payouts = []
+            unroutedRemainder = None
+        else do
+          -- m. 1456(1): "sınırlı ayni hak sahibinin hakkı sigorta tazminatı
+          -- üzerinde de devam eder" -- the real right continues over the
+          -- indemnity as substitute object. It continues over the indemnity
+          -- from the encumbered thing, which is why routing is scoped to the
+          -- coverage whose charge the mortgagee holds and never to the
+          -- policy as a whole. A coverage with no claim recorded is
+          -- untouched by this and pays exactly as it did before.
+          --
+          -- The ceiling is the remaining claim. m. 1456 does not state it --
+          -- the article says the right continues, never how far -- it
+          -- follows from the extent of the sınırlı ayni hak itself, which is
+          -- TMK and not in this repository.
+          let toMortgagee = case targetCoverage.mortgageeClaimAmount of
+                None -> 0.0
+                Some claim -> min claim result.payoutAmount
+              remainder = result.payoutAmount - toMortgagee
+              isCharged = isSome targetCoverage.mortgageeClaimAmount
+              -- m. 1457. Attached NOW: an attachment with no lifting after
+              -- it. A lifting older than the attachment means it was
+              -- re-imposed, which the two-date shape carries without losing
+              -- either fact.
+              isAttached = case (targetCoverage.attachedAt, targetCoverage.attachmentLiftedAt) of
+                (None, _) -> False
+                (Some _, None) -> True
+                (Some a, Some l) -> l < a
+              -- m. 1456 and m. 1457 on one coverage: nothing routes (see the
+              -- fork below for why). Defined HERE because the decrement needs
+              -- it -- a claim must not be reduced by an amount the bank was
+              -- never sent.
+              competingClaims = isAttached && isCharged
+              routedToMortgagee = if competingClaims then 0.0 else toMortgagee
+              newCoverages = map
+                (\c -> if c.coverageCode == coverageCode
+                       then c with
+                         remainingLimit = targetCoverage.remainingLimit - result.payoutAmount
+                         -- Decrements exactly like remainingLimit, and for
+                         -- the same kind of reason: what was routed to the
+                         -- bank satisfies the secured debt pro tanto, so
+                         -- the charge no longer reaches it. Note this is
+                         -- NOT m. 1428 -- that reduces the sigorta bedeli,
+                         -- which is remainingLimit's business and says
+                         -- nothing about the secured claim.
+                         --
+                         -- Falls to Some 0.0, never back to None. "Charged
+                         -- and exhausted" and "never charged" are different
+                         -- facts and route differently below.
+                         mortgageeClaimAmount =
+                           fmap (\claim -> claim - routedToMortgagee) c.mortgageeClaimAmount
+                       else c)
+                coverages
+              -- Closing the policy is a policy-wide fact, not a
+              -- per-coverage one: PayoutApproved.isFullSettlement here
+              -- means "this payout closed the whole policy," not "this
+              -- payout exhausted this one coverage" -- the latter can be
+              -- true (this coverage hit zero) while the policy as a whole
+              -- stays open because another coverage still has limit left.
+              allExhausted = all (\c -> c.remainingLimit <= 0.0) newCoverages
+          -- An uncharged coverage still has to name someone, and the insured
+          -- is the only recipient this system routes to automatically.
+          -- Fails loudly rather than picking a role the policy did not
+          -- allow -- beneficiary routing is not implemented anywhere.
+          assertMsg ("coverage " <> coverageCode <> " has no mortgagee claim, so its payout " <>
+                     "routes to the insured, but its payoutDestination does not permit PDR_Insured")
+            (isCharged || isAttached || PDR_Insured `elem` targetCoverage.payoutDestination)
+          assertMsg ("coverage " <> coverageCode <> " carries a mortgagee claim but its " <>
+                     "payoutDestination does not permit PDR_Mortgagee")
+            (not isCharged || toMortgagee <= 0.0 || PDR_Mortgagee `elem` targetCoverage.payoutDestination)
+          archive self
+
+          let approvedFor : PayoutDestinationRole -> Decimal -> Update (ContractId PayoutApproved)
+              approvedFor role legAmount = create PayoutApproved with
+                insurer
+                policyholder
+                oracleOperator
+                policyId = policyNo
+                coverageCode
+                sourcePolicyContractId = selfContractId
+                -- The GROSS figure for THIS recipient. The split is between
+                -- recipients, never a netting: nothing here is reduced by
+                -- premium, set-off or anything else.
+                amount = legAmount
+                recipient = role
+                -- Observed by the bank only on the leg that is actually its
+                -- own. The policy-level mortgagee already observes the whole
+                -- token; this is narrower, not wider.
+                mortgagee = if role == PDR_Mortgagee then mortgagee else None
+                currency
+                payoutPercentage = result.payoutPct
+                tierLabel = fromOptional "unknown" result.matchedTierLabel
+                isFullSettlement = allExhausted
+                -- Snapshotted from the coverage that actually triggered, so a
+                -- later settlement report can be checked on-ledger against the
+                -- destination this policy specified (Stage 4).
+                payoutDestination = targetCoverage.payoutDestination
+                approvedAt = now
+                status = PA_Pending
+
+          -- m. 1457 and m. 1456 on one coverage. The Code supplies NO priority
+          -- rule: they sit as `a) Sinirli ayni hak` and `b) Haciz` under one
+          -- heading, `4. Menfaat uzerinde sinirlamalar`, two species of one
+          -- genus presented in parallel. Whose claim ranks where in an
+          -- attached asset's proceeds is Icra ve Iflas Kanunu territory,
+          -- which is not in this repository. So nothing routes -- the whole
+          -- indemnity is recorded for a human, and the system decides
+          -- nothing it was not given the means to decide.
+          --
+          -- Never a zero-amount contract for a recipient owed nothing.
+          legs <- if competingClaims then
+                    pure []
+                  else if isAttached then do
+                    -- The property is attached and no charge competes.
+                    -- m. 1457: paying the icra mudurlugu is what discharges,
+                    -- and after the officer's ihtar it is the ONLY payment
+                    -- that does.
+                    cid <- approvedFor PDR_EnforcementOffice result.payoutAmount
+                    pure [PayoutLeg with recipient = PDR_EnforcementOffice, amount = result.payoutAmount, cid]
+                  else if not isCharged then do
+                    cid <- approvedFor PDR_Insured result.payoutAmount
+                    pure [PayoutLeg with recipient = PDR_Insured, amount = result.payoutAmount, cid]
+                  else if toMortgagee > 0.0 then do
+                    cid <- approvedFor PDR_Mortgagee toMortgagee
+                    pure [PayoutLeg with recipient = PDR_Mortgagee, amount = toMortgagee, cid]
+                  else
+                    pure []
+
+          -- The excess over the secured claim on a CHARGED coverage, and the
+          -- whole payout once that claim is exhausted -- the same amount
+          -- reached two ways, and neither is routed automatically. Ordering
+          -- must not decide what arithmetic was not allowed to.
+          remainderOpt <- if competingClaims then do
+                            reviewCid <- create ManualReviewRequired with
+                              insurer
+                              policyholder
+                              policyId = policyNo
+                              coverageCode
+                              sourcePayoutContractId = ""
+                              amount = result.payoutAmount
+                              currency
+                              reason = "m. 1456 and m. 1457 both bite on coverage " <> coverageCode <>
+                                       ": a mortgagee holds a charge on it AND the insured property is " <>
+                                       "under attachment. The Code supplies no priority rule between " <>
+                                       "them -- they sit as (a) sinirli ayni hak and (b) haciz under one " <>
+                                       "heading, two species of one genus -- and whose claim ranks where " <>
+                                       "in an attached asset's proceeds is Icra ve Iflas Kanunu " <>
+                                       "territory. NOTHING was routed. This asserts nothing about who " <>
+                                       "is entitled; it records that the platform was not given the " <>
+                                       "means to decide."
+                              flaggedAt = now
+                            pure (Some UnroutedRemainder with
+                                    amount = result.payoutAmount
+                                    reason = UNR_CompetingClaims
+                                    reviewCid)
+                          else if isCharged && remainder > 0.0 then do
+                            reviewCid <- create ManualReviewRequired with
+                              insurer
+                              policyholder
+                              policyId = policyNo
+                              coverageCode
+                              -- EMPTY, and it has to be. A remainder does
+                              -- not come from a PayoutApproved -- it is the
+                              -- part of an indemnity that never became one --
+                              -- so there is no source payout to point at.
+                              -- `show` on a ContractId is no help either: on
+                              -- this participant it renders the literal
+                              -- "<contract-id>", which is what cost a package
+                              -- rename to discover. The chain back is
+                              -- policyId + coverageCode + flaggedAt, all
+                              -- carried here, and the dispatcher records the
+                              -- link to the mortgagee leg in SQL where it
+                              -- holds real ids.
+                              sourcePayoutContractId = ""
+                              amount = remainder
+                              currency
+                              reason = "m. 1456(2): this coverage carries a mortgagee charge, so the " <>
+                                       "indemnity above the remaining secured claim is NOT routed to the " <>
+                                       "insured automatically. The paragraph forbids paying the sigortalı " <>
+                                       "without the real-right holder's izin and offers no surplus " <>
+                                       "carve-out; whether it reaches an excess is unsettled on the text. " <>
+                                       "Recorded for a human. This asserts nothing about who is entitled."
+                              flaggedAt = now
+                            pure (Some UnroutedRemainder with
+                                    amount = remainder
+                                    reason = UNR_MortgageeSurplus
+                                    reviewCid)
+                          else
+                            pure None
+
+          if allExhausted then
+            pure EvaluateTriggerResult with
+              trigger = result
+              newPolicyCid = None
+              payouts = legs
+              unroutedRemainder = remainderOpt
+          else do
+            -- Touches the CLAIM axis only. defaultState is carried over
+            -- unchanged by `create this with` -- deliberately, and this is
+            -- the whole point of Stage 3 Part 3's split: a policy that was
+            -- in its grace period when the loss happened is still in its
+            -- grace period afterwards, so graceSweeper.js can still find
+            -- and terminate it. The premium does not become paid because a
+            -- claim was paid; per TTK 1431/3 the insurer may set the
+            -- outstanding premium off against this indemnity, but that is
+            -- the insurer's own arithmetic in its own system -- this ledger
+            -- records the GROSS indemnity and never nets anything. Only the
+            -- insurer knows whether the premium was actually settled, and
+            -- it says so by calling PolicyToken_Reinstate.
+            newCid <- create this with
+              coverages = newCoverages
+              status = PS_PartiallyPaid
+              version = version + 1
+            pure EvaluateTriggerResult with
+              trigger = result
+              newPolicyCid = Some newCid
+              payouts = legs
+              unroutedRemainder = remainderOpt
+
+    -- Module 3: the final burn on premium default -- PHASE TWO of
+    -- termination, and until Stage 4 this choice existed, compiled, was
+    -- tested, and was called by nothing.
+    --
+    -- Termination (PolicyToken_Terminate) ends the CONTRACT. It deliberately
+    -- does NOT archive the token, because a loss during the notice period is
+    -- payable and the resulting PayoutApproved is an obligation that
+    -- survives termination -- archiving the policy while a payout is still
+    -- open would orphan that obligation and break the chain from a payout
+    -- back to the policy it came from. So the token stays live, in
+    -- DS_Terminated with coverage already ended, until every payout raised
+    -- on it has reached a terminal state. Only then is it burned here.
+    --
+    -- The guard is on the ledger, not just in the sweeper that calls it: a
+    -- token that is not terminated cannot be archived for non-payment.
+    -- Whether the payouts are actually all resolved is checked off-ledger
+    -- (dispatch/dispatcher.js, against payout_events) -- PayoutApproved
+    -- contracts are separate contracts this template cannot see.
+    choice PolicyToken_ArchiveForNonPayment : ()
+      with
+        archivedAt : Time
+        reason     : Text
+      controller insurer
+      do
+        -- m. 1434(4) added a second way a contract ends for non-payment, and
+        -- without this its token could never burn. The two remain distinct
+        -- states and distinct routes; only the archive path is shared,
+        -- because "the contract has ended and every payout on it is
+        -- resolved" is the same condition either way.
+        assertMsg "only a policy terminated for non-payment can be archived by this route"
+          (defaultState == DS_Terminated || defaultState == DS_TwoNoticeTerminated)
+        pure ()
+
+    -- Module 3: full burn at natural expiry with no outstanding claim.
+    -- archivedAt/reason (Stage 3 Part 1) record why and when on-ledger --
+    -- before this, an expiry archive was indistinguishable from any other
+    -- archive of this choice. Regardless of what remaining limit any
+    -- coverage still had: a policy reaching its term end expires, full
+    -- stop, and whatever was left simply lapses -- there is no re-mint
+    -- here to carry it forward into.
+    choice PolicyToken_ArchiveForExpiry : ()
+      with
+        archivedAt : Time
+        reason     : Text
+      controller insurer
+      do pure ()
+
+    -- The premium-default flow, rebuilt in Stage 4 to match TTK 6102
+    -- m. 1434(3). Notice served -> DS_GracePeriod, where coverage CONTINUES
+    -- IN FULL and a loss is payable. The notice period elapsing unpaid ->
+    -- DS_Terminated: the contract is `feshedilmiş olur`, deemed terminated.
+    --
+    -- What this replaced, and why. Until Stage 4 the period elapsing moved
+    -- the policy to a SUSPENDED state in which coverage stopped but the
+    -- contract survived and could be reinstated. That model conflicts with
+    -- 1434(3) on three counts: the statute terminates rather than suspends;
+    -- termination is a consequence, not a power the insurer exercises; and
+    -- m. 1452(3) makes 1434 non-derogable against the insured, so the
+    -- general conditions cannot introduce a suspension state either.
+    -- DS_Suspended and PolicyToken_Suspend are both gone.
+    --
+    -- Every choice here moves ONLY the default axis and leaves `status`
+    -- exactly as it found it -- the mirror image of EvaluateTrigger, which
+    -- moves only the claim axis. Controller is `insurer` alone throughout,
+    -- same reasoning as ArchiveForNonPayment: none of these is a
+    -- conflict-of-interest concern the way EvaluateTrigger is.
+    -- m. 1434(4): "Bir sigorta donemi icinde sigorta ettirene iki defa ihtar
+    -- gonderilmisse sigortaci, sigorta doneminin sonunda hukum dogurmak uzere
+    -- sozlesmeyi feshedebilir."
+    --
+    -- SENDING suffices. `gonderilmisse` attaches to the sending, twice, and
+    -- borrows none of (3)'s machinery -- (3) spells out "on gunluk sure
+    -- vererek ... bu surenin bitiminde", and this paragraph does not. The ten
+    -- days belong to (3).
+    --
+    -- The period is SUPPLIED, not derived: m. 1411 ties it to how the premium
+    -- is calculated and this system holds no calculation basis. What the
+    -- ledger can check, and does, is that two recorded service dates actually
+    -- fall inside the period the insurer names.
+    choice PolicyToken_ElectTwoNoticeTermination : ContractId PolicyToken
+      with
+        electedAt            : Time
+        insurancePeriodStart : Time
+        insurancePeriodEnd   : Time
+      controller insurer
+      do
+        assertMsg "the insurance period must start before it ends"
+          (insurancePeriodStart < insurancePeriodEnd)
+        -- A deferred effect needs a future instant to defer to. A period that
+        -- has already ended cannot receive one.
+        assertMsg "the insurance period has already ended -- a m. 1434(4) termination has no instant left to take effect at"
+          (insurancePeriodEnd > electedAt)
+        assertMsg "m. 1434(4) requires two ihtars sent within one insurance period"
+          (length (filter (\d -> d >= insurancePeriodStart && d <= insurancePeriodEnd) noticeServiceDates) >= 2)
+        -- REFUSED while a notice period is running, and this decides nothing
+        -- rather than deciding something. The right exists on the text the
+        -- moment the second ihtar is sent -- but defaultState holds ONE value,
+        -- and writing DS_TwoNoticeElected over a live DS_GracePeriod would
+        -- disable (3) and thereby rule that (4) beats it, which the text
+        -- nowhere says. (4)'s own case is the payer who HAS paid, so the axis
+        -- is normally DS_None here anyway.
+        assertMsg "a notice period is running on this policy -- m. 1434(3) must resolve before a m. 1434(4) election can be recorded"
+          (defaultState == DS_None)
+        assertMsg "policy is not in a state that can be terminated under m. 1434(4)"
+          (status == PS_Active || status == PS_PartiallyPaid)
+        create this with
+          defaultState = DS_TwoNoticeElected
+          twoNoticeElectionAt = Some electedAt
+          twoNoticeEffectiveAt = Some insurancePeriodEnd
+          version = version + 1
+
+    -- The effect landing. Driven by a sweeper written as a state test, and
+    -- the instant comes from the FROZEN field rather than a clock -- so a
+    -- sweeper running three days late records the instant it would have
+    -- recorded on time.
+    --
+    -- Payment in the interval does NOT defeat this. m. 1434(4) attaches the
+    -- right to two ihtars having been SENT, not to an outstanding debt --
+    -- and payment is what made the paragraph reachable in the first place.
+    choice PolicyToken_ApplyTwoNoticeTermination : ContractId PolicyToken
+      with
+        appliedAt : Time
+      controller insurer
+      do
+        assertMsg "no m. 1434(4) election is pending on this policy"
+          (defaultState == DS_TwoNoticeElected)
+        case twoNoticeEffectiveAt of
+          None -> abort "a pending m. 1434(4) election with no effective instant"
+          Some eff -> do
+            assertMsg "the insurance period has not ended yet -- a m. 1434(4) termination cannot take effect early"
+              (appliedAt >= eff)
+            create this with
+              defaultState = DS_TwoNoticeTerminated
+              -- Cover ends when the contract does, as under (3). The instant
+              -- is the frozen period end, never `appliedAt`.
+              coverageValidThrough = eff
+              version = version + 1
+
+    choice PolicyToken_ServeNotice : ContractId PolicyToken
+      with
+        noticeServiceDate : Time
+        noticeRecordedAt  : Time
+      controller insurer
+      do
+        assertMsg "notice can only be served on a policy not already in default"
+          (defaultState == DS_None)
+        assertMsg "policy is not in a state that can enter a notice period"
+          (status == PS_Active || status == PS_PartiallyPaid)
+        create this with
+          noticeServiceDate = Some noticeServiceDate
+          noticeRecordedAt = Some noticeRecordedAt
+          noticeCount = noticeCount + 1
+          -- The ONE touch m. 1434(4) makes to m. 1434(3)'s machinery: an
+          -- append, changing nothing about how notice works. Without the
+          -- individual dates, "two ihtars in one insurance period" cannot be
+          -- checked -- only asserted.
+          noticeServiceDates = noticeServiceDates ++ [noticeServiceDate]
+          defaultState = DS_GracePeriod
+          version = version + 1
+          -- coverageValidThrough deliberately untouched -- coverage
+          -- continues in full through the notice period. `status` likewise
+          -- untouched: a partially-paid policy stays partially paid while
+          -- also being in its notice period.
+
+    -- m. 1456(4): the insurer must notify a known real-right holder of the
+    -- policyholder's default and of the notice served. This RECORDS that the
+    -- insurer says it did so, with its own reported date -- exactly like the
+    -- service date, and for the same reason: the platform cannot observe a
+    -- notification, only be told of one. It generates and sends nothing.
+    -- m. 1457: the insured property has been attached.
+    --
+    -- Reported from outside with its own date -- the platform cannot observe
+    -- an icra file, and holds no case number, court, office identifier or
+    -- party identity for one. The routing decision needs none of those, and
+    -- holding one would make this platform the place such things live.
+    --
+    -- Recorded PER COVERAGE, which is an approximation and is stated as one:
+    -- the article attaches to the PROPERTY ("Sigortali mal haczedilirse"),
+    -- and this system has no property registry. The coverage is its nearest
+    -- honest unit -- the same approximation v17 made for the mortgagee's
+    -- charge.
+    choice PolicyToken_RecordAttachment : ContractId PolicyToken
+      with
+        coverageCode : Text
+        attachedAt   : Time
+      controller insurer
+      do
+        assertMsg ("unknown coverage: " <> coverageCode)
+          (any (\c -> c.coverageCode == coverageCode) coverages)
+        let Some target = find (\c -> c.coverageCode == coverageCode) coverages
+            alreadyAttached = case (target.attachedAt, target.attachmentLiftedAt) of
+              (None, _) -> False
+              (Some _, None) -> True
+              (Some a, Some l) -> l < a
+        assertMsg ("coverage " <> coverageCode <> " is already under attachment")
+          (not alreadyAttached)
+        create this with
+          coverages = map (\c -> if c.coverageCode == coverageCode
+                                 then c with attachedAt = Some attachedAt
+                                 else c) coverages
+          version = version + 1
+
+    -- m. 1457: the attachment has been lifted.
+    --
+    -- A fact the Code itself anticipates rather than one this system
+    -- invented: the officer's ihtar binds "DIGER BIR BILDIRIME KADAR" --
+    -- until a further notification. Routing returns to normal for payouts
+    -- arising afterwards; nothing reaches back.
+    choice PolicyToken_RecordAttachmentLifted : ContractId PolicyToken
+      with
+        coverageCode : Text
+        liftedAt     : Time
+      controller insurer
+      do
+        assertMsg ("unknown coverage: " <> coverageCode)
+          (any (\c -> c.coverageCode == coverageCode) coverages)
+        let Some target = find (\c -> c.coverageCode == coverageCode) coverages
+            attachedNow = case (target.attachedAt, target.attachmentLiftedAt) of
+              (None, _) -> False
+              (Some _, None) -> True
+              (Some a, Some l) -> l < a
+        assertMsg ("coverage " <> coverageCode <> " is not under attachment")
+          attachedNow
+        case target.attachedAt of
+          None -> abort "an attached coverage with no attachment instant"
+          Some a -> assertMsg "an attachment cannot be lifted before it was imposed"
+            (liftedAt >= a)
+        create this with
+          coverages = map (\c -> if c.coverageCode == coverageCode
+                                 then c with attachmentLiftedAt = Some liftedAt
+                                 else c) coverages
+          version = version + 1
+
+    -- m. 1456(6), the REQUEST. Reported by the insurer, which is who
+    -- receives it -- the platform is not addressable by a mortgagee and does
+    -- not want to be.
+    --
+    -- Deliberately unconnected to the premium-default flow, unlike
+    -- PolicyToken_RecordMortgageeNotice below: (4) and (5) fire because
+    -- something went wrong, (6) can be asked at any time for no reason at
+    -- all, and tying it to a default state would refuse the ordinary case.
+    choice PolicyToken_RecordMortgageeInfoRequest : ContractId PolicyToken
+      with
+        requestedAt : Time
+      controller insurer
+      do
+        assertMsg "there is no mortgagee on this policy to have made a m. 1456(6) request"
+          (isSome mortgagee)
+        -- One outstanding request at a time. A second while the first is
+        -- unanswered would overwrite the date the insurer's duty runs from,
+        -- and the unanswered one is the whole point of recording this.
+        assertMsg "a m. 1456(6) request is already outstanding on this policy -- record the response first"
+          (case (mortgageeInfoRequestedAt, mortgageeInfoProvidedAt) of
+             (None, _) -> True
+             (Some _, None) -> False
+             (Some req, Some prov) -> prov >= req)
+        create this with
+          mortgageeInfoRequestedAt = Some requestedAt
+          version = version + 1
+
+    -- m. 1456(6), the RESPONSE. The insurer reports having given the
+    -- information; the platform records that it says so and generates
+    -- nothing. What was disclosed is not recorded here -- the token already
+    -- carries the cover and the sum insured, and duplicating them into a
+    -- disclosure log would create a second copy that can drift from the
+    -- first.
+    choice PolicyToken_RecordMortgageeInfoProvided : ContractId PolicyToken
+      with
+        providedAt : Time
+      controller insurer
+      do
+        assertMsg "no m. 1456(6) request has been recorded on this policy to respond to"
+          (isSome mortgageeInfoRequestedAt)
+        assertMsg "there is no outstanding m. 1456(6) request on this policy"
+          (case (mortgageeInfoRequestedAt, mortgageeInfoProvidedAt) of
+             (Some _, None) -> True
+             (Some req, Some prov) -> prov < req
+             (None, _) -> False)
+        -- A response cannot predate the request it answers. Both dates are
+        -- externally reported, but the relation between them is intrinsic
+        -- rather than a comparison of two independently-supplied facts -- the
+        -- trap the v15 cover-start invariant fell into.
+        assertMsg "a m. 1456(6) response cannot predate the request it answers"
+          (case mortgageeInfoRequestedAt of
+             Some req -> providedAt >= req
+             None -> False)
+        create this with
+          mortgageeInfoProvidedAt = Some providedAt
+          version = version + 1
+
+    choice PolicyToken_RecordMortgageeNotice : ContractId PolicyToken
+      with
+        notifiedAt : Time
+      controller insurer
+      do
+        assertMsg "there is no mortgagee on this policy to notify"
+          (isSome mortgagee)
+        assertMsg "a mortgagee notification only makes sense once notice has been served"
+          (defaultState == DS_GracePeriod || defaultState == DS_Terminated)
+        create this with
+          mortgageeNotifiedAt = Some notifiedAt
+          version = version + 1
+
+    -- PHASE ONE of termination. Reachable only from DS_GracePeriod, so a
+    -- contract cannot be terminated without notice having been served and
+    -- recorded first.
+    --
+    -- terminationInstant is NOT a clock reading. It is the externally
+    -- supplied notice service date plus the policy's own grace period,
+    -- computed off-ledger (dispatch/dispatcher.js) and passed in -- this
+    -- choice applies the value it is given and reads no clock. The sweeper
+    -- that queues it only OBSERVES that the period elapsed; the instant
+    -- itself was fixed the moment notice was served.
+    --
+    -- coverageValidThrough moves to the termination instant: losses after it
+    -- are outside cover, losses before it are not. unrunDays is recorded
+    -- alongside because m. 1419 requires return of premium for the unrun
+    -- days -- the facts, never the arithmetic.
+    --
+    -- The token is deliberately NOT archived here. See
+    -- PolicyToken_ArchiveForNonPayment for phase two and why.
+    choice PolicyToken_Terminate : ContractId PolicyToken
+      with
+        terminationInstant          : Time
+        unrunDays                   : Int
+        mortgageeContinuationEndsAt : Optional Time
+      controller insurer
+      do
+        assertMsg "only a policy in its notice period can be terminated for non-payment"
+          (defaultState == DS_GracePeriod)
+        -- THE FREEZE, and what it rests on. m. 1431(4) says that on the
+        -- sigortali's undertaking "sozlesme bu kisilerle DEVAM EDER"; m.
+        -- 1434(3) says that at the end of the notice period "sozlesme
+        -- FESHEDILMIS olur". A contract cannot both continue and have been
+        -- terminated, so a substitution recorded during a running notice
+        -- period must stop that termination completing.
+        --
+        -- This is the incompatibility of those two phrases and NOT an
+        -- invented rule: no article says the clock stops, resets or runs on,
+        -- and this asserts none of those. It refuses the one outcome the two
+        -- phrases cannot share. The notice facts stay on the token untouched,
+        -- and defaultState is deliberately not cleared either -- an
+        -- undertaking is not a payment, and the premium is as unpaid as it
+        -- was. If the new party also fails to pay, the ordinary m. 1434(3)
+        -- machine runs against them from the start: a new ihtar, a new ten
+        -- days.
+        assertMsg "the contract was taken over by the sigortali under m. 1431(4) and continues with them -- it cannot also be terminated for the default that preceded the takeover"
+          (isNone substitutedAt)
+        assertMsg "unrunDays cannot be negative"
+          (unrunDays >= 0)
+        -- m. 1456(5) opens a continuation window for known real-right
+        -- holders at termination. Its length is configuration supplied from
+        -- outside, never a literal here, and it is only meaningful when the
+        -- policy actually names a mortgagee.
+        assertMsg "a mortgagee continuation window requires a mortgagee on the policy"
+          (isNone mortgageeContinuationEndsAt || isSome mortgagee)
+        create this with
+          coverageValidThrough = terminationInstant
+          terminationInstant = Some terminationInstant
+          unrunDays = Some unrunDays
+          mortgageeContinuationEndsAt
+          defaultState = DS_Terminated
+          version = version + 1
+
+    -- m. 1456(5): the real-right holder's election within the continuation
+    -- window, recorded if one is reported. Recording only -- the takeover
+    -- itself is deliberately not implemented, and nothing in this system
+    -- acts on ME_Continue.
+    choice PolicyToken_RecordMortgageeElection : ContractId PolicyToken
+      with
+        election : MortgageeElection
+      controller insurer
+      do
+        assertMsg "there is no mortgagee on this policy"
+          (isSome mortgagee)
+        assertMsg "an election only arises once the contract has terminated"
+          (defaultState == DS_Terminated)
+        create this with
+          mortgageeElection = Some election
+          version = version + 1
+
+    -- Payment arrived INSIDE the notice period, so the default never
+    -- matured into termination and the contract simply continues.
+    -- coverageValidThrough restores to `expiry` (which never moved), and
+    -- `status` is left exactly as found -- a policy that was partially paid
+    -- before it defaulted is still partially paid after.
+    --
+    -- Stage 4 NARROWED this: it used to be reachable from the suspended
+    -- state as well, i.e. it could revive a policy after the period had
+    -- elapsed. Under m. 1434(3) there is nothing to revive at that point --
+    -- the contract is terminated, and what would follow is a NEW contract,
+    -- not a reinstatement of the old one. So DS_Terminated is not a valid
+    -- starting state here, and the assertion says so.
+    --
+    -- Reinstatement remains the ONLY way out of DS_GracePeriod other than
+    -- termination: the system cannot observe a premium payment, so nothing
+    -- else -- least of all a claim payout -- may clear it. The insurer
+    -- knows, and says so by exercising this.
+    choice PolicyToken_Reinstate : ContractId PolicyToken
+      controller insurer
+      do
+        assertMsg "only a policy inside its notice period can be reinstated -- a terminated contract has ended"
+          (defaultState == DS_GracePeriod)
+        create this with
+          coverageValidThrough = expiry
+          defaultState = DS_None
+          version = version + 1
+
+    -- ======================================================================
+    -- m. 1434(2) -- FIRST-premium default: cayma, not fesih
+    -- ======================================================================
+    --
+    -- A different mechanism from the block above, not a variant of it. The
+    -- paragraph gives no ihtar, no ten days and no service date; it gives a
+    -- three-month window running from the due date, and two routes out of it.
+    --
+    -- Whether cayma leaves the contract as never having existed is NOT
+    -- decided here. The text does not say: m. 1441, titled "Caymanın
+    -- hükümleri", sits in the disclosure-obligation chain (1435->1442) and
+    -- addresses only premium entitlement, while m. 1430(3) shows cayma
+    -- operating on a contract that plainly exists. These choices record the
+    -- facts a later reading would need -- the reported due date, the
+    -- withdrawal date, which path ended it, whether enforcement was reported
+    -- -- and encode no answer. The token is re-minted, not archived, so the
+    -- interpretation can be settled without rebuilding.
+    --
+    -- Controller is `insurer` throughout, same reasoning as the notice block:
+    -- none of these is a conflict-of-interest concern the way EvaluateTrigger
+    -- is.
+
+    -- The insurer reports that a first instalment, or a premium payable in
+    -- one sum, fell due on a given date and has not been paid. m. 1431(1)
+    -- puts that date at contract formation against delivery of the policy;
+    -- this platform can observe neither, so it is told.
+    --
+    -- Reporting it is the insurer asserting non-payment as of that date --
+    -- the platform cannot observe a payment either, which is why the state is
+    -- entered on the report rather than derived from one.
+    choice PolicyToken_RecordPremiumDueDate : ContractId PolicyToken
+      with
+        dueDate : Time
+      controller insurer
+      do
+        assertMsg "a first-premium due date can only be reported on a policy not already in default"
+          (defaultState == DS_None)
+        assertMsg "the first-premium mechanism (m. 1434(2)) does not apply to a policy already under notice for a subsequent premium (m. 1434(3))"
+          (isNone noticeServiceDate)
+        assertMsg "a first-premium due date is reported once and not restated"
+          (isNone premiumDueDate)
+        create this with
+          premiumDueDate = Some dueDate
+          defaultState = DS_FirstPremiumUnpaid
+          version = version + 1
+          -- coverageValidThrough deliberately untouched. Whether cover ever
+          -- began is m. 1421's question, not this one's, and this task does
+          -- not answer it.
+
+    -- The insurer reports that it pursued the premium claim "dava veya takip
+    -- yoluyla". Its presence forecloses m. 1434(2)'s second sentence: the
+    -- deemed withdrawal follows only from the claim NOT having been pursued.
+    --
+    -- Commencement only. Whether the enforcement proved fruitless is
+    -- m. 1431(4)'s trigger for the sigortalı taking over the premium, which
+    -- is a different fact and is deliberately not implemented.
+    choice PolicyToken_RecordEnforcementCommenced : ContractId PolicyToken
+      with
+        commencedAt : Time
+      controller insurer
+      do
+        assertMsg "enforcement can only be reported on a policy in first-premium default"
+          (defaultState == DS_FirstPremiumUnpaid)
+        assertMsg "enforcement commencement is reported once"
+          (isNone enforcementCommencedAt)
+        create this with
+          enforcementCommencedAt = Some commencedAt
+          version = version + 1
+
+    -- The insurer reports receiving the first premium. This is the ordinary
+    -- path by which cover begins (m. 1421(1)), and it is ALSO the exit from
+    -- m. 1434(2)'s default when a due date had been reported -- the same
+    -- fact, doing two jobs.
+    --
+    -- It is therefore reachable from DS_None (the normal case: minted, then
+    -- paid) as well as from DS_FirstPremiumUnpaid (paid after the default was
+    -- recorded). Deliberately NOT PolicyToken_Reinstate: that is the exit
+    -- from m. 1434(3)'s notice period, a different mechanism.
+    --
+    -- paidAt is the insurer's REPORTED date, not a clock reading. It was a
+    -- discarded argument until this package -- the choice took it and never
+    -- assigned it, and the dispatcher passed Date.now(). That was harmless
+    -- while nothing depended on it and is not harmless now: this date is
+    -- when the insurer's liability begins.
+    --
+    -- The due date, where one was reported, stays on the token. It is a fact
+    -- about what happened, not a flag to be cleared -- the same reasoning
+    -- that keeps noticeServiceDate after reinstatement.
+    -- m. 1431(4), fact ONE of three. Enforcement against the sigorta ettiren
+    -- for the premium debt proved fruitless.
+    --
+    -- Deliberately NOT the same field as enforcementCommencedAt, which v14
+    -- built for m. 1434(2). Commencement is what SUSPENDS the deemed
+    -- withdrawal; fruitlessness is what OPENS substitution. One can exist
+    -- without the other, and the m. 1434(3) notice mechanism has no
+    -- commencement field at all -- making this depend on one would force that
+    -- path to report something it was never given a place to record.
+    --
+    -- The date is supplied, never a clock reading: the platform cannot
+    -- observe an enforcement proceeding, only be told about one.
+    choice PolicyToken_RecordEnforcementFruitless : ContractId PolicyToken
+      with
+        fruitlessAt : Time
+        route       : EnforcementRoute
+      controller insurer
+      do
+        -- "Baskasi lehine yapilan sigortada" is the paragraph's first
+        -- condition. A policy on its own account has nobody to substitute in
+        -- and never had.
+        assertMsg "m. 1431(4) applies only to insurance taken for another's account -- this policy's sigortali is its sigorta ettiren"
+          (insured /= policyholder)
+        assertMsg "the policyholder has already been substituted under m. 1431(4)"
+          (isNone substitutedAt)
+        assertMsg "a contract that has ended cannot have its premium enforced into a substitution"
+          (defaultState /= DS_Terminated && defaultState /= DS_WithdrawnForFirstPremium)
+        assertMsg "policy is not in a state where a premium debt can be enforced"
+          (status == PS_Active || status == PS_PartiallyPaid)
+        create this with
+          enforcementFruitlessAt = Some fruitlessAt
+          enforcementRoute = Some route
+
+    -- m. 1431(4), fact TWO. The insurer notified the sigortali.
+    --
+    -- On the text this is a CONDITION of the right, not merely its occasion:
+    -- "bu durumun sigortaci tarafindan kendilerine bildirilmesi halinde ...
+    -- ustlenirlerse" chains two conditionals. It is also the insurer's own
+    -- act, which leaves an asymmetry the text does not resolve -- an insurer
+    -- that never notifies could reach the otherwise-branch by silence, while
+    -- m. 1452(3) makes this paragraph non-derogable against the sigortali.
+    -- That question is for a lawyer and is deliberately not answered
+    -- here; the platform simply requires the fact.
+    choice PolicyToken_RecordSubstitutionNotice : ContractId PolicyToken
+      with
+        notifiedAt : Time
+      controller insurer
+      do
+        assertMsg "the insurer cannot notify the sigortali under m. 1431(4) before enforcement has been reported fruitless"
+          (isSome enforcementFruitlessAt)
+        assertMsg "the policyholder has already been substituted under m. 1431(4)"
+          (isNone substitutedAt)
+        create this with
+          substitutionNotifiedAt = Some notifiedAt
+
+    -- m. 1431(4), fact THREE, and the only choice in this file that changes
+    -- who a party is. It is deliberately NOT reachable through
+    -- PolicyToken_Amend, which is forbidden to touch `policyholder` and stays
+    -- forbidden: a change of party needs its own justification, its own
+    -- preconditions and its own name in the transaction log.
+    --
+    -- "sozlesme bu kisilerle devam eder" -- the contract continues WITH the
+    -- sigortali, not merely for their benefit, so `policyholder` becomes
+    -- `insured`. m. 1454(1) leaves the contract's rights with the sigortali
+    -- throughout, so afterwards one person holds both roles and the paragraph
+    -- is spent -- there is no longer a distinct third party to substitute in,
+    -- which is why this can never fire twice.
+    choice PolicyToken_SubstitutePolicyholder : ContractId PolicyToken
+      with
+        substitutedAtInstant : Time
+      controller insurer
+      do
+        assertMsg "m. 1431(4) applies only to insurance taken for another's account -- this policy's sigortali is its sigorta ettiren"
+          (insured /= policyholder)
+        assertMsg "the sigortali cannot take over before enforcement has been reported fruitless (m. 1431(4))"
+          (isSome enforcementFruitlessAt)
+        assertMsg "the sigortali cannot take over before the insurer's notification has been recorded (m. 1431(4))"
+          (isSome substitutionNotifiedAt)
+        assertMsg "the policyholder has already been substituted under m. 1431(4)"
+          (isNone substitutedAt)
+        -- Guard 1. "Sozlesme bu kisilerle devam eder" presupposes a contract
+        -- to continue, and after termination or withdrawal there is not one.
+        assertMsg "the contract has already ended -- there is nothing left for the sigortali to continue"
+          (defaultState /= DS_Terminated && defaultState /= DS_WithdrawnForFirstPremium)
+        assertMsg "policy is not in a state that can be taken over"
+          (status == PS_Active || status == PS_PartiallyPaid)
+        -- defaultState is carried through UNCHANGED by `create this with`.
+        -- An undertaking is not a payment; the premium is exactly as unpaid
+        -- as it was, so clearing the default would assert something the text
+        -- does not. What the substitution does prevent is the termination
+        -- completing -- see PolicyToken_Terminate above for what that rests
+        -- on.
+        create this with
+          policyholder = insured
+          supersededPolicyholder = Some policyholder
+          substitutedAt = Some substitutedAtInstant
+          version = version + 1
+
+    choice PolicyToken_RecordFirstPremiumPaid : ContractId PolicyToken
+      with
+        paidAt : Time
+      controller insurer
+      do
+        assertMsg "the first premium can only be reported paid on a policy not in a subsequent-premium default (m. 1434(3) is a different mechanism)"
+          (defaultState == DS_None || defaultState == DS_FirstPremiumUnpaid)
+        -- The direction guard. m. 1452(3) forbids varying m. 1421 to the
+        -- insured's detriment: an agreed start EARLIER than payment is in
+        -- their favour and stands; one LATER than payment would leave them
+        -- paying for a gap the Code's own default would have covered.
+        assertMsg "an agreed cover start later than the reported payment date would vary m. 1421 to the insured's detriment, which m. 1452(3) does not permit"
+          (isNone coverageBeganAt || coverageBeganAt <= Some paidAt)
+        create this with
+          -- Only if not already set: cover begun by agreement is not
+          -- restarted by a later payment. The earlier instant governs.
+          coverageBeganAt = case coverageBeganAt of
+            Some began -> Some began
+            None -> Some paidAt
+          coverageStartBasis = case coverageStartBasis of
+            Some basis -> Some basis
+            None -> Some CSB_PremiumPaid
+          defaultState = DS_None
+          version = version + 1
+
+    -- Withdrawal under m. 1434(2), by either route.
+    --
+    -- The window arithmetic is NOT done here. Like the termination instant,
+    -- the date is computed off-ledger from the reported due date plus the
+    -- configured window and passed in, so a sweeper running late records the
+    -- instant it would have recorded on time.
+    choice PolicyToken_WithdrawForFirstPremium : ContractId PolicyToken
+      with
+        withdrawnAt : Time
+        path        : WithdrawalPath
+      controller insurer
+      do
+        assertMsg "only a policy in first-premium default can be withdrawn from under m. 1434(2)"
+          (defaultState == DS_FirstPremiumUnpaid)
+        assertMsg "withdrawal requires a reported premium due date -- both of m. 1434(2)'s periods run from it"
+          (isSome premiumDueDate)
+        -- The deemed route exists precisely BECAUSE the claim was not pursued.
+        -- Where enforcement has been reported, sentence 2 does not apply and
+        -- only the insurer's own act can end the contract.
+        assertMsg "the deemed withdrawal follows from the claim NOT having been pursued -- enforcement was reported on this policy"
+          (path /= WP_DeemedNoEnforcement || isNone enforcementCommencedAt)
+        create this with
+          withdrawnAt = Some withdrawnAt
+          withdrawalPath = Some path
+          defaultState = DS_WithdrawnForFirstPremium
+          version = version + 1
+          -- The token is re-minted rather than archived, deliberately: see
+          -- the note at the head of this block. Archiving would encode a
+          -- holding on retroactivity that the text does not support.
+
+    -- Stage 3 Part 3, Part B: an endorsement (zeyilname) -- a change to a
+    -- LIVE policy's terms, archive-and-re-mint with version + 1 and the
+    -- reason recorded on the new token. Distinct from a renewal, which is
+    -- a new policy with a new term carrying a predecessorRef, and which is
+    -- deliberately NOT implemented here.
+    --
+    -- Every change is expressed declaratively as a delta rather than as a
+    -- whole replacement coverage list, for one specific reason:
+    -- remainingLimit must survive an endorsement that does not explicitly
+    -- concern it. Handing in a full list would make silently resetting a
+    -- drawn-down limit back to its sum insured the easiest possible
+    -- mistake to make -- it would just look like "the caller sent the
+    -- coverage". A delta cannot express that by accident.
+    --
+    -- Deliberately CANNOT change: policyNo, insurer, policyholder,
+    -- predecessorRef (identity and the renewal chain), version (always
+    -- +1), noticeServiceDate/noticeRecordedAt (default history is not
+    -- rewritable by an endorsement), or defaultState/status (those axes
+    -- move only through their own choices).
+    choice PolicyToken_Amend : ContractId PolicyToken
+      with
+        reason : EndorsementReason
+        -- coverageCode -> its NEW sumInsured. remainingLimit moves by the
+        -- same delta (see below), never resets.
+        sumInsuredChanges     : [(Text, Decimal)]
+        coveragesToAdd        : [Coverage]
+        coverageCodesToRemove : [Text]
+        -- Extends the term. Moves expiry and coverageValidThrough
+        -- together, always -- letting them drift apart here is exactly
+        -- the confusion the two-field split exists to prevent.
+        newExpiry             : Optional Time
+        -- A flag plus a value, rather than the nested
+        -- `Optional (Optional Party)` this started as. Three states are
+        -- needed -- leave alone / clear / set -- and one Optional only has
+        -- two, but the nested form was rejected outright by this
+        -- participant's JSON decoder ("Expected ujson.Arr (data: null)"),
+        -- so the tri-state is carried explicitly instead. changeX = False
+        -- leaves the role untouched and ignores newX entirely; changeX =
+        -- True applies newX, whether that is Some p or None.
+        changeBeneficiary     : Bool
+        newBeneficiary        : Optional Party
+        changeMortgagee       : Bool
+        newMortgagee          : Optional Party
+        newDocumentHash       : Optional Text
+      controller insurer
+      do
+        assertMsg "a terminated contract cannot be amended -- there is no contract left to amend"
+          (defaultState /= DS_Terminated)
+        assertMsg "only an active or partially paid policy can be amended"
+          (status == PS_Active || status == PS_PartiallyPaid)
+
+        -- Removals first, so a code can be removed and re-added in one
+        -- endorsement (replacing a coverage outright) without tripping the
+        -- duplicate check.
+        forA_ coverageCodesToRemove $ \code -> do
+          assertMsg ("cannot remove unknown coverage: " <> code)
+            (any (\c -> c.coverageCode == code) coverages)
+          let Some doomed = find (\c -> c.coverageCode == code) coverages
+          -- A coverage that has paid out carries claim history in the gap
+          -- between its sumInsured and its remainingLimit. Dropping it from
+          -- the list would erase that, so this is refused outright rather
+          -- than allowed with a warning.
+          assertMsg ("cannot remove coverage " <> code <> ": it has already paid out")
+            (doomed.remainingLimit == doomed.sumInsured)
+        let afterRemovals = filter (\c -> notElem c.coverageCode coverageCodesToRemove) coverages
+
+        -- Sum-insured changes: remainingLimit moves by the SAME delta, so
+        -- raising a sum insured raises what is left by that amount and
+        -- lowering it lowers what is left. It never resets to the new sum
+        -- insured -- a policy that has already paid out 70k of 100k and is
+        -- endorsed up to 150k has 80k left, not 150k.
+        --
+        -- A reduction large enough to drive remainingLimit below zero is
+        -- not clamped: it falls through to the template's own
+        -- `remainingLimit >= 0.0` ensure and the whole endorsement is
+        -- rejected. Silently clamping would quietly forgive the
+        -- difference, which is a real money decision this choice has no
+        -- authority to make.
+        forA_ sumInsuredChanges $ \(code, _) ->
+          assertMsg ("cannot change sum insured of unknown coverage: " <> code)
+            (any (\c -> c.coverageCode == code) afterRemovals)
+        let afterChanges = map
+              (\c -> case lookup c.coverageCode sumInsuredChanges of
+                       None -> c
+                       Some newSumInsured ->
+                         c with
+                           sumInsured = newSumInsured
+                           remainingLimit = c.remainingLimit + (newSumInsured - c.sumInsured))
+              afterRemovals
+
+        let newCoverages = afterChanges ++ coveragesToAdd
+        -- These three are also enforced by the template's own ensure, but
+        -- asserted explicitly here so the failed outbox row names the
+        -- actual problem instead of a generic precondition failure.
+        assertMsg "an endorsement cannot leave a policy with no coverages"
+          (not (null newCoverages))
+        assertMsg "an endorsement cannot produce duplicate coverage codes"
+          (allDistinct (map (.coverageCode) newCoverages))
+        assertMsg "an endorsement cannot leave a coverage's remaining limit above its sum insured"
+          (all (\c -> c.remainingLimit <= c.sumInsured) newCoverages)
+
+        let effectiveExpiry = fromOptional expiry newExpiry
+        create this with
+          coverages = newCoverages
+          expiry = effectiveExpiry
+          coverageValidThrough = effectiveExpiry
+          beneficiary = if changeBeneficiary then newBeneficiary else beneficiary
+          mortgagee = if changeMortgagee then newMortgagee else mortgagee
+          documentHash = case newDocumentHash of
+            None -> documentHash
+            Some h -> Some h
+          amendmentReason = Some reason
+          version = version + 1

@@ -1,0 +1,30 @@
+{
+  "name": "insurance-tokenization-node",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Node.js orchestration layer for the parametric insurance tokenization platform: policy intake API, scheduled oracle bot, and ledger dispatcher.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dispatch": "node src/dispatch/dispatcher.js",
+    "oracle": "node src/oracle/oracleBot.js",
+    "listener": "node src/listeners/payoutListener.js",
+    "expiry-sweeper": "node src/sweepers/expirySweeper.js",
+    "grace-sweeper": "node src/sweepers/graceSweeper.js",
+    "first-premium-sweeper": "node src/sweepers/firstPremiumSweeper.js",
+    "two-notice-sweeper": "node src/sweepers/twoNoticeSweeper.js",
+    "onboard-insurer": "node src/scripts/onboardInsurer.js",
+    "test": "echo npm test half 1 of 2 - the error handler, health, the command id and the event window, which need nothing, then enumOrdering and schema drift, read-only against DATABASE_URL, needs DATABASE_MAINT_URL && node --test --test-concurrency=1 test/errorHandler.test.mjs test/health.test.mjs test/commandId.test.mjs test/eventWindow.test.mjs test/enumOrdering.test.mjs test/eventHandlers.test.mjs test/schemaDrift.test.mjs && echo npm test half 2 of 2 - the tests that write, guarded, against TEST_DATABASE_URL, then the leak gate in its own process && node test-support/runWritersThenGate.mjs",
+    "test:db": "node --test --test-concurrency=1 test/enumOrdering.test.mjs test/eventHandlers.test.mjs test/testDbGuard.test.mjs test/guardFirstImport.test.mjs test/guardOrdering.test.mjs test/schemaDrift.test.mjs test/errorHandler.test.mjs test/health.test.mjs test/processHandlers.test.mjs test/commandId.test.mjs test/eventWindow.test.mjs test/evidenceLock.test.mjs",
+    "doctor": "node ../scripts/doctor.mjs",
+    "verify-all": "node ../scripts/runVerifications.mjs"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "node-cron": "^3.0.3",
+    "pg": "^8.13.1"
+  }
+}
