@@ -14,8 +14,11 @@
 // carries hosts, ports and driver internals, and this endpoint has no
 // authentication -- the same reason errorHandler.js keeps a 5xx body fixed.
 // A failed probe is the answer here, not an error to log: /health is polled,
-// and a real outage is logged once by the dispatcher, which is the part that
-// stops working.
+// and a real outage is logged by the dispatcher, which is the part that
+// stops working -- a ledger outage once when it starts and then every five
+// minutes (noteLedgerUnreachable), and only while a pending row makes runOnce
+// probe the ledger at all; a database outage on every poll it lasts,
+// because runOnce's first query fails and startDispatcher logs each failure.
 
 // Short, because /health is polled and must stay cheap: a hung dependency is
 // reported down rather than holding the response open.

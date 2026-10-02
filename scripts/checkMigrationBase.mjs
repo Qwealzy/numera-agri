@@ -16,8 +16,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-const ENV_PATH = new URL('../node/.env', import.meta.url).pathname.replace(/^\//, '');
+const ENV_PATH = fileURLToPath(new URL('../node/.env', import.meta.url));
 // 2026-09-17: the process environment wins over node/.env, as in doctor.mjs
 // and setupTestDb.mjs, so a URL given on the command line is the one used.
 for (const line of fs.readFileSync(ENV_PATH, 'utf8').split('\n')) {
@@ -36,7 +37,7 @@ const env = { ...process.env, PGPASSWORD: decodeURIComponent(url.password) };
 const run = (exe, args, opts = {}) =>
   execFileSync(path.join(PG, exe), args, { env, encoding: 'utf8', ...opts });
 
-const ROOT = new URL('..', import.meta.url).pathname.replace(/^\//, '');
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const stamp = Date.now().toString(36);
 const DB_SCHEMA = `basecheck_schema_${stamp}`;
 const DB_MIGRATE = `basecheck_migrate_${stamp}`;

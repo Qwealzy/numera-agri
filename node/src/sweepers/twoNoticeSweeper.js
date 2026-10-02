@@ -2,6 +2,7 @@ import { pathToFileURL } from 'node:url';
 import cron from 'node-cron';
 import { pool } from '../db.js';
 import { config } from '../config.js';
+import { lastWindowPending } from './expirySweeper.js';
 
 // The m. 1434(4) sweeper: the elected termination taking effect.
 //
@@ -63,6 +64,48 @@ async function runOnce({ insurerIds } = {}) {
       `INSERT INTO policy_events (policy_no, event_type) VALUES ($1, 'two_notice_termination')
        ON CONFLICT (policy_no)
          WHERE event_type = 'two_notice_termination' AND status IN ('pending', 'processing')
+       DO NOTHING`,
+      [policy.id]
+    );
+  }
+
+  // PHASE TWO -- the token of a contract whose elected termination has landed.
+  // The same treatment graceSweeper.js's phase two gives a terminated one, and
+  // for the same reasons: the token is burned only once every payout raised on
+  // it has reached a terminal state, and only once the last window before the
+  // contract's end -- here two_notice_effective_at -- has been evaluated and no
+  // trigger row of the policy is still pending or processing (v22). Only
+  // the archive path is shared with the notice-period termination, as on the
+  // ledger (PolicyToken_ArchiveForNonPayment); the states stay distinct. Without this
+  // such a token was never archived: the expiry sweeper's own wait looks at the
+  // window before `expiry`, where readings the oracle no longer folds stay
+  // without a row. Also a state test, and idempotent; each deferral is logged
+  // with its reason and the next run looks again.
+  const { rows: burnable } = await pool.query(
+    `SELECT p.id, p.two_notice_effective_at, p.coverage_began_at, p.event_window_timezone,
+            p.event_window_start_hour, p.event_aggregation, now() AS swept_at
+       FROM policies p
+     WHERE p.default_state = 'two_notice_terminated'
+       AND p.daml_contract_id IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM payout_events pe
+         WHERE pe.policy_id = p.id AND pe.resolved_at IS NULL
+       )` + (insurerIds === undefined ? '' : ' AND p.insurer_id = ANY($1)'),
+    insurerIds === undefined ? undefined : [insurerIds]
+  );
+  console.log(
+    `[twoNoticeSweeper] ${burnable.length} two-notice-terminated polic${burnable.length === 1 ? 'y' : 'ies'} ` +
+      'with all payouts resolved'
+  );
+  for (const policy of burnable) {
+    const pending = await lastWindowPending(policy, policy.two_notice_effective_at);
+    if (pending) {
+      console.log(`[twoNoticeSweeper] two-notice-terminated policy ${policy.id} not archived yet: ${pending}`);
+      continue;
+    }
+    await pool.query(
+      `INSERT INTO policy_events (policy_no, event_type) VALUES ($1, 'termination_archive')
+       ON CONFLICT (policy_no) WHERE event_type = 'termination_archive' AND status IN ('pending', 'processing')
        DO NOTHING`,
       [policy.id]
     );

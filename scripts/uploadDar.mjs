@@ -4,8 +4,9 @@
 // posts the bytes directly with a correctly generated HS256 token.
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
-const ENV_PATH = new URL('../node/.env', import.meta.url).pathname.replace(/^\//, '');
+const ENV_PATH = fileURLToPath(new URL('../node/.env', import.meta.url));
 for (const line of fs.readFileSync(ENV_PATH, 'utf8').split('\n')) {
   const m = line.trim().match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
   if (m) process.env[m[1]] = m[2].trim().replace(/^["']/, '').replace(/["']$/, '');
@@ -27,7 +28,11 @@ const token = process.env.DAML_LEDGER_TOKEN
   || jwt(process.env.DAML_UNSAFE_JWT_SECRET ?? 'unsafe', process.env.DAML_UNSAFE_JWT_SUB ?? 'ledger-api-user');
 
 const base = process.env.DAML_JSON_API_URL ?? 'http://localhost:3975';
-const other = base.replace(/:\d+/, ':2975');
+// The second participant is DAML_JSON_API_URL_ORACLE, read through
+// config.js, where it is set. Unset or empty, it is what it always was: the
+// same host as DAML_JSON_API_URL on port 2975, LocalNet's App User participant.
+const { config } = await import('../node/src/config.js');
+const other = config.daml.jsonApiUrlOracle ?? base.replace(/:\d+/, ':2975');
 
 for (const url of [...new Set([base, other])]) {
   try {

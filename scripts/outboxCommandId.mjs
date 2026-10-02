@@ -5,7 +5,7 @@
 // handleActivation and handleRenewal call createContract (`create-`); every
 // other handler in EVENT_HANDLERS calls exerciseChoice or, in handleTrigger,
 // commandIdFor('exercise', ...) (`exercise-`). `release` is notImplemented
-// and `suspension` has no handler, so neither submits anything. doctor only
+// and so is `suspension`, so neither submits anything. doctor only
 // prints the id; it never asks the ledger for it.
 //
 // The one copy of this mapping: scripts/doctor.mjs and

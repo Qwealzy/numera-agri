@@ -26,7 +26,7 @@ WITH demo_insurer AS (
   RETURNING id
 )
 INSERT INTO payout_tiers
-  (insurer_id, product_code, peril_type, tier_order, label, threshold_min, threshold_max, payout_percentage)
-SELECT id, 'FROST-STANDARD', 'FROST', 1, 'Mild frost (-2C to 0C)', -2.0, 0.0, 25.00 FROM demo_insurer
+  (insurer_id, product_code, peril_type, tier_order, label, threshold_min, threshold_max, payout_percentage, shape)
+SELECT id, 'FROST-STANDARD', 'FROST', 1, 'Mild frost (-2C to 0C)', -2.0, 0.0, 25.00, 'TS_Step' FROM demo_insurer
 UNION ALL
-SELECT id, 'FROST-STANDARD', 'FROST', 2, 'Severe frost (below -4C)', NULL, -4.0, 100.00 FROM demo_insurer;
+SELECT id, 'FROST-STANDARD', 'FROST', 2, 'Severe frost (below -4C)', NULL, -4.0, 100.00, 'TS_Step' FROM demo_insurer;

@@ -14,9 +14,9 @@
 //
 // The verify scripts write real rows (policies, events, readings) to the
 // working database, and each rewrites its own docs/m*-live-run.txt evidence
-// file -- untracked and not ignored, so a run leaves them in `git status`.
-// That is how they have always worked; this does not change it, it only lists
-// the files at the end.
+// file -- listed in .gitignore, so a run no longer leaves them in `git status`.
+// Writing both is how the scripts have always worked; this does not change
+// it, it only lists the files at the end.
 //
 //   node scripts/runVerifications.mjs [api-key]   the key is passed to every
 //                                                 script (their default is
@@ -28,6 +28,7 @@ import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { assertMaintSameServer } from '../node/test-support/testDbGuard.mjs';
+import { teardownRun } from './lib/policyTeardown.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const env = {};
@@ -59,14 +60,23 @@ async function answers(url) {
 // Scoped to what the run made: contracts whose ids were not there before it
 // started, and rows created at or after it started. Anything older is left
 // exactly as it was.
-async function insurerParties() {
+//
+// and only under the insurer the run uses -- the one whose API key every
+// script is given (their default is demo-api-key) -- and, under it, only the
+// policies the run created (scripts/lib/policyTeardown.mjs, teardownRun). No
+// verify script creates an insurer. A demo, or anything else, created during a
+// run under another insurer, or under this one for an older policy, is left as
+// it is.
+async function insurerParties(apiKey) {
   const { Client } = createRequire(path.join(ROOT, 'node', 'package.json'))('pg');
   const client = new Client({ connectionString: env.DATABASE_URL, connectionTimeoutMillis: 3000 });
   await client.connect();
   try {
     await client.query('SET default_transaction_read_only = on');
     const { rows } = await client.query(
-      `SELECT id, canton_party_id FROM insurers WHERE canton_party_id IS NOT NULL AND is_active = true`
+      `SELECT id, canton_party_id FROM insurers WHERE canton_party_id IS NOT NULL AND is_active = true
+          AND api_key_hash = encode(sha256($1::bytea), 'hex')`,
+      [apiKey]
     );
     return rows;
   } finally {
@@ -105,6 +115,9 @@ async function activeContracts(parties) {
       ['Insurance.PolicyToken', 'PolicyToken'],
       ['Insurance.PayoutBridge', 'PayoutApproved'],
       ['Insurance.PayoutBridge', 'ManualReviewRequired'],
+      // v22: the records a settlement or a close-unpaid leaves.
+      ['Insurance.PayoutBridge', 'PayoutSettled'],
+      ['Insurance.PayoutBridge', 'PayoutClosedUnpaid'],
     ]) {
       let entries;
       try {
@@ -114,7 +127,11 @@ async function activeContracts(parties) {
       }
       for (const e of entries) {
         const c = e.contractEntry?.JsActiveContract?.createdEvent;
-        if (c) found.set(c.contractId, { templateId: c.templateId, signatories: c.signatories, entity: entityName });
+        if (c) {
+          found.set(c.contractId, {
+            templateId: c.templateId, signatories: c.signatories, createArgument: c.createArgument, entity: entityName,
+          });
+        }
       }
     }
   }
@@ -182,7 +199,12 @@ const scripts = fs.readdirSync(path.join(ROOT, 'scripts')).filter((f) => /^verif
 const passthrough = process.argv.slice(2);
 const before = await fixtureInsurers();
 const evidenceBefore = evidenceMtimes();
-const parties = (await insurerParties()).map((r) => r.canton_party_id);
+const runInsurers = await insurerParties(passthrough[0] ?? 'demo-api-key');
+if (runInsurers.length === 0) {
+  console.log('Not run: no active insurer with a ledger party holds the API key the scripts are given.');
+  process.exit(2);
+}
+const parties = runInsurers.map((r) => r.canton_party_id);
 const contractsBefore = await activeContracts(parties);
 if (!contractsBefore.ok) {
   // Refusing to start, not failing the run: if the ledger cannot be read
@@ -212,55 +234,31 @@ for (const file of scripts) {
 }
 
 // --- teardown: take back what this run made --------------------------------
-const teardown = { archived: 0, failed: 0, rows: null, error: null };
+const teardown = { archived: 0, failed: 0, leftAlone: 0, rows: null, error: null };
 const contractsAfterRun = await activeContracts(parties);
 if (!contractsAfterRun.ok) {
   teardown.error = contractsAfterRun.error;
 } else {
-  for (const [contractId, c] of contractsAfterRun.contracts) {
-    if (contractsBefore.contracts.has(contractId)) continue; // older than this run
-    try {
-      const { exerciseChoice } = await import(pathToFileURL(path.join(ROOT, 'node', 'src', 'damlClient.js')).href);
-      const [, moduleName, entityName] = c.templateId.split(':');
-      await withRetry(() => exerciseChoice({
-        moduleName, entityName, contractId, choice: 'Archive', argument: {},
-        // PayoutApproved has two signatories; Archive needs both.
-        actAs: c.signatories?.length ? c.signatories : [parties[0]],
-      }));
-      teardown.archived += 1;
-    } catch (err) {
-      // An archive that timed out and was retried can come back "not active":
-      // the first attempt did land. The state this asks for is the state it
-      // is in, so it counts as archived -- and the gate below re-reads the
-      // ledger anyway, so a wrong call here cannot pass the run.
-      if (/NOT_ACTIVE|CONTRACT_NOT_FOUND|NOT_FOUND/i.test(err.message ?? '')) {
-        teardown.archived += 1;
-        continue;
-      }
-      teardown.failed += 1;
-      console.log(`  could not archive ${contractId.slice(0, 16)}... (${c.entity}): ${err.message.slice(0, 140)}`);
-    }
-  }
+  const { exerciseChoice } = await import(pathToFileURL(path.join(ROOT, 'node', 'src', 'damlClient.js')).href);
+  // PayoutApproved has two signatories; Archive needs both.
+  // An archive that timed out and was retried can come back "not active":
+  // the first attempt did land. The state this asks for is the state it
+  // is in, so it counts as archived -- and the gate below re-reads the
+  // ledger anyway, so a wrong call here cannot pass the run.
+  // (a PayoutApproved is now closed through the insurer's
+  // ConfirmSettlement instead, and its record archived; see archiveContract.)
   // Then the rows, in FK order, and only those this run created.
   const { Client } = createRequire(path.join(ROOT, 'node', 'package.json'))('pg');
   const client = new Client({ connectionString: maintUrl, connectionTimeoutMillis: 3000 });
   await client.connect();
   try {
-    await client.query('BEGIN');
-    const mine = 'SELECT id FROM policies WHERE created_at >= $1';
-    await client.query('UPDATE policies SET renewed_by_policy_id = NULL, predecessor_policy_id = NULL WHERE created_at >= $1', [runStart]);
-    await client.query(`DELETE FROM payout_notifications WHERE payout_event_id IN (SELECT id FROM payout_events WHERE policy_id IN (${mine}))`, [runStart]);
-    await client.query(`DELETE FROM payout_events WHERE policy_id IN (${mine})`, [runStart]);
-    await client.query(`DELETE FROM policy_events WHERE policy_no IN (${mine})`, [runStart]);
-    for (const t of ['policy_documents', 'policy_status_history', 'policy_coverages', 'oracle_readings']) {
-      await client.query(`DELETE FROM ${t} WHERE policy_id IN (${mine})`, [runStart]);
-    }
-    const policies = await client.query('DELETE FROM policies WHERE created_at >= $1', [runStart]);
-    const people = await client.query('DELETE FROM policyholders WHERE created_at >= $1', [runStart]);
-    await client.query('COMMIT');
-    teardown.rows = `${policies.rowCount} policies, ${people.rowCount} policyholders`;
+    const r = await teardownRun({
+      exerciseChoice, withRetry, client, runStart, insurerIds: runInsurers.map((i) => i.id),
+      before: contractsBefore.contracts, after: contractsAfterRun.contracts, fallbackActAs: [parties[0]],
+    });
+    Object.assign(teardown, { archived: r.archived, failed: r.failed, leftAlone: r.leftAlone });
+    teardown.rows = `${r.rows.policies} policies, ${r.rows.policyholders} policyholders`;
   } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
     teardown.error = `row cleanup failed: ${err.message.slice(0, 160)}`;
   } finally {
     await client.end();
@@ -281,6 +279,7 @@ console.log(
   contractsAfter.ok
     ? `${contractsGrew ? 'FAIL' : 'PASS'}     active contracts: ${contractsBefore.contracts.size} before, ${contractsAfter.contracts.size} after` +
       ` (teardown archived ${teardown.archived}${teardown.failed ? `, ${teardown.failed} FAILED` : ''}` +
+      `${teardown.leftAlone ? `, left alone ${teardown.leftAlone} new contract(s) of policies the run did not create` : ''}` +
       `${teardown.rows ? `; deleted ${teardown.rows}` : ''})`
     : `FAIL     active contracts: ${contractsBefore.contracts.size} before, unreadable after -- ${contractsAfter.error}`
 );

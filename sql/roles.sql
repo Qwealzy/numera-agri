@@ -63,8 +63,10 @@ GRANT INSERT, UPDATE ON
   payout_notifications
   TO :"app_role";
 
--- The dispatcher's coverage replacement (dispatcher.js) is the one DELETE.
+-- The two DELETEs: the dispatcher's coverage replacement (dispatcher.js), and
+-- the tier-set PUT and DELETE (routes/policies.js).
 GRANT DELETE ON policy_coverages TO :"app_role";
+GRANT DELETE ON payout_tiers TO :"app_role";
 
 GRANT USAGE ON SEQUENCE policy_status_history_id_seq TO :"app_role";
 

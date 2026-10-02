@@ -9,10 +9,22 @@ import { config } from './config.js';
 // github.com/canton-network-devs/Canton-Builder-Tool) confirm the LocalNet
 // *ports* (App Provider :3975 / App User :2975) and the dpm-build-then-deploy
 // flow, but the dev hub itself is a JS app that renders no static
-// documentation content a fetch can read. Everything version-sensitive is
-// isolated in this one file on purpose -- verify against your participant's
-// own served OpenAPI spec (usually at `<jsonApiUrl>/docs`) before relying on
-// it in production, and adjust only here if it differs.
+// documentation content a fetch can read. Within the service (node/src) the
+// REQUEST side of everything version-sensitive (endpoint paths, request
+// bodies, auth) is isolated in this one file on purpose. Outside the service
+// it is not: findOutboxCommand, uploadDar and several maintenance and
+// wire-check scripts kept outside this repository call the JSON API with their own paths, bodies and
+// tokens, doctor.mjs and runVerifications.mjs probe GET /v2/version, and
+// dispatcher.test.mjs and oracleWindow.test.mjs POST /v2/updates themselves.
+// The RESPONSE side is isolated only partly: createContract
+// reads its contract id here, but queryActiveContracts and exerciseChoice
+// hand back the participant's raw shapes
+// (JsActiveContract, CreatedEvent, ExercisedEvent), and dispatcher.js,
+// routes/debug.js, listeners/payoutListener.js, oracle/oracleBot.js and many
+// scripts under scripts/ parse them themselves. Verify against your
+// participant's own served OpenAPI spec (usually at `<jsonApiUrl>/docs`)
+// before relying on it in production, and if it differs adjust it here, at
+// those parsing sites and in those scripts and tests.
 
 function base64url(input) {
   return Buffer.from(input)
@@ -24,8 +36,10 @@ function base64url(input) {
 
 // Mints an "unsafe-jwt-hmac-256" token matching the Canton Builder Tool's
 // LocalNet auth service -- HS256, secret "unsafe" by default, `sub` is
-// treated as an admin-level ledger-api-user with rights to actAs any party
-// the participant hosts. Never use this scheme against a real network.
+// treated as an admin-level ledger-api-user: it can allocate any party, but
+// may actAs only a party it holds a CanActAs right for (grantUserRights
+// below; allocateParty grants one only when asked with grantActAs: true).
+// Never use this scheme against a real network.
 function generateUnsafeJwt(secret, sub) {
   const header = base64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
   const payload = base64url(
@@ -54,36 +68,87 @@ function authToken() {
   throw new Error('No Daml auth configured: set DAML_LEDGER_TOKEN or DAML_UNSAFE_JWT_SECRET');
 }
 
-const http = axios.create({
-  baseURL: config.daml.jsonApiUrl,
-  headers: { 'Content-Type': 'application/json' },
-  timeout: 15000,
-});
+// ONE AXIOS INSTANCE PER PARTICIPANT, not one per process. This used to be a
+// single module-scope instance bound to config.daml.jsonApiUrl, and that was
+// correct while every party lived on one participant. It no longer is: the
+// oracle operator can be hosted on a participant of its own
+// (DAML_JSON_API_URL_ORACLE), and which participant a call goes to must never
+// be implicit -- a submission whose actAs party the receiving participant does
+// not host is refused 403, measured in
+// a two-participant check kept outside this repository.
+//
+// Every exported function below takes an optional `endpoint`. With none it
+// goes to the INSURER's participant, which is what every caller written before
+// this meant and still means. Auth is unchanged and shared: the same token,
+// from the same DAML_LEDGER_TOKEN or the same DAML_UNSAFE_JWT_SECRET, for
+// both endpoints -- no second secret and no second user exists.
+const clientsByEndpoint = new Map();
 
-http.interceptors.request.use((requestConfig) => {
-  requestConfig.headers.Authorization = `Bearer ${authToken()}`;
-  return requestConfig;
-});
+function clientFor(baseURL) {
+  const existing = clientsByEndpoint.get(baseURL);
+  if (existing) return existing;
+  const http = axios.create({
+    baseURL,
+    headers: { 'Content-Type': 'application/json' },
+    timeout: 15000,
+  });
 
-// Canton returns a structured error body ({ code, cause, correlationId, ... })
-// that axios's own message throws away, leaving only "Request failed with
-// status code 400" -- useless in a failed outbox row, where the whole point
-// is that a human can later read WHY a ledger action was refused. Stage 3
-// Part 2 depends on this directly: a trigger against a terminated policy is
-// required to leave a failed row stating the reason, and the reason lives
-// in `cause`. Enrich the message in place and leave err.response intact for
-// anything that wants the raw body.
-http.interceptors.response.use(undefined, (err) => {
-  const body = err.response?.data;
-  if (body?.code || body?.cause) {
-    const parts = [body.code, body.cause].filter(Boolean).join(': ');
-    err.message = `${err.message} -- ${parts}`;
-    if (body.correlationId) {
-      err.message += ` (correlationId=${body.correlationId})`;
+  http.interceptors.request.use((requestConfig) => {
+    requestConfig.headers.Authorization = `Bearer ${authToken()}`;
+    return requestConfig;
+  });
+
+  // Canton returns a structured error body ({ code, cause, correlationId, ... })
+  // that axios's own message throws away, leaving only "Request failed with
+  // status code 400" -- useless in a failed outbox row, where the whole point
+  // is that a human can later read WHY a ledger action was refused. Stage 3
+  // Part 2 depends on this directly: a trigger against a terminated policy is
+  // required to leave a failed row stating the reason, and the reason lives
+  // in `cause`. Enrich the message in place and leave err.response intact for
+  // anything that wants the raw body.
+  http.interceptors.response.use(undefined, (err) => {
+    const body = err.response?.data;
+    if (body?.code || body?.cause) {
+      const parts = [body.code, body.cause].filter(Boolean).join(': ');
+      err.message = `${err.message} -- ${parts}`;
+      if (body.correlationId) {
+        err.message += ` (correlationId=${body.correlationId})`;
+      }
     }
-  }
-  return Promise.reject(err);
-});
+    return Promise.reject(err);
+  });
+
+  clientsByEndpoint.set(baseURL, http);
+  return http;
+}
+
+// The insurer's participant: every party but the oracle operator, and the
+// default for every call that names no endpoint.
+export function insurerEndpoint() {
+  return config.daml.jsonApiUrl;
+}
+
+// The participant that hosts the oracle operator parties. Equal to
+// insurerEndpoint() when DAML_JSON_API_URL_ORACLE is unset or empty -- that is
+// the single-participant configuration, not a fallback. When the key IS set
+// this returns it unconditionally, reachable or not: a caller that cannot
+// reach it fails loudly rather than sending an oracle command to the
+// insurer's participant, which would be exactly the boundary this exists to
+// keep.
+export function oracleEndpoint() {
+  return config.daml.jsonApiUrlOracle ?? config.daml.jsonApiUrl;
+}
+
+// Whether the oracle really is somewhere else. The one place that question is
+// answered, because several callers ask it and they must all get the same
+// answer.
+export function oracleIsOnItsOwnParticipant() {
+  return oracleEndpoint() !== insurerEndpoint();
+}
+
+function resolveEndpoint(endpoint) {
+  return endpoint ?? config.daml.jsonApiUrl;
+}
 
 function templateId(moduleName, entityName) {
   return `${config.daml.packageId}:${moduleName}:${entityName}`;
@@ -100,11 +165,14 @@ function templateId(moduleName, entityName) {
 //
 // Seeded with the outbox row id, the id becomes unique across processes AND
 // stable for a given event, so the ledger sees two submissions for the same
-// row as ONE command rather than two. Nothing retries today; this only makes
-// a retry a meaningful thing to build (how long the participant will still
-// recognise the id is its own deduplication setting, which is not measured
-// here). Callers with no outbox row behind them -- scripts, wire checks, the
-// measurement harness -- pass no seed and get a random UUID.
+// row as ONE command rather than two. One submission is retried today: the
+// trigger, which dispatcher.js re-sends under this same id on the two
+// schedules in config.js's oracleTrigger (a token not yet visible on the
+// oracle's participant, and an event the ledger says has not ended yet). How
+// long the participant will still recognise the id is its own deduplication
+// setting, which is not measured here. Callers with no outbox row behind
+// them -- scripts, wire checks, the measurement harness -- pass no seed and
+// get a random UUID.
 export function commandIdFor(prefix, seed) {
   return `${prefix}-${seed ?? crypto.randomUUID()}`;
 }
@@ -113,8 +181,8 @@ export function commandIdFor(prefix, seed) {
 // a party and being authorized to actAs it are SEPARATE grants -- a
 // ParticipantAdmin user (like LocalNet's "unsafe" ledger-api-user) can
 // allocate any party but cannot submit commands as it until this is called.
-export async function grantUserRights(userId, party) {
-  await http.post(`/v2/users/${userId}/rights`, {
+export async function grantUserRights(userId, party, { endpoint } = {}) {
+  await clientFor(resolveEndpoint(endpoint)).post(`/v2/users/${userId}/rights`, {
     userId,
     rights: [{ kind: { CanActAs: { value: { party } } } }],
   });
@@ -122,15 +190,38 @@ export async function grantUserRights(userId, party) {
 
 // The read side of grantUserRights: every right the user holds, CanActAs
 // and otherwise.
-export async function listUserRights(userId) {
-  const { data } = await http.get(`/v2/users/${userId}/rights`);
+export async function listUserRights(userId, { endpoint } = {}) {
+  const { data } = await clientFor(resolveEndpoint(endpoint)).get(`/v2/users/${userId}/rights`);
   return data.rights;
+}
+
+// A CanReadAs for one party: the user may read as it and submit nothing. The
+// participant answers with what it newly granted -- empty when the user
+// already held that right -- so a caller that revokes afterwards revokes only
+// what this call added, never a right that was there before it. Used by
+// /debug/roles-data, which reads a role party's view and takes the right back
+// within the same request.
+export async function grantReadAs(userId, party, { endpoint } = {}) {
+  const { data } = await clientFor(resolveEndpoint(endpoint)).post(`/v2/users/${userId}/rights`, {
+    userId,
+    rights: [{ kind: { CanReadAs: { value: { party } } } }],
+  });
+  return data.newlyGrantedRights ?? [];
+}
+
+// Takes back the given rights, in the shape listUserRights returns them. PATCH,
+// the same call a maintenance script kept outside this repository makes: /rights/delete 404s. The
+// participant answers with what it actually revoked, which the caller compares
+// against what it asked for.
+export async function revokeUserRights(userId, rights, { endpoint } = {}) {
+  const { data } = await clientFor(resolveEndpoint(endpoint)).patch(`/v2/users/${userId}/rights`, { userId, rights });
+  return data.newlyRevokedRights ?? [];
 }
 
 // Module 1: allocate a fresh Canton Party (used for both insurers and
 // policyholders -- the caller decides the display name / hint).
-export async function allocateParty(displayName, partyIdHint, { grantActAs } = {}) {
-  const { data } = await http.post('/v2/parties', {
+export async function allocateParty(displayName, partyIdHint, { grantActAs, endpoint } = {}) {
+  const { data } = await clientFor(resolveEndpoint(endpoint)).post('/v2/parties', {
     partyIdHint,
     displayName,
   });
@@ -151,7 +242,7 @@ export async function allocateParty(displayName, partyIdHint, { grantActAs } = {
   // user's 1000 rights. Real OIDC deployments manage per-party rights
   // through their own identity provider instead, so skip this there.
   if (grantActAs === true && config.daml.unsafeJwtSecret) {
-    await grantUserRights(config.daml.unsafeJwtSub, party);
+    await grantUserRights(config.daml.unsafeJwtSub, party, { endpoint });
   }
 
   return party;
@@ -160,9 +251,9 @@ export async function allocateParty(displayName, partyIdHint, { grantActAs } = {
 // Returns { contractId, commandId } -- callers that write the result back
 // to an outbox table for reconciliation purposes need the commandId too,
 // not just the contractId (see dispatcher.js's write-back-failure handling).
-export async function createContract({ moduleName, entityName, payload, actAs, readAs = [], commandSeed }) {
+export async function createContract({ moduleName, entityName, payload, actAs, readAs = [], commandSeed, endpoint }) {
   const commandId = commandIdFor('create', commandSeed);
-  const { data } = await http.post('/v2/commands/submit-and-wait-for-transaction', {
+  const { data } = await clientFor(resolveEndpoint(endpoint)).post('/v2/commands/submit-and-wait-for-transaction', {
     commands: {
       commandId,
       actAs,
@@ -194,8 +285,9 @@ export async function exerciseChoice({
   readAs = [],
   commandSeed,
   commandId = commandIdFor('exercise', commandSeed),
+  endpoint,
 }) {
-  const { data } = await http.post('/v2/commands/submit-and-wait-for-transaction', {
+  const { data } = await clientFor(resolveEndpoint(endpoint)).post('/v2/commands/submit-and-wait-for-transaction', {
     commands: {
       commandId,
       actAs,
@@ -216,8 +308,9 @@ export async function exerciseChoice({
       transactionShape: 'TRANSACTION_SHAPE_LEDGER_EFFECTS',
     },
   });
-  // Caller pulls out the choice's return value (extractExerciseResult in
-  // oracleBot.js) and/or any created-contract ids from the raw response.
+  // Caller pulls out the choice's return value (dispatcher.js reads it as
+  // ExercisedEvent.exerciseResult, e.g. in readReMintResult) and/or any
+  // created-contract ids from the raw response.
   return data;
 }
 
@@ -225,15 +318,15 @@ export async function exerciseChoice({
 // participant: the body is `{ packageIds: [<64-hex hash>, ...] }`, and each
 // participant answers for itself -- LocalNet's app provider and app user are
 // two participants, and a DAR uploaded to one is not on the other.
-export async function listPackageIds() {
-  const { data } = await http.get('/v2/packages');
+export async function listPackageIds({ endpoint } = {}) {
+  const { data } = await clientFor(resolveEndpoint(endpoint)).get('/v2/packages');
   return data.packageIds;
 }
 
 // `activeAtOffset` is mandatory: omitting it doesn't error, it silently
 // returns []. Confirmed live -- fetch the current ledger end first.
-export async function getLedgerEnd() {
-  const { data } = await http.get('/v2/state/ledger-end');
+export async function getLedgerEnd({ endpoint } = {}) {
+  const { data } = await clientFor(resolveEndpoint(endpoint)).get('/v2/state/ledger-end');
   return data.offset;
 }
 
@@ -241,10 +334,12 @@ export async function getLedgerEnd() {
 // in testing (all of a party's active contracts came back regardless) --
 // filter client-side on templateId as a defensive belt-and-suspenders,
 // rather than trusting the server-side filter alone.
-export async function queryActiveContracts({ moduleName, entityName, parties }) {
-  const activeAtOffset = await getLedgerEnd();
+export async function queryActiveContracts({ moduleName, entityName, parties, endpoint }) {
+  // The offset has to come from the SAME participant the read is made
+  // against: two participants are at two different ledger ends.
+  const activeAtOffset = await getLedgerEnd({ endpoint });
   const wantedTemplateId = templateId(moduleName, entityName);
-  const { data } = await http.post('/v2/state/active-contracts', {
+  const { data } = await clientFor(resolveEndpoint(endpoint)).post('/v2/state/active-contracts', {
     filter: {
       filtersByParty: Object.fromEntries(
         parties.map((p) => [

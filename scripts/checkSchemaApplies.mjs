@@ -28,9 +28,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-const ROOT = new URL('..', import.meta.url).pathname.replace(/^\//, '');
-const ENV_PATH = new URL('../node/.env', import.meta.url).pathname.replace(/^\//, '');
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const ENV_PATH = fileURLToPath(new URL('../node/.env', import.meta.url));
 // 2026-09-17: the process environment wins over node/.env, as in doctor.mjs
 // and setupTestDb.mjs, so a URL given on the command line is the one used.
 for (const line of fs.readFileSync(ENV_PATH, 'utf8').split('\n')) {

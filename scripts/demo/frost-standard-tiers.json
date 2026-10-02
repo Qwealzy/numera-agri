@@ -1,0 +1,23 @@
+{
+  "note": "copied verbatim from the FROST-STANDARD tiers of the verification insurer on 2026-09-22; not an actuarial figure",
+  "productCode": "FROST-STANDARD",
+  "perilType": "FROST",
+  "tiers": [
+    {
+      "tierOrder": 1,
+      "label": "Mild frost (-2C to 0C)",
+      "thresholdMin": "-2.0000",
+      "thresholdMax": "0.0000",
+      "payoutPercentage": "25.00",
+      "shape": "TS_Step"
+    },
+    {
+      "tierOrder": 2,
+      "label": "Severe frost (below -4C)",
+      "thresholdMin": null,
+      "thresholdMax": "-4.0000",
+      "payoutPercentage": "100.00",
+      "shape": "TS_Step"
+    }
+  ]
+}

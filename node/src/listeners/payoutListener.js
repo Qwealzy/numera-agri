@@ -7,7 +7,7 @@ import { enqueuePayoutNotification } from '../notifications/enqueue.js';
 // Polls the ledger for PayoutApproved contracts (the on-chain
 // "Payout_Approved" signal). Stage 2 Part 1: this no longer exercises
 // anything itself -- dispatch/dispatcher.js's handleTrigger already writes
-// both the payout_events row and the settlement outbox row directly, in
+// the payout_events row directly, in
 // the same transaction as the exercise that created the PayoutApproved
 // contract (it already holds the contract id then; no reason to wait for
 // a poll to discover it). This listener is now the defensive safety net
@@ -39,16 +39,16 @@ async function ensureTracked(contract, insurerId) {
   const { contractId, payload } = contract;
   if (!payload) return;
 
-  // ON CONFLICT DO NOTHING on both -- the normal path already has both
-  // rows (written by handleTrigger's write-back), so these are no-ops
-  // almost always. UNIQUE(daml_contract_id) / the settlement partial
-  // index are what make this safe to attempt unconditionally rather than
-  // needing to check existence first.
+  // ON CONFLICT DO NOTHING -- the normal path already has this row
+  // (written by handleTrigger's write-back), so this is a no-op
+  // almost always. UNIQUE(daml_contract_id) is what makes this safe to
+  // attempt unconditionally rather than needing to check existence first.
   const { rows: [inserted] } = await pool.query(
     `INSERT INTO payout_events
        (policy_id, coverage_code, tier_label, payout_percentage, payout_amount, currency,
-        is_full_settlement, status, daml_contract_id, recipient, record_kind, approved_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,'approved',$8,$9,'payout',$10)
+        is_full_settlement, status, daml_contract_id, recipient, record_kind, approved_at,
+        event_start, event_end, evidence_digest)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,'approved',$8,$9,'payout',$10,$11,$12,$13)
      ON CONFLICT (daml_contract_id) DO NOTHING
      RETURNING id`,
     [
@@ -70,6 +70,11 @@ async function ensureTracked(contract, insurerId) {
       // mirrors. This path exists because that write-back may never have run,
       // so the value is taken from the contract rather than from a clock here.
       payload.approvedAt,
+      // v22: the event and the evidence digest the payout was
+      // approved on, from the contract, as handleTrigger writes them.
+      payload.eventStart,
+      payload.eventEnd,
+      payload.evidenceDigest,
     ]
   );
 

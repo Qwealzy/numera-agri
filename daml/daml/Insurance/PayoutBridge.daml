@@ -64,12 +64,22 @@ template PayoutApproved
     -- have nothing on-ledger to check against.
     payoutDestination       : [PayoutDestinationRole]
     approvedAt              : Time
-    status                  : PayoutStatus
+    -- v22. The event this payout was approved for, as the trigger
+    -- received it: [eventStart, eventEnd), start inclusive, end exclusive.
+    eventStart              : Time
+    eventEnd                : Time
+    -- v22. The digest of the evidence the trigger was evaluated on,
+    -- "sha256:" + 64 lowercase hex. A digest only: no request parameters,
+    -- no coordinates, reach this contract's observers.
+    evidenceDigest          : Text
   where
     signatory insurer, oracleOperator
     observer policyholder, optionalToList mortgagee
 
     ensure amount > 0.0 && not (null payoutDestination) &&
+      -- v22. With the two equal, the insurer alone could create this
+      -- contract -- an equal signatory pair needs only one signature.
+      oracleOperator /= insurer &&
       -- A leg can only be owed to a role the coverage actually permits --
       -- EXCEPT the enforcement office, and the exemption needs its reason
       -- stated or someone will read it as a hole.
@@ -100,10 +110,13 @@ template PayoutApproved
     -- notice service date: the platform cannot observe when a bank transfer
     -- landed, only when it was told.
     --
-    -- Consuming: settling closes the payout. The evidence (bank reference,
-    -- date, role) lives permanently in this exercise's own event on the
-    -- ledger.
-    choice PayoutApproved_ConfirmSettlement : ()
+    -- Consuming: settling closes the payout, and since v22 leaves a
+    -- PayoutSettled record in its place, whose id this choice returns. Of
+    -- the bank reference, the ledger holds only its salted digest,
+    -- "sha256:" + hex(SHA-256(salt || text)); the raw text and the salt stay
+    -- in SQL. The date and the role are on the record as
+    -- reported.
+    choice PayoutApproved_ConfirmSettlement : ContractId PayoutSettled
       with
         bankReference : Text
         settledAt     : Time
@@ -126,7 +139,24 @@ template PayoutApproved
         assertMsg ("settlement reports paying " <> show paidRole <>
                    ", but this payout is owed to " <> show recipient)
           (paidRole == recipient)
-        pure ()
+        recordedAt <- getTime
+        create PayoutSettled with
+          insurer
+          policyholder
+          mortgagee
+          oracleOperator
+          policyId
+          coverageCode
+          sourcePayoutContractId = Some self
+          amount
+          currency
+          recipient = paidRole
+          eventStart
+          eventEnd
+          evidenceDigest
+          settledAt
+          bankReferenceDigest = bankReference
+          recordedAt
 
     -- Stage 4: the EXCEPTION path, and only that. Until Stage 4 every
     -- payout came through here, because no settlement path existed and the
@@ -137,7 +167,6 @@ template PayoutApproved
     choice PayoutApproved_MarkFailed : ContractId ManualReviewRequired
       with
         failureReason : Text
-        now           : Time
         -- The link back to the payout this review item came from, passed in
         -- rather than derived. `show self` CANNOT be used: on this
         -- participant it renders the literal string "<contract-id>", not an
@@ -158,6 +187,9 @@ template PayoutApproved
           (failureReason /= "")
         assertMsg "sourcePayoutContractId is required -- it is the link back to the payout"
           (sourcePayoutContractId /= "")
+        -- v22. flaggedAt is the transaction's ledger time, not a value
+        -- the caller supplies.
+        now <- getTime
         create ManualReviewRequired with
           insurer
           policyholder
@@ -171,6 +203,13 @@ template PayoutApproved
           currency
           reason = failureReason
           flaggedAt = now
+          oracleOperator
+          mortgagee
+          recipient = Some recipient
+          sourcePayoutCid = Some self
+          eventStart
+          eventEnd
+          evidenceDigest
 
 -- Landing spot when a payout could not be settled through the normal path.
 -- Until Stage 4 this had no choices at all beyond the implicit Archive, so
@@ -189,6 +228,22 @@ template ManualReviewRequired
     currency               : Text
     reason                 : Text
     flaggedAt              : Time
+    -- v22. What a closing record needs and this item cannot otherwise
+    -- reach, because the PayoutApproved it came from is archived. Carried
+    -- from that payout by MarkFailed; on an item the trigger raised for an
+    -- unrouted amount there is no source payout, so the payout-only fields
+    -- are None. None of them is an observer here: `mortgagee` becomes one
+    -- on the closing record only, as it was on the payout.
+    -- v22. Except `mortgagee`: on an unrouted item raised on a charged
+    -- coverage it is the policy's charge holder, carried so the item can be
+    -- settled to it; it reaches a record only as that record's recipient.
+    oracleOperator         : Party
+    mortgagee              : Optional Party
+    recipient              : Optional PayoutDestinationRole
+    sourcePayoutCid        : Optional (ContractId PayoutApproved)
+    eventStart             : Time
+    eventEnd               : Time
+    evidenceDigest         : Text
   where
     signatory insurer
     observer policyholder
@@ -202,7 +257,7 @@ template ManualReviewRequired
     -- PayoutApproved, which this item's creation archived. The reported
     -- role is recorded as asserted, and the check is enforced off-ledger by
     -- dispatch/dispatcher.js against the coverage's SQL mirror instead.
-    choice ManualReviewRequired_ResolveSettled : ()
+    choice ManualReviewRequired_ResolveSettled : ContractId PayoutSettled
       with
         bankReference : Text
         settledAt     : Time
@@ -211,7 +266,36 @@ template ManualReviewRequired
       do
         assertMsg "bankReference is required to resolve a review item as settled"
           (bankReference /= "")
-        pure ()
+        -- v22. An item MarkFailed raised carries its payout's recipient,
+        -- and a report naming another role would close the wrong claim, as
+        -- in ConfirmSettlement. An unrouted item carries none and its role is
+        -- not checked here. v22: one raised on a charged coverage carries
+        -- the mortgagee party, so PDR_Mortgagee is accepted for it; with no
+        -- mortgagee party the record's own ensure still refuses it.
+        assertMsg ("settlement reports paying " <> show paidRole <>
+                   ", but this item is owed to " <> show recipient)
+          (optional True (== paidRole) recipient)
+        -- v22: the same record ConfirmSettlement leaves.
+        recordedAt <- getTime
+        create PayoutSettled with
+          insurer
+          policyholder
+          -- v22. Only on a record paid to the mortgagee, so an unrouted
+          -- item's charge holder observes nothing it was not paid.
+          mortgagee = if paidRole == PDR_Mortgagee then mortgagee else None
+          oracleOperator
+          policyId
+          coverageCode
+          sourcePayoutContractId = sourcePayoutCid
+          amount
+          currency
+          recipient = paidRole
+          eventStart
+          eventEnd
+          evidenceDigest
+          settledAt
+          bankReferenceDigest = bankReference
+          recordedAt
 
     -- Exit 2: it will not be paid, and that is the final answer. An
     -- enumerated reason so the outcome is queryable, plus a mandatory
@@ -221,12 +305,121 @@ template ManualReviewRequired
     -- Recording an outcome is not a legal conclusion about whether the
     -- indemnity was lawfully extinguished. It records what the insurer
     -- asserted and why.
-    choice ManualReviewRequired_ResolveUnpaid : ()
+    choice ManualReviewRequired_ResolveUnpaid : ContractId PayoutClosedUnpaid
       with
         unpaidReason : UnpaidReason
         note         : Text
+        -- v22. The instant the insurer declares the item closed,
+        -- supplied like settledAt; the record's own ledger time is separate.
+        closedAt     : Time
       controller insurer
       do
         assertMsg "a note is required when closing a review item unpaid"
           (note /= "")
-        pure ()
+        recordedAt <- getTime
+        create PayoutClosedUnpaid with
+          insurer
+          policyholder
+          -- v22. As in ResolveSettled: an unrouted item's charge holder
+          -- is not carried onto a record it would then observe.
+          mortgagee = if recipient == Some PDR_Mortgagee then mortgagee else None
+          oracleOperator
+          policyId
+          coverageCode
+          sourcePayoutContractId = sourcePayoutCid
+          amount
+          currency
+          recipient
+          eventStart
+          eventEnd
+          evidenceDigest
+          unpaidReason
+          noteDigest = note
+          closedAt
+          recordedAt
+
+-- v22. What stays on the ledger once a payout is reported settled,
+-- through PayoutApproved_ConfirmSettlement or
+-- ManualReviewRequired_ResolveSettled. It is the insurer's DECLARATION that
+-- it paid, not proof that money moved: the platform never moves money and
+-- cannot observe a bank transfer (see PayoutApproved above).
+--
+-- No choice other than the implicit Archive. The platform never archives
+-- one; the signatory can, since Daml lets a signatory archive any contract
+-- it signs, so "never goes" cannot be enforced here.
+--
+-- Observers are the source payout's: the policyholder, and the mortgagee
+-- only on a leg that was the mortgagee's own. oracleOperator is a plain
+-- field, neither signatory nor observer.
+template PayoutSettled
+  with
+    insurer                : Party
+    policyholder           : Party
+    mortgagee              : Optional Party
+    oracleOperator         : Party
+    policyId               : Text
+    coverageCode           : Text
+    -- The PayoutApproved this settles. None when the review item it came
+    -- from was raised by the trigger for an unrouted amount and so had no
+    -- source payout.
+    sourcePayoutContractId : Optional (ContractId PayoutApproved)
+    amount                 : Decimal
+    currency               : Text
+    -- The role the insurer reports having paid.
+    recipient              : PayoutDestinationRole
+    eventStart             : Time
+    eventEnd               : Time
+    evidenceDigest         : Text
+    -- The insurer's reported settlement date.
+    settledAt              : Time
+    -- "sha256:" + hex(SHA-256(salt || bank reference)); the text and the
+    -- salt stay in SQL.
+    bankReferenceDigest    : Text
+    -- The ledger time of the transaction that created this record.
+    recordedAt             : Time
+  where
+    signatory insurer
+    observer policyholder, optionalToList mortgagee
+
+    ensure oracleOperator /= insurer && isSha256Digest bankReferenceDigest &&
+      -- v22. PayoutApproved's rule, for the same reason.
+      (recipient == PDR_Mortgagee) == isSome mortgagee
+
+-- v22. What stays on the ledger once a review item is closed unpaid,
+-- through ManualReviewRequired_ResolveUnpaid. The insurer's declaration and
+-- why, as there; not a legal conclusion that the indemnity was lawfully
+-- extinguished. Same rules as PayoutSettled: no choice but Archive, the
+-- platform never archives it, same observers, oracleOperator a plain field.
+template PayoutClosedUnpaid
+  with
+    insurer                : Party
+    policyholder           : Party
+    mortgagee              : Optional Party
+    oracleOperator         : Party
+    policyId               : Text
+    coverageCode           : Text
+    sourcePayoutContractId : Optional (ContractId PayoutApproved)
+    amount                 : Decimal
+    currency               : Text
+    -- The source payout's recipient; None on an unrouted amount, which was
+    -- never owed to a role.
+    recipient              : Optional PayoutDestinationRole
+    eventStart             : Time
+    eventEnd               : Time
+    evidenceDigest         : Text
+    unpaidReason           : UnpaidReason
+    -- "sha256:" + hex(SHA-256(salt || note)); the note and the salt stay in
+    -- SQL.
+    noteDigest             : Text
+    -- The insurer's declared closing instant.
+    closedAt               : Time
+    -- The ledger time of the transaction that created this record.
+    recordedAt             : Time
+  where
+    signatory insurer
+    observer policyholder, optionalToList mortgagee
+
+    ensure oracleOperator /= insurer && isSha256Digest noteDigest &&
+      -- v22. PayoutApproved's rule; an unrouted amount has no recipient
+      -- and so no mortgagee.
+      (recipient == Some PDR_Mortgagee) == isSome mortgagee

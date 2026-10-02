@@ -2,11 +2,15 @@ import '../test-support/setup-test-db.mjs'; // must stay first: guards the datab
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import http from 'node:http';
 import { pool } from '../src/db.js';
-import { allocateParty, queryActiveContracts, exerciseChoice, getLedgerEnd } from '../src/damlClient.js';
+import { allocateParty, queryActiveContracts, exerciseChoice, getLedgerEnd, revokeUserRights } from '../src/damlClient.js';
 import { config } from '../src/config.js';
 import { runOnce as dispatch } from '../src/dispatch/dispatcher.js';
-import { queueClosedWindows } from '../src/oracle/oracleBot.js';
+import { queueClosedWindows, coverBoundFor, tokenNotLive, runOnce as runOracle } from '../src/oracle/oracleBot.js';
+import { windowFor } from '../src/oracle/eventWindow.js';
+import { runOnce as sweepGrace } from '../src/sweepers/graceSweeper.js';
+import { insertWindowedTrigger } from '../test-support/windowedTrigger.mjs';
 
 // The event window, end to end against LocalNet: readings in, triggers out,
 // payouts on the ledger. Before migration 030 every reading produced its own
@@ -56,8 +60,8 @@ before(async () => {
   insurerId = inserted.rows[0].id;
   await pool.query(
     `INSERT INTO payout_tiers
-       (insurer_id, product_code, peril_type, tier_order, label, threshold_min, threshold_max, payout_percentage)
-     VALUES ($1, 'TEST-PRODUCT', 'TEST-PERIL', 1, 'test tier', -2.0, 0.0, 25.00)`,
+       (insurer_id, product_code, peril_type, tier_order, label, threshold_min, threshold_max, payout_percentage, shape)
+     VALUES ($1, 'TEST-PRODUCT', 'TEST-PERIL', 1, 'test tier', -2.0, 0.0, 25.00, 'TS_Step')`,
     [insurerId]
   );
 });
@@ -68,7 +72,10 @@ after(async () => {
       ['Insurance.PolicyToken', 'PolicyToken'],
       ['Insurance.PayoutBridge', 'PayoutApproved'],
     ]) {
-      const entries = await queryActiveContracts({ moduleName, entityName, parties: [insurerParty] }).catch(() => []);
+      const entries = await queryActiveContracts({ moduleName, entityName, parties: [insurerParty] }).catch((err) => {
+        console.error(`[fixture cleanup] could not list ${entityName}:`, err.message);
+        return [];
+      });
       for (const e of entries) {
         const c = e.contractEntry.JsActiveContract.createdEvent;
         await exerciseChoice({
@@ -117,6 +124,15 @@ after(async () => {
         client.release();
       }
     }
+    // The two CanActAs before() granted, taken back after the archive that
+    // acts as these parties; loud if the ledger takes back fewer.
+    const rights = [insurerParty, oracleParty].filter(Boolean).map((party) => ({ kind: { CanActAs: { value: { party } } } }));
+    if (rights.length) {
+      const revoked = await revokeUserRights(config.daml.unsafeJwtSub, rights);
+      if (revoked.length !== rights.length) {
+        throw new Error(`[fixture cleanup] asked to revoke ${rights.length} CanActAs, the ledger revoked ${revoked.length}`);
+      }
+    }
   } finally {
     await pool.end();
   }
@@ -147,10 +163,10 @@ async function mintedPolicy(windowRule) {
   await pool.query(
     `INSERT INTO policy_coverages
        (policy_id, coverage_code, product_code, peril_type, cell_ids,
-        sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination)
+        sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination, metric, payout_basis)
      VALUES ($1,'TEST-COVERAGE','TEST-PRODUCT','TEST-PERIL','["window-cell"]',10000,10000,
-       '[{"tierOrder":1,"label":"test tier","minValue":"-2.0","maxValue":"0.0","payoutPct":"25.0"}]',
-       '["PDR_Insured"]')`,
+       '[{"tierOrder":1,"label":"test tier","minValue":"-2.0","maxValue":"0.0","payoutPct":"25.0","shape":"TS_Step","pctAtMin":null,"pctAtMax":null}]',
+       '["PDR_Insured"]','TEMPERATURE_C','PB_RemainingLimit')`,
     [policy.id]
   );
   await pool.query(
@@ -209,7 +225,10 @@ const triggerRows = (policyId) =>
 
 test('three matching readings in one closed window give ONE trigger and ONE payout', async () => {
   const policy = await mintedPolicy(RULE);
-  await insertDay(policy.id);
+  // With stored responses: since v22 a window whose evidence is absent is not
+  // sent (the test after next), so the one-payout claim is shown on readings
+  // that carry their evidence.
+  const readings = await insertDayWithEvidence(policy.id);
 
   await queueClosedWindows({ insurerIds: [insurerId] });
   assert.equal(await triggerRows(policy.id), 1, 'one window, one trigger -- not one per reading');
@@ -235,6 +254,20 @@ test('three matching readings in one closed window give ONE trigger and ONE payo
   const payout = (await pool.query('SELECT * FROM payout_events WHERE policy_id = $1', [policy.id])).rows[0];
   assert.equal(payout.trigger_window_id, win[0].id, 'the payout names its window');
   assert.equal(payout.oracle_reading_id, win[0].determining_reading_id, 'and, for a min, the reading that decided it');
+
+  // v22: the interval the window was queued with, the digest of
+  // the deciding response, and the approval instant are what the LEDGER holds.
+  const deciding = readings.find((r) => r.value === -1.5);
+  const approved = onLedger[0].contractEntry.JsActiveContract.createdEvent.createArgument;
+  assert.equal(new Date(approved.eventStart).getTime(), new Date(win[0].event_start).getTime());
+  assert.equal(new Date(approved.eventEnd).getTime(), new Date(win[0].event_end).getTime());
+  assert.equal(approved.evidenceDigest, `sha256:${deciding.sha256}`, 'the digest is the deciding response\'s hash');
+  assert.equal(payout.evidence_digest, approved.evidenceDigest);
+  assert.equal(new Date(payout.event_start).getTime(), new Date(approved.eventStart).getTime());
+  assert.equal(new Date(payout.event_end).getTime(), new Date(approved.eventEnd).getTime());
+  // Compared as instants: SQL holds a timestamptz, the ledger an ISO string.
+  assert.equal(new Date(payout.approved_at).getTime(), new Date(approved.approvedAt).getTime(), 'approved_at is the ledger time read back');
+  assert.equal(payout.payout_percentage, '25.0000000000', 'the applied rate at the ledger Decimal\'s ten places');
 });
 
 test('a min window attests to the deciding response, and its hash is the one stored', async () => {
@@ -283,12 +316,64 @@ test('a mean window has no deciding reading and commits to every response it com
   assert.equal(payout.trigger_window_id, win.id, 'the window is what names every reading of it');
 });
 
+// This was left unverified earlier: whether two readings of
+// one window can share a stored response. The oracle does not write that --
+// storeReading inserts one response per reading -- but the schema allows it
+// (oracle_readings.raw_response_id is not unique), so the readings are written
+// directly here and what follows is what the code does with them.
+test('a mean window whose readings share one stored response is refused before the ledger: nothing is sent', async () => {
+  const policy = await mintedPolicy({ ...RULE, aggregation: 'mean' });
+  const [shared] = await insertDayWithEvidence(policy.id, DAY.slice(0, 1));
+  for (const [measuredAt, value] of DAY.slice(1)) {
+    await pool.query(
+      `INSERT INTO oracle_readings
+         (policy_id, coverage_code, cell_id, metric, value, measured_at, source, raw_response_id)
+       VALUES ($1,'TEST-COVERAGE','window-cell','TEMPERATURE_C',$2,$3,'oracleWindow-fixture',$4)`,
+      [policy.id, value, measuredAt, shared.raw]
+    );
+  }
+
+  await queueClosedWindows({ insurerIds: [insurerId] });
+  const win = (await pool.query('SELECT * FROM trigger_windows WHERE policy_id = $1', [policy.id])).rows[0];
+  const att = JSON.parse(win.attestation_ref);
+  assert.equal(att.evidence.combines, 3, 'combines counts readings, not distinct responses');
+  const listedThrice = crypto.createHash('sha256').update([shared.sha256, shared.sha256, shared.sha256].join('\n')).digest('hex');
+  assert.equal(att.evidence.sha256, listedThrice, 'the one response\'s hash is listed once per reading');
+
+  await dispatch();
+  const ev = (await pool.query('SELECT id, status, error FROM policy_events WHERE trigger_window_id = $1', [win.id])).rows[0];
+  assert.equal(ev.status, 'failed');
+  assert.match(ev.error, /attested_evidence_pkey/, 'the evidence insert meets its own primary key');
+  assert.equal(
+    await count(`SELECT count(*)::int AS n FROM attested_evidence WHERE policy_event_id = $1`, [ev.id]),
+    0,
+    'one INSERT statement: none of its rows is written'
+  );
+  assert.equal(await count(`SELECT count(*)::int AS n FROM payout_events WHERE policy_id = $1`, [policy.id]), 0);
+  const onLedger = (
+    await queryActiveContracts({ moduleName: 'Insurance.PayoutBridge', entityName: 'PayoutApproved', parties: [insurerParty] })
+  ).filter((e) => e.contractEntry.JsActiveContract.createdEvent.createArgument.policyId === policy.id);
+  assert.equal(onLedger.length, 0, 'no PayoutApproved on the ledger for the policy');
+});
+
 test('readings with no stored response are attested as absent, not left quietly empty', async () => {
   const policy = await mintedPolicy(RULE);
   await insertDay(policy.id);
   await queueClosedWindows({ insurerIds: [insurerId] });
-  const win = (await pool.query('SELECT attestation_ref FROM trigger_windows WHERE policy_id = $1', [policy.id])).rows[0];
+  const win = (await pool.query('SELECT id, attestation_ref FROM trigger_windows WHERE policy_id = $1', [policy.id])).rows[0];
   assert.equal(JSON.parse(win.attestation_ref).evidence, 'absent');
+
+  // v22: such a window has no evidence digest, and the ledger takes no
+  // trigger without one. The row fails with a reason that says so, before
+  // anything is sent -- and says it is not a finding about the riziko.
+  await dispatch();
+  const ev = (await pool.query('SELECT status, error FROM policy_events WHERE trigger_window_id = $1', [win.id])).rows[0];
+  assert.equal(ev.status, 'failed');
+  assert.match(ev.error, /records its evidence as absent/);
+  assert.match(ev.error, /Nothing was sent/);
+  assert.match(ev.error, /not a finding about whether the riziko occurred/);
+  assert.equal(await count(`SELECT count(*)::int AS n FROM payout_events WHERE policy_id = $1`, [policy.id]), 0);
+  assert.equal(await count(`SELECT count(*)::int AS n FROM attested_evidence WHERE trigger_window_id = $1`, [win.id]), 0);
 });
 
 test('a windowed trigger whose window carries no attestation is refused, not evaluated', async () => {
@@ -547,3 +632,550 @@ test('a trigger the ledger refuses still leaves its evidence locked: the lock is
     .rows.map((r) => r.raw_response_id);
   assert.deepEqual(locked, [deciding.raw], 'written before the call, so the refusal did not undo it');
 });
+
+// The behaviour decided on 2026-09-19: a window folds in only the
+// readings measured in [cover start, expiry), and a policy whose cover
+// has not begun gets no window and no trigger. queueCellWindows selects
+// only the readings measured in [coverage_began_at, end), where end is
+// coverBoundFor's -- expiry, or earlier where the contract ends earlier --
+// and a NULL coverage_began_at selects none, so the second follows from the first. All
+// three were first written red and marked todo; they pass since
+// then.
+
+test(
+  'a reading measured after expiry is not folded into the window',
+  async () => {
+    const policy = await mintedPolicy(RULE);
+    const expiry = new Date(policy.expiry);
+    const inCover = new Date(expiry.getTime() - 7 * 60 * 60 * 1000);
+    const afterExpiry = new Date(expiry.getTime() + 3 * 60 * 60 * 1000);
+    assert.equal(
+      windowFor(inCover, RULE).start.getTime(),
+      windowFor(afterExpiry, RULE).start.getTime(),
+      'fixture: both readings must fall in the one window that holds expiry'
+    );
+    await insertDay(policy.id, [
+      [inCover.toISOString(), -0.5],
+      [afterExpiry.toISOString(), -1.8],
+    ]);
+    const inCoverId = (
+      await pool.query('SELECT id FROM oracle_readings WHERE policy_id = $1 AND measured_at = $2', [policy.id, inCover])
+    ).rows[0].id;
+
+    await queueClosedWindows({ insurerIds: [insurerId], now: new Date(expiry.getTime() + 2 * 24 * 60 * 60 * 1000) });
+
+    const win = (await pool.query('SELECT * FROM trigger_windows WHERE policy_id = $1', [policy.id])).rows;
+    assert.equal(win.length, 1, 'fixture: the window holding expiry is closed and evaluated');
+    assert.equal(
+      Number(win[0].aggregated_value),
+      -0.5,
+      `expected the min of the readings inside cover (-0.5, measured ${inCover.toISOString()}); ` +
+        `got ${win[0].aggregated_value}, and -1.8 was measured ${afterExpiry.toISOString()}, after expiry ` +
+        `${expiry.toISOString()}`
+    );
+    assert.equal(win[0].determining_reading_id, inCoverId, 'the deciding reading is the one inside cover');
+    // v22: the event interval the trigger will send ends at expiry.
+    assert.equal(new Date(win[0].event_end).getTime(), expiry.getTime(), 'the interval is clipped at expiry');
+    assert.equal(new Date(win[0].event_start).getTime(), new Date(win[0].window_start).getTime());
+  }
+);
+
+test(
+  'a reading measured before cover began is not folded into the window',
+  async () => {
+    const probe = await mintedPolicy(RULE);
+    const coverStart = new Date(probe.coverage_began_at);
+    // One UTC day centred on the cover start, so the window straddles it. The
+    // rule is frozen at activation, so a second policy is minted under it.
+    const rule = { timezone: 'UTC', startHour: (coverStart.getUTCHours() + 12) % 24, aggregation: 'min' };
+    const policy = await mintedPolicy(rule);
+    assert.equal(new Date(policy.coverage_began_at).getTime(), coverStart.getTime());
+    const beforeCover = new Date(coverStart.getTime() - 2 * 60 * 60 * 1000);
+    const inCover = new Date(coverStart.getTime() + 2 * 60 * 60 * 1000);
+    assert.equal(
+      windowFor(beforeCover, rule).start.getTime(),
+      windowFor(inCover, rule).start.getTime(),
+      'fixture: both readings must fall in the one window that holds the cover start'
+    );
+    await insertDay(policy.id, [
+      [beforeCover.toISOString(), -1.8],
+      [inCover.toISOString(), -0.5],
+    ]);
+    const inCoverId = (
+      await pool.query('SELECT id FROM oracle_readings WHERE policy_id = $1 AND measured_at = $2', [policy.id, inCover])
+    ).rows[0].id;
+
+    await queueClosedWindows({ insurerIds: [insurerId] });
+
+    const win = (await pool.query('SELECT * FROM trigger_windows WHERE policy_id = $1', [policy.id])).rows;
+    assert.equal(win.length, 1, 'fixture: the window holding the cover start is closed and evaluated');
+    assert.equal(
+      Number(win[0].aggregated_value),
+      -0.5,
+      `expected the min of the readings inside cover (-0.5, measured ${inCover.toISOString()}); ` +
+        `got ${win[0].aggregated_value}, and -1.8 was measured ${beforeCover.toISOString()}, before cover ` +
+        `began at ${coverStart.toISOString()}`
+    );
+    assert.equal(win[0].determining_reading_id, inCoverId, 'the deciding reading is the one inside cover');
+    // v22: and the interval starts where cover began.
+    assert.equal(new Date(win[0].event_start).getTime(), coverStart.getTime(), 'the interval is clipped at the cover start');
+  }
+);
+
+// ---------------------------------------------------------------------------
+// The hold rule (v22). While a
+// m. 1434(3) notice's deadline has passed and no outcome is recorded, a window
+// ending after the deadline is neither queued nor sent; the outcome, once
+// recorded, decides the interval: a termination clips it at the termination
+// instant, a payment reported late releases the whole window.
+//
+// The notice is served with a service date 14 days (this file's fixture grace
+// period) before a noon in Istanbul, 2026-09-10, so the deadline falls inside
+// that local day's window, which is long closed: the "late sweeper" case, run
+// here on demand.
+// ---------------------------------------------------------------------------
+const DEADLINE = new Date('2026-09-10T09:00:00.000Z');
+const SERVICE_DATE = new Date(DEADLINE.getTime() - 14 * 24 * 60 * 60 * 1000).toISOString();
+const HELD_DAYS = [
+  ['2026-09-09T03:00:00+03:00', -1.2], // the day before: its window ends before the deadline
+  ['2026-09-10T03:00:00+03:00', -1.5], // the deadline's own day, before the deadline
+  ['2026-09-10T18:00:00+03:00', -1.9], // the same day, after the deadline
+  ['2026-09-11T03:00:00+03:00', -1.0], // a day wholly after the deadline
+];
+const windowOf = (policyId, start) =>
+  pool.query('SELECT * FROM trigger_windows WHERE policy_id = $1 AND window_start = $2', [policyId, start]).then((r) => r.rows[0]);
+const DAY_09 = new Date('2026-09-08T21:00:00.000Z');
+const DAY_10 = new Date('2026-09-09T21:00:00.000Z');
+const DAY_11 = new Date('2026-09-10T21:00:00.000Z');
+
+async function servedNotice(policyId, serviceDate = SERVICE_DATE) {
+  await pool.query(`INSERT INTO policy_events (policy_no, event_type, payload) VALUES ($1,'notice',$2)`, [
+    policyId,
+    JSON.stringify({ serviceDate }),
+  ]);
+  await dispatch();
+  const row = (await pool.query('SELECT * FROM policies WHERE id = $1', [policyId])).rows[0];
+  assert.equal(row.default_state, 'grace_period', 'fixture: the notice is served');
+  return row;
+}
+
+test('coverBoundFor: the deadline, the recorded termination and the two-notice instant, from SQL alone', () => {
+  const base = { id: 'p', expiry: '2027-03-31T09:00:00.000Z', grace_period_days: 14 };
+  assert.deepEqual(coverBoundFor({ ...base, default_state: 'none' }), { end: new Date(base.expiry), deadline: null });
+  const inGrace = coverBoundFor({ ...base, default_state: 'grace_period', notice_service_date: SERVICE_DATE });
+  assert.equal(inGrace.deadline.getTime(), DEADLINE.getTime(), 'the service date plus the frozen grace period');
+  assert.equal(inGrace.end.getTime(), new Date(base.expiry).getTime(), 'the end does not move before the outcome');
+  assert.equal(
+    coverBoundFor({ ...base, default_state: 'grace_period', notice_service_date: SERVICE_DATE, substituted_at: '2026-09-05T00:00:00Z' }).deadline,
+    null,
+    'a substituted policy is never terminated, so nothing is held'
+  );
+  const terminated = coverBoundFor({ ...base, default_state: 'terminated', terminated_at: DEADLINE.toISOString() });
+  assert.equal(terminated.end.getTime(), DEADLINE.getTime());
+  assert.equal(terminated.deadline, null);
+  const elected = coverBoundFor({ ...base, default_state: 'two_notice_elected', two_notice_effective_at: '2026-12-31T21:00:00Z' });
+  assert.equal(elected.end.getTime(), new Date('2026-12-31T21:00:00Z').getTime(), 'clipped at the election\'s instant from the election on');
+  assert.match(coverBoundFor({ ...base, default_state: 'terminated' }).reason, /records no terminated_at/);
+});
+
+test('late sweeper: a window ending after the deadline is held, not queued; once the termination is recorded it is clipped at the termination instant', async () => {
+  const policy = await mintedPolicy(RULE);
+  await servedNotice(policy.id);
+  const readings = await insertDayWithEvidence(policy.id, HELD_DAYS);
+
+  await queueClosedWindows({ insurerIds: [insurerId] });
+  assert.ok(await windowOf(policy.id, DAY_09), 'the window ending before the deadline is queued as usual');
+  assert.equal(await windowOf(policy.id, DAY_10), undefined, 'HELD: the deadline\'s own day ends after it');
+  assert.equal(await windowOf(policy.id, DAY_11), undefined, 'HELD: the day after the deadline');
+  await dispatch();
+  assert.equal(await triggerRows(policy.id), 1, 'only the one window was queued, and sent');
+
+  // The sweeper runs late: the termination is recorded now, at the instant the
+  // notice fixed, not at the clock.
+  await sweepGrace({ insurerIds: [insurerId] });
+  await dispatch();
+  const terminated = (await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id])).rows[0];
+  assert.equal(terminated.default_state, 'terminated');
+  assert.equal(new Date(terminated.terminated_at).getTime(), DEADLINE.getTime());
+
+  await queueClosedWindows({ insurerIds: [insurerId] });
+  const clipped = await windowOf(policy.id, DAY_10);
+  assert.ok(clipped, 'the held window is queued once the outcome is recorded');
+  assert.equal(new Date(clipped.event_start).getTime(), DAY_10.getTime());
+  assert.equal(new Date(clipped.event_end).getTime(), DEADLINE.getTime(), 'clipped at the termination instant');
+  assert.equal(Number(clipped.aggregated_value), -1.5, 'the reading after the termination instant is not folded in');
+  assert.deepEqual(clipped.reading_ids, [readings[1].reading], 'nor named by the window');
+  assert.equal(await windowOf(policy.id, DAY_11), undefined, 'a window wholly after the termination has no in-cover reading');
+
+  await dispatch();
+  const payout = (
+    await pool.query('SELECT * FROM payout_events WHERE trigger_window_id = $1', [clipped.id])
+  ).rows[0];
+  assert.ok(payout, 'the in-cover part of the last window is evaluated and paid');
+  assert.equal(new Date(payout.event_end).getTime(), DEADLINE.getTime());
+  assert.equal(payout.evidence_digest, `sha256:${readings[1].sha256}`, 'the digest covers the in-cover reading only');
+});
+
+test('a late payment report releases the full window', async () => {
+  const policy = await mintedPolicy(RULE);
+  await servedNotice(policy.id);
+  await insertDayWithEvidence(policy.id, HELD_DAYS);
+
+  await queueClosedWindows({ insurerIds: [insurerId] });
+  assert.equal(await windowOf(policy.id, DAY_10), undefined, 'held while the outcome is undecided');
+
+  await pool.query(`INSERT INTO policy_events (policy_no, event_type) VALUES ($1,'reinstatement')`, [policy.id]);
+  await dispatch();
+  assert.equal((await pool.query('SELECT default_state FROM policies WHERE id = $1', [policy.id])).rows[0].default_state, 'none');
+
+  await queueClosedWindows({ insurerIds: [insurerId] });
+  const full = await windowOf(policy.id, DAY_10);
+  assert.equal(new Date(full.event_end).getTime(), new Date(full.window_end).getTime(), 'the whole window, not clipped');
+  assert.equal(Number(full.aggregated_value), -1.9, 'every reading of the day is folded in');
+  assert.ok(await windowOf(policy.id, DAY_11), 'and the day after is released too');
+  await dispatch();
+  const statuses = (
+    await pool.query(`SELECT status FROM policy_events WHERE policy_no = $1 AND event_type = 'trigger'`, [policy.id])
+  ).rows.map((r) => r.status);
+  assert.deepEqual(statuses, ['done', 'done', 'done'], 'all three windows sent and accepted');
+});
+
+test('the dispatcher refuses a held row: it stays pending, and is sent once a payment is reported', async () => {
+  const policy = await mintedPolicy(RULE);
+  await servedNotice(policy.id);
+  // Queued as if before the notice was reported: a window ending after the
+  // deadline, already in the outbox.
+  const { eventId } = await insertWindowedTrigger(pool, {
+    policyId: policy.id, coverageCode: 'TEST-COVERAGE', cellId: 'window-cell', value: -1.0,
+    eventStart: DAY_11, eventEnd: new Date(DAY_11.getTime() + 24 * 60 * 60 * 1000),
+  });
+
+  await dispatch();
+  const held = (await pool.query('SELECT status FROM policy_events WHERE id = $1', [eventId])).rows[0];
+  assert.equal(held.status, 'pending', 'not claimed, not failed: nothing is sent while the outcome is undecided');
+  assert.equal(await count(`SELECT count(*)::int AS n FROM payout_events WHERE policy_id = $1`, [policy.id]), 0);
+
+  await pool.query(`INSERT INTO policy_events (policy_no, event_type) VALUES ($1,'reinstatement')`, [policy.id]);
+  await dispatch();
+  const sent = (await pool.query('SELECT status, error FROM policy_events WHERE id = $1', [eventId])).rows[0];
+  assert.equal(sent.status, 'done', sent.error ?? '');
+  assert.equal(await count(`SELECT count(*)::int AS n FROM payout_events WHERE policy_id = $1`, [policy.id]), 1);
+});
+
+test('a m. 1434(4) election clips a window at the elected period end, from the election on', async () => {
+  const policy = await mintedPolicy(RULE);
+  // Two notices in the period, each paid, then the election -- the only way
+  // m. 1434(4) is reached. The period ends at DEADLINE, inside a closed day.
+  for (const serviceDate of ['2026-08-20T09:00:00.000Z', '2026-09-01T09:00:00.000Z']) {
+    await servedNotice(policy.id, serviceDate);
+    await pool.query(`INSERT INTO policy_events (policy_no, event_type) VALUES ($1,'reinstatement')`, [policy.id]);
+    await dispatch();
+  }
+  await pool.query(`INSERT INTO policy_events (policy_no, event_type, payload) VALUES ($1,'two_notice_election',$2)`, [
+    policy.id,
+    JSON.stringify({
+      electedAt: '2026-09-09T00:00:00.000Z', insurancePeriodStart: '2026-08-01T00:00:00.000Z',
+      insurancePeriodEnd: DEADLINE.toISOString(),
+    }),
+  ]);
+  await dispatch();
+  assert.equal(
+    (await pool.query('SELECT default_state FROM policies WHERE id = $1', [policy.id])).rows[0].default_state,
+    'two_notice_elected',
+    'fixture: elected, not landed'
+  );
+  await insertDayWithEvidence(policy.id, HELD_DAYS.slice(1));
+
+  await queueClosedWindows({ insurerIds: [insurerId] });
+  const clipped = await windowOf(policy.id, DAY_10);
+  assert.equal(new Date(clipped.event_end).getTime(), DEADLINE.getTime(), 'clipped at the elected end, not held');
+  assert.equal(Number(clipped.aggregated_value), -1.5, 'the reading after the elected end is not folded in');
+  assert.equal(await windowOf(policy.id, DAY_11), undefined);
+  await dispatch();
+  const ev = (await pool.query('SELECT status, error FROM policy_events WHERE trigger_window_id = $1', [clipped.id])).rows[0];
+  assert.equal(ev.status, 'done', ev.error ?? '');
+});
+
+// The same as mintedPolicy, but with no cover start: the policy is minted and
+// active, and its cover has not begun because no first premium is recorded.
+async function mintedPolicyCoverNotBegun(windowRule) {
+  const ph = (
+    await pool.query(`INSERT INTO policyholders (insurer_id, external_ref) VALUES ($1,$2) RETURNING id`, [
+      insurerId,
+      `test-ref-${crypto.randomUUID()}`,
+    ])
+  ).rows[0].id;
+  const policy = (
+    await pool.query(
+      `INSERT INTO policies
+         (insurer_id, policyholder_id, premium_amount, currency, start_date, end_date, status, created_at,
+          event_window_timezone, event_window_start_hour, event_aggregation, document_hash)
+       VALUES ($1,$2,500,'TRY','2026-08-01','2027-03-31','pending_mint','2026-08-01',$3,$4,$5,$6)
+       RETURNING id`,
+      [insurerId, ph, windowRule.timezone, windowRule.startHour, windowRule.aggregation, DOCUMENT_HASH]
+    )
+  ).rows[0];
+  await pool.query(
+    `INSERT INTO policy_coverages
+       (policy_id, coverage_code, product_code, peril_type, cell_ids,
+        sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination, metric, payout_basis)
+     VALUES ($1,'TEST-COVERAGE','TEST-PRODUCT','TEST-PERIL','["window-cell"]',10000,10000,
+       '[{"tierOrder":1,"label":"test tier","minValue":"-2.0","maxValue":"0.0","payoutPct":"25.0","shape":"TS_Step","pctAtMin":null,"pctAtMax":null}]',
+       '["PDR_Insured"]','TEMPERATURE_C','PB_RemainingLimit')`,
+    [policy.id]
+  );
+  await pool.query(
+    `INSERT INTO policy_events (policy_no, event_type, expected_version) VALUES ($1, 'activation', 0)`,
+    [policy.id]
+  );
+  await dispatch();
+  const row = (await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id])).rows[0];
+  assert.equal(row.status, 'active', 'fixture policy must mint before a window can be tested on it');
+  assert.equal(row.coverage_began_at, null, 'fixture: cover has not begun');
+  return row;
+}
+
+test('tokenNotLive: live, no token, no party, failed read', () => {
+  const policy = { id: 'p1', insurer_id: 'i1', daml_contract_id: '00abcdef0123456789' };
+  assert.equal(
+    tokenNotLive(policy, new Map([['i1', new Map([['p1', new Set(['00abcdef0123456789'])]])]])),
+    null,
+    'an active token with its policyNo and the contract id SQL records'
+  );
+  const gone = tokenNotLive(policy, new Map([['i1', new Map([['p2', new Set(['00fedcba9876543210'])]])]]));
+  assert.equal(gone.known, true);
+  assert.match(gone.why, /00abcdef0123/, 'names the contract id SQL records');
+  const noParty = tokenNotLive(policy, new Map());
+  assert.equal(noParty.known, true);
+  assert.match(noParty.why, /no Canton party/);
+  const failed = tokenNotLive(policy, new Map([['i1', new Error('boom')]]));
+  assert.equal(failed.known, false, 'a failed read is not known, not "no token"');
+  assert.match(failed.why, /boom/);
+});
+
+// A token re-created on the ledger whose new contract id never reached
+// SQL carries the same policyNo, so the policyNo alone calls it live.
+test('tokenNotLive: an active token whose contract id is not the one SQL records, or two active tokens, is not known', () => {
+  const policy = { id: 'p1', insurer_id: 'i1', daml_contract_id: '00old00000000000000' };
+  const stale = tokenNotLive(policy, new Map([['i1', new Map([['p1', new Set(['00new11111111111111'])]])]]));
+  assert.equal(stale?.known, false, 'the SQL contract id is not the live one: not known, so not queued');
+  assert.match(stale.why, /00old0000000/, 'names the contract id SQL records');
+  assert.match(stale.why, /00new1111111/, 'and the one active on the ledger');
+  const two = tokenNotLive(policy, new Map([['i1', new Map([['p1', new Set(['00old00000000000000', '00bbb22222222222222'])]])]]));
+  assert.equal(two?.known, false, 'two active tokens with one policyNo: not known');
+  assert.match(two.why, /00old0000000/);
+  assert.match(two.why, /00bbb2222222/);
+});
+
+const loggedLines = (errors) => errors.mock.calls.map((c) => c.arguments.map(String).join(' '));
+const windowRows = (policyId) =>
+  count('SELECT count(*)::int AS n FROM trigger_windows WHERE policy_id = $1', [policyId]);
+
+test('a policy whose token was archived behind the platform gets no window, no trigger and no evidence row; a live one beside it does', async (t) => {
+  const A = await mintedPolicy(RULE);
+  const B = await mintedPolicy(RULE);
+  await insertDayWithEvidence(A.id);
+  await insertDayWithEvidence(B.id);
+  // Archived behind the platform's back, as the ledger-refusal test above does:
+  // SQL still records B as active with its contract id.
+  const token = (await queryActiveContracts({ moduleName: 'Insurance.PolicyToken', entityName: 'PolicyToken', parties: [insurerParty] }))
+    .map((e) => e.contractEntry.JsActiveContract.createdEvent)
+    .find((c) => c.contractId === B.daml_contract_id);
+  await exerciseChoice({
+    moduleName: 'Insurance.PolicyToken', entityName: 'PolicyToken', contractId: token.contractId,
+    choice: 'Archive', argument: {}, actAs: token.signatories,
+  });
+  const snapshot = async (id) => ({
+    row: (await pool.query('SELECT to_jsonb(p)::text AS j FROM policies p WHERE id = $1', [id])).rows[0].j,
+    readings: await count('SELECT count(*)::int AS n FROM oracle_readings WHERE policy_id = $1', [id]),
+    events: await count('SELECT count(*)::int AS n FROM policy_events WHERE policy_no = $1', [id]),
+  });
+  const before = await snapshot(B.id);
+  const errors = t.mock.method(console, 'error');
+
+  await queueClosedWindows({ insurerIds: [insurerId] });
+
+  assert.equal(await windowRows(A.id), 1, 'the live policy gets its window');
+  assert.equal(await triggerRows(A.id), 1, 'and its trigger');
+  assert.equal(await windowRows(B.id), 0, 'no window for a policy with no active token');
+  assert.equal(await triggerRows(B.id), 0, 'no trigger for it');
+  assert.deepEqual(await snapshot(B.id), before, 'its row, readings and outbox are left as they were');
+  const lines = loggedLines(errors);
+  assert.equal(
+    lines.filter((l) => l.includes(B.id) && l.includes('no PolicyToken with its policyNo')).length,
+    1,
+    `expected one logged skip for ${B.id}; got: ${JSON.stringify(lines)}`
+  );
+
+  await dispatch();
+  const ev = (
+    await pool.query(`SELECT status, error FROM policy_events WHERE policy_no = $1 AND event_type = 'trigger'`, [A.id])
+  ).rows[0];
+  assert.equal(ev.status, 'done', ev.error ?? '');
+  assert.equal(
+    await count('SELECT count(*)::int AS n FROM attested_evidence WHERE policy_id = $1', [B.id]),
+    0,
+    'no permanent evidence row is written for it'
+  );
+  assert.deepEqual(await snapshot(B.id), before, 'nor does the dispatcher touch it');
+});
+
+test('a failed liveness read queues nothing this run, and the next run queues the same window', async (t) => {
+  const C = await mintedPolicy(RULE);
+  await insertDayWithEvidence(C.id);
+  const errors = t.mock.method(console, 'error');
+
+  await queueClosedWindows({
+    insurerIds: [insurerId],
+    activeTokens: async () => new Map([[insurerId, new Error('simulated: ledger unreachable')]]),
+  });
+
+  assert.equal(await windowRows(C.id), 0, 'not known is not a reason to queue');
+  assert.equal(await triggerRows(C.id), 0);
+  const lines = loggedLines(errors);
+  assert.ok(
+    lines.some((l) => l.includes(C.id) && l.includes('simulated')),
+    `expected a logged line for ${C.id} naming the failed read; got: ${JSON.stringify(lines)}`
+  );
+
+  await queueClosedWindows({ insurerIds: [insurerId] });
+  assert.equal(await windowRows(C.id), 1, 'the next run, with a read that succeeds, queues the window');
+  assert.equal(await triggerRows(C.id), 1);
+  await dispatch();
+  const ev = (
+    await pool.query(`SELECT status, error FROM policy_events WHERE policy_no = $1 AND event_type = 'trigger'`, [C.id])
+  ).rows[0];
+  assert.equal(ev.status, 'done', ev.error ?? '');
+});
+
+// The token is live on the ledger, but SQL records another contract id
+// (a re-create whose write-back never landed). The ledger read is real.
+test('a policy whose SQL contract id is not its live token\'s queues no window; once SQL matches, the next run does', async (t) => {
+  const S = await mintedPolicy(RULE);
+  await insertDayWithEvidence(S.id);
+  const liveCid = S.daml_contract_id;
+  const staleCid = `00${'5'.repeat(10)}${liveCid.slice(12)}`;
+  await pool.query('UPDATE policies SET daml_contract_id = $2 WHERE id = $1', [S.id, staleCid]);
+  const readings = () => count('SELECT count(*)::int AS n FROM oracle_readings WHERE policy_id = $1', [S.id]);
+  const readingsBefore = await readings();
+  const errors = t.mock.method(console, 'error');
+
+  await queueClosedWindows({ insurerIds: [insurerId] });
+
+  assert.equal(await windowRows(S.id), 0, 'a contract id that is not the live one is not a reason to queue');
+  assert.equal(await triggerRows(S.id), 0);
+  assert.equal(await readings(), readingsBefore, 'its readings are left where they are');
+  const lines = loggedLines(errors);
+  assert.ok(
+    lines.some((l) => l.includes(S.id) && l.includes(staleCid.slice(0, 12)) && l.includes(liveCid.slice(0, 12)) &&
+      l.includes('looked at again on the next run')),
+    `expected a logged line for ${S.id} naming both contract ids; got: ${JSON.stringify(lines)}`
+  );
+
+  await pool.query('UPDATE policies SET daml_contract_id = $2 WHERE id = $1', [S.id, liveCid]);
+  await queueClosedWindows({ insurerIds: [insurerId] });
+  assert.equal(await windowRows(S.id), 1, 'with SQL on the live contract id, the next run queues the window');
+  assert.equal(await triggerRows(S.id), 1);
+  await dispatch();
+  const ev = (
+    await pool.query(`SELECT status, error FROM policy_events WHERE policy_no = $1 AND event_type = 'trigger'`, [S.id])
+  ).rows[0];
+  assert.equal(ev.status, 'done', ev.error ?? '');
+});
+
+// The readings half, which the rest of this file leaves out by inserting
+// readings directly: a policy whose token is gone must stop getting readings
+// too, and that is decided in runOnce. So runOnce is run here, against a
+// provider stub on a loopback port (the stub-server pattern of
+// oracleEndpoint.test.mjs); the ledger read and the archive are real.
+test('runOnce records no reading for a policy whose token was archived and one for a live one; a failed liveness read records both', async (t) => {
+  const A = await mintedPolicy(RULE);
+  const B = await mintedPolicy(RULE);
+  // fetchProviderResponse asks only for a cell in the stand-in format.
+  await pool.query('UPDATE policy_coverages SET cell_ids = $2 WHERE policy_id = ANY($1)', [
+    [A.id, B.id],
+    JSON.stringify(['metno:-12.3456,98.7654']),
+  ]);
+  const token = (await queryActiveContracts({ moduleName: 'Insurance.PolicyToken', entityName: 'PolicyToken', parties: [insurerParty] }))
+    .map((e) => e.contractEntry.JsActiveContract.createdEvent)
+    .find((c) => c.contractId === B.daml_contract_id);
+  await exerciseChoice({
+    moduleName: 'Insurance.PolicyToken', entityName: 'PolicyToken', contractId: token.contractId,
+    choice: 'Archive', argument: {}, actAs: token.signatories,
+  });
+  // Measured now, so no window of it closes during the test; 20 is outside the
+  // fixture tier either way.
+  const provider = http.createServer((req, res) => {
+    const now = new Date().toISOString();
+    res.setHeader('content-type', 'application/json');
+    res.end(
+      JSON.stringify({
+        geometry: { coordinates: [98.7654, -12.3456, 0] },
+        properties: {
+          meta: { updated_at: now, units: { air_temperature: 'celsius' } },
+          timeseries: [{ time: now, data: { instant: { details: { air_temperature: 20.0 } } } }],
+        },
+      })
+    );
+  });
+  await new Promise((r) => provider.listen(0, '127.0.0.1', r));
+  const saved = { ...config.oracle };
+  config.oracle.climateApiUrl = `http://127.0.0.1:${provider.address().port}`;
+  config.oracle.climateApiUserAgent = 'oracleWindow.test.mjs provider stub';
+  const readings = (id) => count('SELECT count(*)::int AS n FROM oracle_readings WHERE policy_id = $1', [id]);
+  try {
+    const errors = t.mock.method(console, 'error');
+
+    await runOracle({ insurerIds: [insurerId] });
+
+    assert.equal(await readings(A.id), 1, 'the live policy gets its reading');
+    assert.equal(await readings(B.id), 0, 'no reading for a policy with no active token');
+    const first = loggedLines(errors);
+    assert.equal(
+      first.filter((l) => l.includes(B.id) && l.includes('skipped, no reading recorded')).length,
+      1,
+      `expected one logged skip for ${B.id}; got: ${JSON.stringify(first)}`
+    );
+    assert.equal(first.filter((l) => l.includes(A.id)).length, 0, 'nothing is logged against the live one');
+
+    await runOracle({
+      insurerIds: [insurerId],
+      activeTokens: async () => new Map([[insurerId, new Error('simulated: ledger unreachable')]]),
+    });
+
+    assert.equal(await readings(A.id), 2, 'a failed read does not cost the live policy its reading');
+    assert.equal(await readings(B.id), 1, 'not known is not "no token": the reading is recorded anyway');
+    const second = loggedLines(errors).slice(first.length);
+    for (const id of [A.id, B.id]) {
+      assert.ok(
+        second.some((l) => l.includes(id) && l.includes('NOT KNOWN') && l.includes('simulated')),
+        `expected a logged NOT KNOWN line for ${id}; got: ${JSON.stringify(second)}`
+      );
+    }
+  } finally {
+    Object.assign(config.oracle, saved);
+    provider.closeAllConnections();
+    await new Promise((r) => provider.close(r));
+  }
+});
+
+// Kept last in this file: should it regress, it leaves a queued trigger, and
+// no dispatch() may run after it.
+test(
+  'a policy whose cover has not begun gets no window and no trigger',
+  async () => {
+    const policy = await mintedPolicyCoverNotBegun(RULE);
+    await insertDay(policy.id);
+
+    await queueClosedWindows({ insurerIds: [insurerId] });
+
+    const windows = await count(`SELECT count(*)::int AS n FROM trigger_windows WHERE policy_id = $1`, [policy.id]);
+    const triggers = await triggerRows(policy.id);
+    assert.deepEqual(
+      { windows, triggers },
+      { windows: 0, triggers: 0 },
+      `cover has not begun (coverage_began_at is null), so expected no trigger_windows row and no trigger ` +
+        `outbox row; got ${windows} window(s) and ${triggers} trigger(s)`
+    );
+  }
+);

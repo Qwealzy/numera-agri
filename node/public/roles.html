@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Who Sees What</title>
+<!-- Fetches GET /debug/roles-data and POST /debug/roles/try-insurer-trigger,
+     each only when a button is pressed; nothing refreshes by itself. No
+     external asset of any kind: system fonts, inline CSS, inline script. -->
+<style>
+  :root {
+    --paper: #f6f7f9; --surface: #ffffff; --ink: #14181c; --muted: #5b6770; --line: #d7dde2;
+    --ok: #1f7a4d; --ok-soft: #e3f3ea; --none: #9aa6ae;
+    --warn: #8a5a00; --warn-soft: #fdf0d6; --bad: #b3261e; --bad-soft: #fbe3e1;
+    --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0e1216; --surface: #161c21; --ink: #e8edf1; --muted: #97a4ad; --line: #2b353d;
+      --ok: #6fd39c; --ok-soft: #173024; --none: #56636c;
+      --warn: #f0c264; --warn-soft: #33280f; --bad: #ff8a80; --bad-soft: #3a1512;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--font); }
+  body { font-size: 16px; line-height: 1.45; overflow-x: hidden; }
+  .page { max-width: 1280px; margin: 0 auto; padding: 28px 16px 48px; display: flex; flex-direction: column; gap: 20px; }
+  h1 { font-size: 30px; margin: 0; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin-top: 6px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  select, input, button { font: inherit; }
+  select, input { padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); min-width: 0; max-width: 100%; }
+  input { font-family: var(--mono); width: 26em; }
+  button { padding: 8px 14px; border-radius: 8px; border: 1px solid var(--ink); background: var(--ink); color: var(--paper); cursor: pointer; }
+  button.secondary { background: transparent; color: var(--ink); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .meta { color: var(--muted); font-size: 14px; font-family: var(--mono); overflow-wrap: anywhere; }
+  .banner { padding: 12px 16px; border-radius: 10px; font-weight: 600; }
+  .banner.bad { background: var(--bad-soft); color: var(--bad); border: 2px solid var(--bad); font-size: 20px; }
+  .banner.ok { background: var(--ok-soft); color: var(--ok); }
+  .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+  @media (max-width: 1000px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 600px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+  .col { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .col h2 { font-size: 19px; margin: 0; }
+  .role-tag { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+  .why { font-size: 15px; }
+  .count { font-size: 34px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .count.zero { color: var(--none); }
+  .queries { font-family: var(--mono); font-size: 13px; color: var(--muted); margin: 0; padding-left: 18px; }
+  .contract { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-size: 14px; }
+  .contract .t { font-weight: 700; }
+  .contract dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 10px; margin: 6px 0 0; }
+  .contract dt { color: var(--muted); }
+  .contract dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+  .note { font-size: 13px; color: var(--muted); border-top: 1px dashed var(--line); padding-top: 10px; margin-top: auto; }
+  .error { color: var(--warn); background: var(--warn-soft); padding: 8px 10px; border-radius: 8px; font-size: 14px; overflow-wrap: anywhere; }
+  .absent { color: var(--muted); font-style: italic; }
+  .attempt { display: flex; flex-direction: column; gap: 8px; }
+  .answer { font-size: 14px; overflow-wrap: anywhere; }
+  .answer .refused { color: var(--ok); font-weight: 700; font-size: 16px; }
+  footer { color: var(--muted); font-size: 13px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <h1>One policy, four parties</h1>
+    <div class="sub">Each column is what the ledger returned when asked as that party: the policy token, approved payouts and review items for the chosen policy.</div>
+  </header>
+
+  <div class="controls">
+    <button id="load-list" class="secondary" type="button">Load recent policies</button>
+    <select id="policy-select" aria-label="Recent policies"><option value="">(no list loaded)</option></select>
+    <input id="policy-id" placeholder="or paste a policy id" aria-label="Policy id" />
+    <button id="read" type="button">Read as each party</button>
+  </div>
+  <div id="status" class="meta"></div>
+  <div id="rights"></div>
+  <div id="grid" class="grid"></div>
+  <footer>Synthetic data, LocalNet. A developer page on this machine only.</footer>
+</div>
+
+<script>
+  const WHY = {
+    issuer: 'The insurer signs the policy token, every approved payout, every review item and every settled or closed-unpaid record, so the ledger shows it all of them.',
+    holder: 'The policyholder is an observer on the policy token, on approved payouts, on review items and on settled or closed-unpaid records, so the ledger shows it all of them.',
+    observer: 'The mortgagee is an observer on the policy token, and on an approved payout or a settled or closed-unpaid record only when that leg was routed to it; never on a review item.',
+    outsider: 'Another insurer is neither a signatory nor an observer on any contract of this policy, so the ledger shows it none.',
+  };
+  const TEMPORARY = 'Read by the platform’s ledger user with a temporary read-as right for this party, revoked after the read. Every party in this demo is hosted on the platform’s participant; the party itself has no node or login.';
+  const HOSTED = 'Every party in this demo is hosted on the platform’s participant; the party itself has no node or login.';
+  const ROLE_NAME = { issuer: 'as issuer', holder: 'as holder', observer: 'as observer', outsider: 'as outsider' };
+
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, cls, text) => {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  };
+
+  // heldBefore names a right the PLATFORM'S ledger user already held for this
+  // party, which is why no temporary read right had to be granted. Read as a
+  // claim about the party itself -- "this insurer may act here" -- it says the
+  // opposite of what the column demonstrates, so the sentence spells out whose
+  // right it is and what the ledger actually returned.
+  function readNote(r) {
+    if (!r.readAccess) return HOSTED;
+    if (r.readAccess.granted) return TEMPORARY;
+    if (r.readAccess.heldBefore) {
+      const count = (r.contracts ?? []).length;
+      return `Read by the platform’s ledger user, which can already act on behalf of this party (it holds a ` +
+        `${r.readAccess.heldBefore} right for it), so no extra read right was needed. That is the PLATFORM’s right, ` +
+        `not a right this party has on this policy: the ledger returned ${count} contract(s) for it. ${HOSTED}`;
+    }
+    return HOSTED;
+  }
+
+  // Amounts as money, to the currency's own two places. Display only: the
+  // value the handler returned is what was read off the ledger, unrounded and
+  // untouched, and it is shown underneath when the two differ.
+  function amount(value, currency) {
+    if (value === null || value === undefined || value === '') return null;
+    const n = Number(value);
+    if (!Number.isFinite(n)) return `${value} ${currency ?? ''}`.trim();
+    const shown = `${n.toFixed(2)} ${currency ?? ''}`.trim();
+    // The ledger sends ten decimal places, and dropping eight zeroes is not
+    // worth saying. A value that does NOT round back to itself is: that is
+    // money the two places do not show, so it is named beside them.
+    return Number(n.toFixed(2)) === n ? shown : `${shown} (ledger value ${value})`;
+  }
+
+  function contractCard(c) {
+    const box = el('div', 'contract');
+    box.append(el('div', 't', c.template), el('div', 'meta', `contract ${c.contractIdPrefix}…`));
+    const dl = el('dl');
+    const add = (k, v) => { if (v !== undefined && v !== null) dl.append(el('dt', null, k), el('dd', null, String(v))); };
+    if (c.template === 'PolicyToken') {
+      add('status', c.status);
+      add('default state', c.defaultState);
+      add('expiry', c.expiry);
+      for (const cv of c.coverages ?? []) add(cv.coverageCode, `remaining limit ${amount(cv.remainingLimit, '')}`);
+    } else if (c.template === 'PayoutApproved') {
+      add('amount', amount(c.amount, c.currency));
+      add('recipient role', c.recipientRole);
+      add('approved at', c.approvedAt);
+    } else if (c.template === 'PayoutSettled') {
+      // v22: the record a settlement leaves -- the insurer's declaration.
+      add('amount', amount(c.amount, c.currency));
+      add('recipient role', c.recipientRole);
+      add('settled at (reported)', c.settledAt);
+      add('recorded at', c.recordedAt);
+    } else if (c.template === 'PayoutClosedUnpaid') {
+      // v22: the record a close-unpaid leaves.
+      add('amount', amount(c.amount, c.currency));
+      add('recipient role', c.recipientRole);
+      add('unpaid reason', c.unpaidReason);
+      add('closed at (declared)', c.closedAt);
+      add('recorded at', c.recordedAt);
+    } else {
+      add('amount', amount(c.amount, c.currency));
+      add('reason kind', c.reasonKind);
+    }
+    box.append(dl);
+    return box;
+  }
+
+  function column(r, policyId) {
+    const col = el('section', 'col');
+    col.append(el('div', 'role-tag', r.role), el('h2', null, r.label), el('div', 'why', WHY[r.role] ?? ''));
+    if (r.partyIdPrefix) col.append(el('div', 'meta', `party ${r.partyIdPrefix}`));
+
+    if (r.absent) {
+      col.append(el('div', 'absent', r.absent));
+    } else {
+      if (r.error) col.append(el('div', 'error', r.error));
+      const n = (r.contracts ?? []).length;
+      col.append(el('div', n ? 'count' : 'count zero', `${n} contract${n === 1 ? '' : 's'}`));
+      if (r.queries?.length) {
+        const ul = el('ul', 'queries');
+        for (const q of r.queries) ul.append(el('li', null, `${q.template} ${ROLE_NAME[r.role]} → ${q.returned}`));
+        col.append(ul);
+      }
+      for (const c of r.contracts ?? []) col.append(contractCard(c));
+    }
+
+    if (r.role === 'issuer' && !r.absent) col.append(attemptBox(policyId));
+    col.append(el('div', 'note', readNote(r)));
+    return col;
+  }
+
+  // The route answers refused: true for any error the submission
+  // raised. Only the ledger's authorization refusal is the boundary holding
+  // (measured: 400 DAML_AUTHORIZATION_ERROR, .env.example).
+  function isAuthorityRefusal(body) {
+    return body.refused === true && body.ledgerCode === 'DAML_AUTHORIZATION_ERROR';
+  }
+
+  function attemptBox(policyId) {
+    const box = el('div', 'attempt');
+    const btn = el('button', null, 'Try to evaluate this policy’s trigger as the insurer');
+    btn.type = 'button';
+    const answer = el('div', 'answer');
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      answer.textContent = 'Submitting as the insurer…';
+      try {
+        const res = await fetch('/debug/roles/try-insurer-trigger', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ policyId }),
+        });
+        const body = await res.json();
+        answer.textContent = '';
+        if (!res.ok || body.error) {
+          answer.append(el('div', 'error', body.error ?? body.reason ?? `HTTP ${res.status}`));
+        } else if (body.sent === false) {
+          answer.append(el('div', 'error', `Not sent: ${body.reason}`));
+        } else if (isAuthorityRefusal(body)) {
+          answer.append(
+            el('div', 'refused', 'The ledger refused it.'),
+            el('div', 'meta', `HTTP ${body.ledgerStatus ?? '?'} ${body.ledgerCode ?? ''}`),
+            el('div', 'meta', body.message),
+            el('div', 'meta', `value sent: ${body.observedValueSent} (outside every tier on the token)`),
+          );
+        } else if (body.refused) {
+          answer.append(
+            el('div', 'error', 'The attempt failed, but not with an authorization refusal, so it does not show the boundary holding.'),
+            el('div', 'meta', `HTTP ${body.ledgerStatus ?? 'no answer'} ${body.ledgerCode ?? ''}`),
+            el('div', 'meta', body.message),
+          );
+        } else {
+          answer.append(el('div', 'banner bad', 'THE LEDGER ACCEPTED THE INSURER’S OWN TRIGGER. The insurer is acting as its own oracle on this policy (a configuration check is meant to rule this out).'));
+        }
+        if (body.oracleOperatorDistinctFromInsurer !== undefined) {
+          answer.append(el('div', 'meta', `oracle operator on this token is a different party from the insurer: ${body.oracleOperatorDistinctFromInsurer ? 'yes' : 'NO'}`));
+        }
+      } catch (e) {
+        answer.textContent = `Request failed: ${e.message}`;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    box.append(btn, answer);
+    return box;
+  }
+
+  $('load-list').addEventListener('click', async () => {
+    $('status').textContent = 'Loading recent policies…';
+    try {
+      const res = await fetch('/debug/roles-data');
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+      const sel = $('policy-select');
+      sel.textContent = '';
+      sel.append(el('option', null, body.policies.length ? '(choose a policy)' : '(no minted policy)'));
+      sel.firstChild.value = '';
+      for (const p of body.policies) {
+        const o = el('option', null, `${p.policyId.slice(0, 8)}…  ${p.status}${p.hasMortgagee ? '  with mortgagee' : ''}`);
+        o.value = p.policyId;
+        sel.append(o);
+      }
+      $('status').textContent = `${body.policies.length} minted policies, most recently updated first.`;
+    } catch (e) {
+      $('status').textContent = `Could not load the list: ${e.message}`;
+    }
+  });
+
+  $('policy-select').addEventListener('change', (e) => { if (e.target.value) $('policy-id').value = e.target.value; });
+
+  $('read').addEventListener('click', async () => {
+    const policyId = $('policy-id').value.trim();
+    if (!policyId) { $('status').textContent = 'Choose or paste a policy id first.'; return; }
+    $('read').disabled = true;
+    $('status').textContent = 'Asking the ledger as each party…';
+    $('grid').textContent = '';
+    $('rights').textContent = '';
+    try {
+      const res = await fetch(`/debug/roles-data?policyId=${encodeURIComponent(policyId)}`);
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+      $('status').textContent = `Policy ${body.policyIdPrefix}…, read at ${body.checkedAt}.`;
+      $('rights').append(body.rightsWarning
+        ? el('div', 'banner bad', body.rightsWarning)
+        : el('div', 'meta', `Rights held by the platform’s ledger user: ${body.rightsBefore} before this read, ${body.rightsAfter} after.`));
+      for (const r of body.roles) $('grid').append(column(r, policyId));
+    } catch (e) {
+      $('status').textContent = `Could not read: ${e.message}`;
+    } finally {
+      $('read').disabled = false;
+    }
+  });
+</script>
+</body>
+</html>

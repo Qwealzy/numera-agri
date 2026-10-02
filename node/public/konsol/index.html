@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'" />
+<meta name="referrer" content="no-referrer" />
+<meta name="color-scheme" content="light" />
+<title>Sigortacı Konsolu · Numera</title>
+<link rel="icon" href="/numera-mark.png" />
+<!-- Read-only insurer console. konsol.js reads GET /api/v1/policies,
+     /api/v1/policies/:policyId, /api/v1/payouts and /api/v1/payouts/:payoutId
+     with the key the insurer pastes; the key is kept in sessionStorage only
+     and sent only as the x-api-key header. Nothing here writes. No external
+     asset of any kind: system fonts, inline CSS, a same-origin script. -->
+<style>
+  :root {
+    --navy: #435c7a; --navy-deep: #22374e; --green: #23b779; --green-deep: #178a57;
+    --paper: #f8f2ef; --paper-alt: #f1eae6; --surface: #ffffff; --ink: #1c2733; --ink-soft: #5f6b77; --rule: #ddd4ce;
+    --navy-soft: #e6ecf3; --green-soft: #e1f5ec; --amber: #8a5a00; --amber-soft: #fbefd6;
+    --red: #b3261e; --red-soft: #fbe4e2; --grey-soft: #eeeae7;
+    --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--font); }
+  body { font-size: 15px; line-height: 1.45; overflow-x: hidden; }
+  button, input { font: inherit; }
+  [hidden] { display: none !important; }
+  .mono { font-family: var(--mono); font-size: 0.92em; }
+  .soft { color: var(--ink-soft); }
+
+  /* Top bar */
+  .topbar { background: var(--navy-deep); color: #fff; }
+  .topbar-inner { max-width: 1560px; margin: 0 auto; padding: 12px 16px; display: flex; align-items: center; gap: 12px 16px; flex-wrap: wrap; }
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .brand img { width: 30px; height: 30px; background: var(--paper); border-radius: 7px; padding: 3px; }
+  .brand .wordmark { font-weight: 700; font-size: 18px; letter-spacing: 0.01em; }
+  .brand .product { color: #c9d5e3; font-size: 14px; border-left: 1px solid #50657e; padding-left: 10px; }
+  .proto { font-size: 12.5px; font-weight: 600; color: var(--navy-deep); background: #f5d98a; border-radius: 999px; padding: 3px 10px; white-space: nowrap; }
+  .session { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .session .who { font-size: 13px; color: #c9d5e3; }
+  @media (max-width: 600px) { .session { margin-left: 0; } .session .who { display: none; } }
+  .btn { border: 1px solid transparent; border-radius: 8px; padding: 7px 14px; cursor: pointer; background: var(--navy); color: #fff; }
+  .btn:hover { background: var(--navy-deep); }
+  .btn.ghost { background: transparent; border-color: #6d8199; color: #fff; }
+  .btn.ghost:hover { background: #2d4560; }
+  .btn.light { background: var(--surface); color: var(--navy-deep); border-color: var(--rule); }
+  .btn.light:hover { background: var(--paper-alt); }
+  .btn:disabled { opacity: 0.55; cursor: default; }
+  .btn:focus-visible, .row:focus-visible, summary:focus-visible, input:focus-visible { outline: 3px solid var(--green); outline-offset: 2px; }
+
+  .page { max-width: 1560px; margin: 0 auto; padding: 20px 16px 40px; display: flex; flex-direction: column; gap: 16px; }
+  .card { background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius); }
+
+  /* Key gate */
+  .gate { max-width: 640px; margin: 36px auto 0; padding: 28px; display: flex; flex-direction: column; gap: 14px; }
+  .gate h1 { font-size: 24px; line-height: 1.25; margin: 0; color: var(--navy-deep); }
+  .gate p { margin: 0; }
+  .key-form { display: flex; flex-direction: column; gap: 6px; }
+  .key-form label { font-weight: 600; font-size: 14px; }
+  .key-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .key-row input { flex: 1 1 260px; min-width: 0; padding: 9px 12px; border: 1px solid var(--rule); border-radius: 8px; background: var(--paper); font-family: var(--mono); }
+  .facts { margin: 0; padding: 14px 16px 14px 34px; background: var(--paper-alt); border-radius: 10px; color: var(--ink-soft); font-size: 14px; display: flex; flex-direction: column; gap: 6px; }
+
+  .alert { margin: 0; padding: 10px 14px; border-radius: 10px; background: var(--red-soft); color: var(--red); font-size: 14px; overflow-wrap: anywhere; }
+  .alert.warn { background: var(--amber-soft); color: var(--amber); }
+  .notice { padding: 10px 14px; border-radius: 10px; background: var(--navy-soft); color: var(--navy-deep); font-size: 14px; }
+
+  /* KPI tiles */
+  .kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+  .kpi { padding: 14px 16px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .kpi .label { font-size: 13px; color: var(--ink-soft); }
+  .kpi .value { font-size: 28px; font-weight: 700; color: var(--navy-deep); font-variant-numeric: tabular-nums; }
+  .kpi .sub { font-size: 13px; color: var(--ink-soft); overflow-wrap: anywhere; }
+  .kpi.accent { border-top: 3px solid var(--green); }
+  @media (max-width: 1000px) { .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+  /* Workspace: list + detail */
+  #app { display: flex; flex-direction: column; gap: 16px; }
+  .workspace { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+  @media (max-width: 1150px) { .workspace { grid-template-columns: minmax(0, 1fr); } }
+  .pane-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--rule); flex-wrap: wrap; }
+  .pane-head h2 { font-size: 17px; margin: 0; color: var(--navy-deep); }
+  .pane-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
+
+  table.list { width: 100%; border-collapse: collapse; font-size: 14px; table-layout: fixed; }
+  table.list .pill { white-space: normal; border-radius: 10px; }
+  .nowrap { white-space: nowrap; }
+  table.list th { text-align: left; font-size: 12px; font-weight: 600; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.04em; padding: 10px 12px; border-bottom: 1px solid var(--rule); background: var(--paper-alt); }
+  table.list td { padding: 10px 12px; border-bottom: 1px solid var(--grey-soft); vertical-align: top; }
+  .row { cursor: pointer; }
+  .row:hover td { background: #fbf8f6; }
+  .row[aria-selected="true"] td { background: var(--navy-soft); }
+  .row[aria-selected="true"] td:first-child { box-shadow: inset 3px 0 0 var(--navy); }
+  .cell-main { font-weight: 600; }
+  .cell-sub { font-size: 12.5px; color: var(--ink-soft); }
+  .num { font-variant-numeric: tabular-nums; }
+  .list-foot { padding: 12px 16px; display: flex; justify-content: center; }
+
+  @media (max-width: 760px) {
+    table.list thead { display: none; }
+    table.list, table.list tbody, table.list tr, table.list td { display: block; width: 100%; }
+    table.list tr { border-bottom: 1px solid var(--rule); padding: 8px 4px; }
+    table.list td { border: 0; padding: 4px 12px; display: grid; grid-template-columns: 7.5em minmax(0, 1fr); gap: 8px; }
+    table.list td::before { content: attr(data-label); font-size: 12px; color: var(--ink-soft); padding-top: 2px; }
+  }
+
+  /* Pills */
+  .pills { display: flex; flex-wrap: wrap; gap: 6px; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; border-radius: 999px; padding: 2px 10px; white-space: nowrap; background: var(--grey-soft); color: var(--ink-soft); }
+  .pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; opacity: 0.8; }
+  .pill.ok { background: var(--green-soft); color: var(--green-deep); }
+  .pill.info { background: var(--navy-soft); color: var(--navy); }
+  .pill.warn { background: var(--amber-soft); color: var(--amber); }
+  .pill.bad { background: var(--red-soft); color: var(--red); }
+
+  /* Detail */
+  .placeholder { padding: 40px 20px; text-align: center; color: var(--ink-soft); }
+  .placeholder .big { font-size: 16px; color: var(--ink); font-weight: 600; margin-bottom: 4px; }
+  .detail-title { display: flex; flex-direction: column; gap: 6px; }
+  .detail-title h2 { font-size: 20px; }
+  .detail-title .mono { color: var(--ink-soft); overflow-wrap: anywhere; font-size: 12.5px; }
+  dl.facts-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 16px; margin: 0; }
+  dl.facts-grid div { min-width: 0; }
+  dl.facts-grid dt { font-size: 12.5px; color: var(--ink-soft); }
+  dl.facts-grid dd { margin: 2px 0 0; overflow-wrap: anywhere; }
+  @media (max-width: 480px) { dl.facts-grid { grid-template-columns: minmax(0, 1fr); } }
+  h3.section { font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-soft); margin: 8px 0 0; }
+
+  .cov { border: 1px solid var(--rule); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+  .cov-head { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+  .bar { height: 8px; border-radius: 999px; background: var(--grey-soft); overflow: hidden; }
+  .bar > span { display: block; height: 100%; background: var(--green); }
+
+  .payout { border: 1px solid var(--rule); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .payout-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+  .amount { font-size: 20px; font-weight: 700; color: var(--navy-deep); font-variant-numeric: tabular-nums; }
+  .kv { display: grid; grid-template-columns: 11em minmax(0, 1fr); gap: 4px 10px; font-size: 13.5px; }
+  .kv > :nth-child(odd) { color: var(--ink-soft); }
+  .kv > :nth-child(even) { overflow-wrap: anywhere; }
+  @media (max-width: 480px) { .kv { grid-template-columns: minmax(0, 1fr); } .kv > :nth-child(odd) { margin-top: 4px; } }
+  details.more summary { cursor: pointer; color: var(--navy); font-size: 13.5px; font-weight: 600; }
+  details.more[open] summary { margin-bottom: 8px; }
+
+  ol.events { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+  ol.events li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; padding: 10px 0; border-bottom: 1px solid var(--grey-soft); }
+  ol.events li:last-child { border-bottom: 0; }
+  ol.events .failure { grid-column: 1 / -1; font-size: 13.5px; color: var(--red); background: var(--red-soft); border-radius: 8px; padding: 6px 10px; }
+
+  .empty { padding: 18px; border: 1px dashed var(--rule); border-radius: 10px; color: var(--ink-soft); text-align: center; font-size: 14px; }
+  .back { display: none; }
+  @media (max-width: 1150px) { .back { display: inline-block; } }
+
+  footer { max-width: 1560px; margin: 0 auto; padding: 0 16px 28px; color: var(--ink-soft); font-size: 13px; display: flex; flex-direction: column; gap: 4px; }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <img src="/numera-mark.png" alt="" width="30" height="30" />
+      <span class="wordmark">Numera</span>
+      <span class="product">Sigortacı konsolu</span>
+    </div>
+    <span class="proto">Prototip · test ortamı · sentetik veri</span>
+    <div class="session" id="session" hidden>
+      <span class="who">Anahtar bu sekmenin oturum belleğinde</span>
+      <button class="btn ghost" id="refresh" type="button">Yenile</button>
+      <button class="btn ghost" id="forget" type="button">Anahtarı unut</button>
+    </div>
+  </div>
+</header>
+
+<main class="page">
+  <section class="gate card" id="gate">
+    <h1>Poliçelerinizi ve onaylanan ödeme talimatlarını görüntüleyin</h1>
+    <p class="soft">API anahtarınızı yapıştırın. Anahtar bu sekmenin oturum belleğinde tutulur; adres çubuğuna, çereze ya da kalıcı depolamaya yazılmaz. İsteklere yalnızca başlık olarak eklenir. Silmek için "Anahtarı unut" düğmesine basın: tarayıcı kapatılan sekmeyi geri yüklerse ya da sekme çoğaltılırsa anahtar da onunla gelebilir.</p>
+    <form class="key-form" id="key-form" autocomplete="off">
+      <label for="key-input">API anahtarı</label>
+      <div class="key-row">
+        <input id="key-input" type="password" autocomplete="off" spellcheck="false" autocapitalize="off" required />
+        <button class="btn" type="submit">Görüntüle</button>
+      </div>
+    </form>
+    <p class="alert" id="gate-error" role="alert" hidden></p>
+    <ul class="facts">
+      <li>Bu ekran yalnızca okur. Ödeme sonucu bildirimi ve kapatma gibi işlemler bugünkü API üzerinden yapılır.</li>
+      <li>Defter bir ödeme talimatını onaylar; ödemeyi sigortacı kendi sistemiyle yapar.</li>
+      <li>Her anahtar yalnızca kendi sigortacısının kayıtlarını görür.</li>
+    </ul>
+  </section>
+
+  <section id="app" hidden>
+    <div class="kpis" id="kpis">
+      <div class="kpi card"><span class="label">Poliçe</span><span class="value" id="kpi-policies">–</span><span class="sub" id="kpi-policies-sub"></span></div>
+      <div class="kpi card accent"><span class="label">Onaylı talimat, ödeme sonucu bekleniyor</span><span class="value" id="kpi-approved">–</span><span class="sub" id="kpi-approved-sub"></span></div>
+      <div class="kpi card"><span class="label">İncelemedeki ödeme kalemi</span><span class="value" id="kpi-review">–</span><span class="sub" id="kpi-review-sub"></span></div>
+      <div class="kpi card"><span class="label">Son işlemi başarısız poliçe</span><span class="value" id="kpi-failed">–</span><span class="sub" id="kpi-failed-sub"></span></div>
+    </div>
+    <p class="alert warn" id="payouts-warning" role="status" hidden></p>
+
+    <div class="workspace">
+      <section class="card" aria-labelledby="list-title">
+        <div class="pane-head">
+          <h2 id="list-title">Poliçeler</h2>
+          <span class="soft" id="list-meta">En yeni önce</span>
+        </div>
+        <p class="alert" id="list-error" role="alert" hidden></p>
+        <table class="list" id="policy-table">
+          <colgroup><col style="width: 16%" /><col style="width: 23%" /><col style="width: 22%" /><col style="width: 20%" /><col style="width: 19%" /></colgroup>
+          <thead>
+            <tr><th>Poliçe</th><th>Durum</th><th>Dönem</th><th>Kalan limit</th><th>Son işlem</th></tr>
+          </thead>
+          <tbody id="policy-rows"></tbody>
+        </table>
+        <div class="empty" id="list-empty" hidden>Bu anahtarla görülen poliçe yok. Poliçeler API üzerinden oluşturulduğunda burada listelenir.</div>
+        <div class="list-foot" id="list-foot" hidden><button class="btn light" id="more" type="button">Daha fazla yükle</button></div>
+      </section>
+
+      <section class="card" id="detail" aria-label="Poliçe ayrıntısı">
+        <div class="placeholder" id="detail-placeholder">
+          <div class="big">Poliçe seçilmedi</div>
+          Ayrıntı için listeden bir poliçe seçin: teminatlar, ödeme kayıtları, bildirimler ve işlem geçmişi burada görünür.
+        </div>
+        <div id="detail-body" hidden></div>
+      </section>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span>Defter bir ödeme talimatını onaylar; ödemeyi sigortacı kendi sistemiyle yapar. Bu ekran yalnızca okur.</span>
+  <span>Saatler Türkiye saatiyle (TSİ) gösterilir. Tutarlar API'nin döndürdüğü ondalık metinden biçimlendirilir, yuvarlanmaz.</span>
+</footer>
+
+<script src="konsol.js"></script>
+</body>
+</html>

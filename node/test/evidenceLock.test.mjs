@@ -205,6 +205,19 @@ test('sql/roles.sql mode=working, applied twice: the role writes but cannot dele
       /permission denied for table oracle_raw_responses/, roleClient);
     const { rows } = await roleClient.query('SELECT count(*)::int AS n FROM attested_evidence');
     assert.equal(rows[0].n, 1, 'the role reads what it wrote');
+    // The terms API's tier-set PUT and DELETE (routes/policies.js) delete payout_tiers rows.
+    const { rows: [{ id: tierInsurerId }] } = await roleClient.query(
+      `INSERT INTO insurers (legal_name, api_key_hash) VALUES ('evidenceLock fixture (fake)', $1) RETURNING id`,
+      [crypto.randomBytes(32).toString('hex')]
+    );
+    await roleClient.query(
+      `INSERT INTO payout_tiers (insurer_id, product_code, peril_type, tier_order, label, threshold_min, threshold_max,
+                                 payout_percentage, shape)
+       VALUES ($1, 'FIXTURE-PRODUCT', 'FIXTURE-PERIL', 1, 'fixture tier', -2.0, 0.0, 25.00, 'TS_Step')`,
+      [tierInsurerId]
+    );
+    const tiers = await roleClient.query('DELETE FROM payout_tiers WHERE insurer_id = $1', [tierInsurerId]);
+    assert.equal(tiers.rowCount, 1, 'the role deletes a tier set');
   }, roleClient);
 });
 

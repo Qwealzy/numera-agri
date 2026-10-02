@@ -53,6 +53,18 @@ data EvaluateTriggerResult = EvaluateTriggerResult
     unroutedRemainder : Optional UnroutedRemainder
   deriving (Eq, Show)
 
+-- v22. What an archive of the token returns: two instants, kept
+-- apart. contractEndedAt is when the CONTRACT ended -- the token's expiry,
+-- or the frozen termination instant on a terminated token -- and recordClosedAt is
+-- when the token was archived, the transaction's ledger time. The archive
+-- can come later than the end (the sweeper waits for the last window), and
+-- neither instant stands in for the other.
+data ArchiveInstants = ArchiveInstants
+  with
+    contractEndedAt : Time
+    recordClosedAt  : Time
+  deriving (Eq, Show)
+
 -- The tokenized policy (Module 1's Mint target). Module 2's tier matrix and
 -- Module 3's archive/re-mint/burn lifecycle both live in
 -- PolicyToken_EvaluateTrigger below.
@@ -389,8 +401,15 @@ template PolicyToken
       all (\c -> c.sumInsured > 0.0 &&
                  c.remainingLimit >= 0.0 && c.remainingLimit <= c.sumInsured &&
                  not (null c.payoutDestination) &&
-                 (isNone c.mortgageeClaimAmount || isSome mortgagee))
+                 (isNone c.mortgageeClaimAmount || isSome mortgagee) &&
+                 -- v22: metric, cell commitment and tier-shape checks.
+                 c.metric /= "" &&
+                 isSha256Digest c.cellCommitment &&
+                 all validTier c.payoutTiers)
           coverages &&
+      -- v22. The boundary the trigger's controller rests on holds on
+      -- the ledger only if the two are different parties.
+      oracleOperator /= insurer &&
       coverageValidThrough <= expiry &&
       -- m. 1421: set together or neither. Cover that began has a reason it
       -- began, and a reason without an instant says nothing.
@@ -507,24 +526,39 @@ template PolicyToken
         metric         : Text
         attestationRef : Text
         currency       : Text
-        now            : Time
+        -- v22. The event as the clipped window the oracle evaluated,
+        -- [eventStart, eventEnd): the start is INCLUSIVE, the end EXCLUSIVE,
+        -- the same as the Node clip. Recorded onto PayoutApproved.
+        eventStart     : Time
+        eventEnd       : Time
+        -- v22. Must equal the coverage's cellCommitment.
+        cellCommitment : Text
+        -- v22. "sha256:" + 64 lowercase hex, computed off-ledger from the
+        -- stored responses; recorded onto PayoutApproved.
+        evidenceDigest : Text
       controller oracleOperator
       do
+        -- v22. Every instant this choice stamps -- approvedAt and a
+        -- review item's flaggedAt -- is the transaction's ledger time, not a
+        -- value the caller supplies.
+        now <- getTime
         -- Stage 3 Part 3: two independent checks now, one per axis, because
         -- claimability genuinely depends on both. On the claim/term axis
         -- the policy must not be in a terminal state; on the default axis
         -- coverage must not have stopped. A loss during the grace period
         -- is payable (coverage continues in full there), which is why
-        -- DS_GracePeriod passes and only DS_Terminated fails. Either
+        -- DS_GracePeriod passes. Since v22 a terminated contract is judged
+        -- by the event's time, not refused by its state (below). Either
         -- rejection leaves the required `failed` outbox row via
         -- dispatch/dispatcher.js, recording the observed value and the
         -- ledger's own reason -- never a silent skip.
         assertMsg "policy is not in a claimable state (must be active or partially paid)"
           (status == PS_Active || status == PS_PartiallyPaid)
         -- Cover during the NOTICE period is real: DS_GracePeriod passes, and
-        -- a loss there is payable exactly as on an ordinary policy. Only a
-        -- terminated contract is refused -- after the termination instant
-        -- there is no contract to claim under. Either rejection leaves a
+        -- a loss there is payable exactly as on an ordinary policy. After the
+        -- termination instant there is no contract to claim under; since v22
+        -- that is the event-interval check against coverageValidThrough,
+        -- which termination moves to that instant. Either rejection leaves a
         -- `failed` outbox row carrying the observed value and the ledger's
         -- own reason; nothing is silently skipped.
         -- m. 1421. Checked FIRST and worded distinctly, because this is not
@@ -536,14 +570,29 @@ template PolicyToken
         -- reported first, and both are true.
         assertMsg "cover has not begun on this policy (m. 1421) -- the insurer's liability starts with payment of the first premium unless otherwise agreed, and no start has been recorded"
           (isSome coverageBeganAt)
-        assertMsg "the contract was terminated for premium default -- losses after termination are outside cover"
-          (defaultState /= DS_Terminated)
+        -- v22. The event must lie inside cover: from the recorded
+        -- cover start (inclusive) to coverageValidThrough (exclusive, so
+        -- eventEnd may equal it). coverageValidThrough is the one upper bound
+        -- for expiry, termination (PolicyToken_Terminate moves it to the
+        -- termination instant) and m. 1434(4) (ApplyTwoNoticeTermination moves
+        -- it to the period end): an event that ended before the contract did
+        -- is evaluated although the evaluation comes later, one that runs past
+        -- it is refused.
+        assertMsg "the event interval is empty or inverted -- eventStart must be before eventEnd"
+          (eventStart < eventEnd)
+        assertMsg "the event starts before cover began on this policy"
+          (coverageBeganAt <= Some eventStart)
+        assertMsg "the event ends after coverageValidThrough -- the part after it is outside cover (term end, termination instant, or m. 1434(4) period end)"
+          (eventEnd <= coverageValidThrough)
+        -- v22. A window that has not ended on the
+        -- ledger clock is not evaluated: the observed value of an unfinished
+        -- window is not yet its value. eventEnd may equal the ledger time.
+        assertMsg "the event has not ended yet -- eventEnd is after this transaction's ledger time, and an unfinished window is not evaluated"
+          (eventEnd <= now)
         -- m. 1434(4). Note what is NOT refused: DS_TwoNoticeElected passes.
         -- The election defers the end to the period end and shortens nothing,
         -- so cover runs in full until then and a loss in that window is
         -- payable -- exactly as during a notice period under (3).
-        assertMsg "the contract ended under m. 1434(4) at the end of the insurance period -- losses after that are outside cover"
-          (defaultState /= DS_TwoNoticeTerminated)
         -- m. 1434(2). Deliberately a separate assertion with its own message:
         -- a policy in first-premium default is not a policy that lost cover,
         -- it is one whose first premium the insurer has reported unpaid, and
@@ -555,7 +604,22 @@ template PolicyToken
         assertMsg ("unknown coverage: " <> coverageCode)
           (any (\c -> c.coverageCode == coverageCode) coverages)
         let Some targetCoverage = find (\c -> c.coverageCode == coverageCode) coverages
-            result = evaluateAgainstTiers targetCoverage.payoutTiers targetCoverage.remainingLimit observedValue
+        -- v22. A value in one metric is never evaluated against tiers
+        -- written for another.
+        assertMsg ("the trigger's metric " <> metric <> " is not coverage " <> coverageCode <>
+                   "'s metric " <> targetCoverage.metric)
+          (metric == targetCoverage.metric)
+        -- v22. Consistency with the committed cell, not proof of the
+        -- data read for it.
+        assertMsg ("the trigger's cell commitment does not match coverage " <> coverageCode <> "'s")
+          (cellCommitment == targetCoverage.cellCommitment)
+        -- v22.
+        assertMsg "evidenceDigest must be \"sha256:\" followed by 64 lowercase hex characters"
+          (isSha256Digest evidenceDigest)
+        let basis = case targetCoverage.payoutBasis of
+              PB_RemainingLimit -> targetCoverage.remainingLimit
+              PB_SumInsured -> targetCoverage.sumInsured
+            result = evaluateAgainstTiers targetCoverage.payoutTiers basis targetCoverage.remainingLimit observedValue
         if not result.matched then
           pure EvaluateTriggerResult with
             trigger = result
@@ -658,7 +722,9 @@ template PolicyToken
                 -- destination this policy specified (Stage 4).
                 payoutDestination = targetCoverage.payoutDestination
                 approvedAt = now
-                status = PA_Pending
+                eventStart
+                eventEnd
+                evidenceDigest
 
           -- m. 1457 and m. 1456 on one coverage. The Code supplies NO priority
           -- rule: they sit as `a) Sinirli ayni hak` and `b) Haciz` under one
@@ -711,6 +777,18 @@ template PolicyToken
                                        "is entitled; it records that the platform was not given the " <>
                                        "means to decide."
                               flaggedAt = now
+                              -- v22. No source payout: nothing was
+                              -- routed, so no recipient. v22: the
+                              -- charge holder is carried as data, so a human
+                              -- can settle this to it; it does not observe
+                              -- the item.
+                              oracleOperator
+                              mortgagee
+                              recipient = None
+                              sourcePayoutCid = None
+                              eventStart
+                              eventEnd
+                              evidenceDigest
                             pure (Some UnroutedRemainder with
                                     amount = result.payoutAmount
                                     reason = UNR_CompetingClaims
@@ -743,6 +821,16 @@ template PolicyToken
                                        "carve-out; whether it reaches an excess is unsettled on the text. " <>
                                        "Recorded for a human. This asserts nothing about who is entitled."
                               flaggedAt = now
+                              -- v22. As above: never a payout, so no
+                              -- recipient. v22: the charge holder
+                              -- carried as data, as above.
+                              oracleOperator
+                              mortgagee
+                              recipient = None
+                              sourcePayoutCid = None
+                              eventStart
+                              eventEnd
+                              evidenceDigest
                             pure (Some UnroutedRemainder with
                                     amount = remainder
                                     reason = UNR_MortgageeSurplus
@@ -797,9 +885,8 @@ template PolicyToken
     -- Whether the payouts are actually all resolved is checked off-ledger
     -- (dispatch/dispatcher.js, against payout_events) -- PayoutApproved
     -- contracts are separate contracts this template cannot see.
-    choice PolicyToken_ArchiveForNonPayment : ()
+    choice PolicyToken_ArchiveForNonPayment : ArchiveInstants
       with
-        archivedAt : Time
         reason     : Text
       controller insurer
       do
@@ -810,21 +897,48 @@ template PolicyToken
         -- resolved" is the same condition either way.
         assertMsg "only a policy terminated for non-payment can be archived by this route"
           (defaultState == DS_Terminated || defaultState == DS_TwoNoticeTerminated)
-        pure ()
+        -- v22. The caller supplies no instant. The contract's end is
+        -- the field the terminating choice froze: terminationInstant on
+        -- DS_Terminated (PolicyToken_Terminate), twoNoticeEffectiveAt on
+        -- DS_TwoNoticeTerminated (PolicyToken_ApplyTwoNoticeTermination). The ensure keeps
+        -- each set in its state; a missing one fails loudly.
+        now <- getTime
+        let contractEnd = if defaultState == DS_Terminated
+                          then terminationInstant
+                          else twoNoticeEffectiveAt
+        case contractEnd of
+          None -> abort "a terminated policy with no recorded termination instant"
+          Some ended -> do
+            assertMsg "the contract has not ended yet on the ledger clock -- a policy cannot be archived for non-payment before its termination instant"
+              (now >= ended)
+            pure ArchiveInstants with
+              contractEndedAt = ended
+              recordClosedAt = now
 
     -- Module 3: full burn at natural expiry with no outstanding claim.
-    -- archivedAt/reason (Stage 3 Part 1) record why and when on-ledger --
-    -- before this, an expiry archive was indistinguishable from any other
-    -- archive of this choice. Regardless of what remaining limit any
+    -- reason (Stage 3 Part 1) records why on-ledger, and since v22 the
+    -- returned ArchiveInstants records when -- before this, an expiry archive
+    -- was indistinguishable from any other archive of this choice.
+    -- Regardless of what remaining limit any
     -- coverage still had: a policy reaching its term end expires, full
     -- stop, and whatever was left simply lapses -- there is no re-mint
     -- here to carry it forward into.
-    choice PolicyToken_ArchiveForExpiry : ()
+    --
+    -- v22. Refused while the ledger time is before `expiry`. The two
+    -- instants are returned rather than written into a new contract: the
+    -- smallest change that puts both in the exercise, with no new template
+    -- and no new observer.
+    choice PolicyToken_ArchiveForExpiry : ArchiveInstants
       with
-        archivedAt : Time
         reason     : Text
       controller insurer
-      do pure ()
+      do
+        now <- getTime
+        assertMsg "the term has not ended yet on the ledger clock -- a policy cannot be archived for expiry before its expiry"
+          (now >= expiry)
+        pure ArchiveInstants with
+          contractEndedAt = expiry
+          recordClosedAt = now
 
     -- The premium-default flow, rebuilt in Stage 4 to match TTK 6102
     -- m. 1434(3). Notice served -> DS_GracePeriod, where coverage CONTINUES
@@ -1307,6 +1421,7 @@ template PolicyToken
         create this with
           enforcementFruitlessAt = Some fruitlessAt
           enforcementRoute = Some route
+          version = version + 1
 
     -- m. 1431(4), fact TWO. The insurer notified the sigortali.
     --
@@ -1329,6 +1444,7 @@ template PolicyToken
           (isNone substitutedAt)
         create this with
           substitutionNotifiedAt = Some notifiedAt
+          version = version + 1
 
     -- m. 1431(4), fact THREE, and the only choice in this file that changes
     -- who a party is. It is deliberately NOT reachable through
@@ -1386,6 +1502,13 @@ template PolicyToken
         -- paying for a gap the Code's own default would have covered.
         assertMsg "an agreed cover start later than the reported payment date would vary m. 1421 to the insured's detriment, which m. 1452(3) does not permit"
           (isNone coverageBeganAt || coverageBeganAt <= Some paidAt)
+        -- v22. A payment dated after this
+        -- transaction's ledger time reports something that has not happened
+        -- yet, and would start cover in the future. No allowance for clock
+        -- difference.
+        now <- getTime
+        assertMsg "paidAt is after this transaction's ledger time -- a first premium cannot be reported paid before it was paid"
+          (paidAt <= now)
         create this with
           -- Only if not already set: cover begun by agreement is not
           -- restarted by a later payment. The earlier instant governs.
@@ -1476,6 +1599,15 @@ template PolicyToken
       do
         assertMsg "a terminated contract cannot be amended -- there is no contract left to amend"
           (defaultState /= DS_Terminated)
+        -- v22. The same for the two other ways the contract ends.
+        -- Since v22 the trigger judges a terminated token by the event's
+        -- time against coverageValidThrough, so an Amend here -- which moves
+        -- coverageValidThrough to the (new) expiry -- would reopen cover on a
+        -- contract that has ended.
+        assertMsg "the contract ended at the end of the insurance period after two notices -- there is no contract left to amend"
+          (defaultState /= DS_TwoNoticeTerminated)
+        assertMsg "the insurer withdrew from the contract for the unpaid first premium -- there is no contract left to amend"
+          (defaultState /= DS_WithdrawnForFirstPremium)
         assertMsg "only an active or partially paid policy can be amended"
           (status == PS_Active || status == PS_PartiallyPaid)
 

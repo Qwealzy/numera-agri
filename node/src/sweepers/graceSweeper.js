@@ -2,6 +2,7 @@ import { pathToFileURL } from 'node:url';
 import cron from 'node-cron';
 import { pool } from '../db.js';
 import { config } from '../config.js';
+import { lastWindowPending } from './expirySweeper.js';
 
 // The premium-default sweeper. Same shape as expirySweeper.js in every
 // respect: it never touches the ledger, it only observes state and writes
@@ -96,8 +97,20 @@ async function runOnce({ insurerIds } = {}) {
   //
   // Also a state test, and idempotent: a policy that has no unresolved
   // payouts stays in this result set until the archive actually happens.
+  //
+  // v22. Since v22 the ledger evaluates a
+  // terminated contract's windows by the event's time, so a window that ended
+  // at or before the termination instant is still payable after the
+  // termination is recorded -- and the oracle queues the last one, clipped at
+  // that instant, only once the termination is recorded. So the archive also
+  // waits until that last window has been evaluated and no trigger row of the
+  // policy is still pending or processing: the same test expirySweeper.js
+  // applies at expiry, with terminated_at as the end. Each deferral is logged
+  // with its reason, and the next run looks again.
   const { rows: burnable } = await pool.query(
-    `SELECT p.id FROM policies p
+    `SELECT p.id, p.terminated_at, p.coverage_began_at, p.event_window_timezone, p.event_window_start_hour,
+            p.event_aggregation, now() AS swept_at
+       FROM policies p
      WHERE p.default_state = 'terminated'
        AND p.daml_contract_id IS NOT NULL
        AND NOT EXISTS (
@@ -110,6 +123,13 @@ async function runOnce({ insurerIds } = {}) {
     `[graceSweeper] ${burnable.length} terminated polic${burnable.length === 1 ? 'y' : 'ies'} with all payouts resolved`
   );
   for (const policy of burnable) {
+    const pending = await lastWindowPending(policy, policy.terminated_at);
+    if (pending) {
+      console.log(
+        `[graceSweeper] terminated policy ${policy.id} not archived yet: ${pending}`
+      );
+      continue;
+    }
     await pool.query(
       `INSERT INTO policy_events (policy_no, event_type) VALUES ($1, 'termination_archive')
        ON CONFLICT (policy_no) WHERE event_type = 'termination_archive' AND status IN ('pending', 'processing')

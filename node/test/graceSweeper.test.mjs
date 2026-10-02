@@ -244,7 +244,7 @@ test('a second sweeper run produces no second termination row', async () => {
   assert.equal(
     (await terminationRows(policy.id)).length,
     1,
-    'a policy must be queued for termination exactly once no matter how many times the sweeper runs'
+    'while its termination row is pending or processing, a policy must get no second one however many times the sweeper runs'
   );
 });
 
@@ -408,4 +408,52 @@ test('a policy still in its notice period is never queued for archive', async ()
     0,
     'phase two must wait for the termination to actually be recorded, not run ahead of it'
   );
+});
+
+// v22. Since v22 the ledger evaluates a terminated contract's windows
+// by the event's time, so the last window before the termination instant is
+// still payable once the termination is recorded, and the oracle queues it
+// only then. The archive waits for it -- the expiry sweeper's own test, with
+// terminated_at as the end. The policy carries a window rule, a cover start,
+// and one in-cover reading just before the termination instant, in a
+// closed window with no trigger_windows row yet.
+test('a terminated policy is not queued for archive while its last window before termination is unevaluated', async () => {
+  const ph = await createPolicyholder();
+  const terminatedAt = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+  const { rows: [policy] } = await pool.query(
+    `INSERT INTO policies
+       (insurer_id, policyholder_id, premium_amount, currency, start_date, end_date,
+        status, default_state, notice_service_date, grace_period_days, terminated_at, daml_contract_id, current_version,
+        document_hash, coverage_began_at, coverage_start_basis, event_window_timezone, event_window_start_hour,
+        event_aggregation)
+     VALUES ($1,$2,500,'TRY','2026-01-01','2027-01-01','active','terminated',$3,10,$4,'fake-cid',1,$5,$6,
+             'CSB_AgreedWithoutPayment','UTC',0,'min')
+     RETURNING *`,
+    [insurerId, ph.id, DAYS_AGO_30, terminatedAt.toISOString(), DOCUMENT_HASH, DAYS_AGO_30]
+  );
+  await pool.query(
+    `INSERT INTO policy_coverages
+       (policy_id, coverage_code, product_code, peril_type, cell_ids,
+        sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination, metric, payout_basis)
+     VALUES ($1,'TEST-COVERAGE','TEST-PRODUCT','TEST-PERIL','["grace-cell"]',10000,10000,'[]','["PDR_Insured"]',
+             'TEMPERATURE_C','PB_RemainingLimit')`,
+    [policy.id]
+  );
+  await pool.query(
+    `INSERT INTO oracle_readings (policy_id, coverage_code, cell_id, metric, value, measured_at, source)
+     VALUES ($1,'TEST-COVERAGE','grace-cell','TEMPERATURE_C',-1.0,$2,'graceSweeper-fixture')`,
+    [policy.id, new Date(terminatedAt.getTime() - 1).toISOString()]
+  );
+
+  await runOnce({ insurerIds: [insurerId] });
+  assert.equal(
+    (await archiveRows(policy.id)).length,
+    0,
+    'the last window before the termination instant holds an in-cover reading it has not been evaluated on'
+  );
+
+  // Once no in-cover reading is left unevaluated there, the archive is queued.
+  await pool.query('DELETE FROM oracle_readings WHERE policy_id = $1', [policy.id]);
+  await runOnce({ insurerIds: [insurerId] });
+  assert.equal((await archiveRows(policy.id)).length, 1);
 });

@@ -11,12 +11,13 @@
 
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
 // POST /policies requires the policy document's SHA-256 in lowercase hex
 // (migration 034); the document itself never reaches the platform.
 const DOCUMENT_HASH = crypto.createHash('sha256').update('verify-m1458 policy document').digest('hex');
 
-const ENV_PATH = new URL('../node/.env', import.meta.url).pathname.replace(/^\//, '');
+const ENV_PATH = fileURLToPath(new URL('../node/.env', import.meta.url));
 for (const line of fs.readFileSync(ENV_PATH, 'utf8').split('\n')) {
   const m = line.trim().match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
   if (m) process.env[m[1]] = m[2].trim().replace(/^["']/, '').replace(/["']$/, '');
@@ -28,6 +29,13 @@ const { pool } = await import('../node/src/db.js');
 const { queryActiveContracts } = await import('../node/src/damlClient.js');
 
 const RUN = Date.now().toString(36);
+// Cell ids in the oracle's own format, "metno:<lat>,<lon>" with at most 4 decimals. The
+// first two decimals of the latitude name this script, the first two of the longitude
+// count the cells this run hands out, and the last two of each carry the run.
+const CELL_RUN = String(parseInt(RUN, 36) % 10000).padStart(4, '0');
+let cellCount = 0;
+const nextCell = () =>
+  `metno:0.16${CELL_RUN.slice(0, 2)},0.${String(++cellCount).padStart(2, '0')}${CELL_RUN.slice(2)}`;
 const iso = (d) => new Date(d).toISOString();
 const daysAgo = (n) => iso(Date.now() - n * 86400000);
 const daysAhead = (n) => iso(Date.now() + n * 86400000);
@@ -69,6 +77,10 @@ const createPolicy = async (label, cellIds, agreedCoverageStart) =>
       perilType: 'FROST',
       cellIds,
       sumInsured: 100000,
+      // v22: required by the API, with no default. The basis v21
+      // applied, which is also what the m. 1458 check evaluates against.
+      metric: 'TEMPERATURE_C',
+      payoutBasis: 'PB_RemainingLimit',
     }],
     ...(agreedCoverageStart ? { agreedCoverageStart } : {}),
   })).policy.id;
@@ -96,13 +108,20 @@ const settle = async (policyId, type = 'activation') => {
 
 const policyRow = async (id) => (await pool.query('SELECT * FROM policies WHERE id = $1', [id])).rows[0];
 
+// The package line gives the DAML_PACKAGE_ID loaded above, the package this
+// run is against, beside the name in the source tree's daml/daml.yaml. The
+// heading's vNN stays the version the article shipped in.
+const packageName = fs.readFileSync(new URL('../daml/daml.yaml', import.meta.url), 'utf8').match(/^name:\s*(\S+)/m)?.[1];
+if (!packageName) throw new Error('daml/daml.yaml has no name line');
+const PACKAGE = `\`${packageName}\` (id \`${process.env.DAML_PACKAGE_ID}\`)`;
+
 const out = [];
 const say = (s = '') => { out.push(s); console.log(s); };
 
 say('## 3m. Live verification run (v16 — retroactive cover)');
 say('');
 say('Through the real HTTP API against the real participant, package');
-say('`insurance-tokenization-v16`.');
+say(`${PACKAGE}.`);
 say('');
 
 // ---------------------------------------------------------------------------
@@ -110,11 +129,11 @@ say('');
 // ELSE. This is the case the check exists for: a brand-new policy has no
 // readings of its own.
 // ---------------------------------------------------------------------------
-const CELL_FROST = `cell-1458-frost-${RUN}`;
-const CELL_MILD = `cell-1458-mild-${RUN}`;
-const CELL_UNSEEN = `cell-1458-unseen-${RUN}`;
+const CELL_FROST = nextCell();
+const CELL_MILD = nextCell();
+const CELL_UNSEEN = nextCell();
 
-const neighbourId = await createPolicy('neighbour', [CELL_FROST, CELL_MILD], daysAgo(90));
+const neighbourId = await createPolicy('neighbour', [CELL_FROST], daysAgo(90));
 await call('POST', `/policies/${neighbourId}/activate`, {});
 const neighbourEvent = await settle(neighbourId);
 if (neighbourEvent.status !== 'done') throw new Error(`neighbour did not mint: ${neighbourEvent.error}`);
@@ -266,7 +285,7 @@ say('one. Shrinking the window excluded the only readings this cell has, so the'
 say('check now verifies nothing about it — and says so, rather than reporting');
 say('the correction as a clean bill of health.');
 
-const target = new URL('../docs/m1458-live-run.txt', import.meta.url).pathname.replace(/^\//, '');
+const target = fileURLToPath(new URL('../docs/m1458-live-run.txt', import.meta.url));
 fs.writeFileSync(target, out.join('\n') + '\n');
 console.log(`\nwritten to ${target}`);
 await pool.end();

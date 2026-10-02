@@ -24,7 +24,10 @@ import path from 'node:path';
 const NODE_DIR = path.resolve(import.meta.dirname, '..');
 const WRITERS = [
   'test/api.test.mjs', 'test/dispatcher.test.mjs', 'test/expirySweeper.test.mjs', 'test/graceSweeper.test.mjs',
-  'test/oracleWindow.test.mjs', 'test/notificationQueue.test.mjs',
+  'test/oracleWindow.test.mjs', 'test/notificationQueue.test.mjs', 'test/notificationSender.test.mjs',
+  'test/replayRecorded.test.mjs', 'test/verifyTeardown.test.mjs', 'test/onboardInsurer.test.mjs',
+  // Skips itself unless TEST_DAML_JSON_API_URL_ORACLE names a second participant.
+  'test/twoParticipants.test.mjs',
 ];
 const GATE = 'test/leakGate.test.mjs';
 

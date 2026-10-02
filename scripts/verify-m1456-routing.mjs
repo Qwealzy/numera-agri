@@ -11,12 +11,13 @@
 
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
 // POST /policies requires the policy document's SHA-256 in lowercase hex
 // (migration 034); the document itself never reaches the platform.
 const DOCUMENT_HASH = crypto.createHash('sha256').update('verify-m1456-routing policy document').digest('hex');
 
-const ENV_PATH = new URL('../node/.env', import.meta.url).pathname.replace(/^\//, '');
+const ENV_PATH = fileURLToPath(new URL('../node/.env', import.meta.url));
 for (const line of fs.readFileSync(ENV_PATH, 'utf8').split('\n')) {
   const m = line.trim().match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
   if (m) process.env[m[1]] = m[2].trim().replace(/^["']/, '').replace(/["']$/, '');
@@ -26,8 +27,16 @@ const BASE = `http://localhost:${process.env.PORT ?? 8080}/api/v1`;
 const KEY = process.argv[2] ?? 'demo-api-key';
 const { pool } = await import('../node/src/db.js');
 const { queryActiveContracts } = await import('../node/src/damlClient.js');
+const { insertWindowedTrigger } = await import('../node/test-support/windowedTrigger.mjs');
 
 const RUN = Date.now().toString(36);
+// Cell ids in the oracle's own format, "metno:<lat>,<lon>" with at most 4 decimals. The
+// first two decimals of the latitude name this script, the first two of the longitude
+// count the cells this run hands out, and the last two of each carry the run.
+const CELL_RUN = String(parseInt(RUN, 36) % 10000).padStart(4, '0');
+let cellCount = 0;
+const nextCell = () =>
+  `metno:0.14${CELL_RUN.slice(0, 2)},0.${String(++cellCount).padStart(2, '0')}${CELL_RUN.slice(2)}`;
 const iso = (d) => new Date(d).toISOString();
 const daysAgo = (n) => iso(Date.now() - n * 86400000);
 const daysAhead = (n) => iso(Date.now() + n * 86400000);
@@ -66,8 +75,12 @@ const createPolicy = async (label, claim) =>
       coverageCode: 'FROST-COVER',
       productCode: 'FROST-STANDARD',
       perilType: 'FROST',
-      cellIds: [`cell-1456-${label}-${RUN}`],
+      cellIds: [nextCell()],
       sumInsured: 100000,
+      // v22: required by the API, with no default. The basis v21
+      // applied, so "25% of the remaining limit" below still holds.
+      metric: 'TEMPERATURE_C',
+      payoutBasis: 'PB_RemainingLimit',
       ...(claim === null ? {} : { mortgageeClaimAmount: claim }),
     }],
   })).policy.id;
@@ -86,25 +99,29 @@ const settleOutbox = async (policyId, type) => {
 
 // The oracle bot writes these on a schedule; the verification supplies one
 // directly rather than waiting for a cron.
+// v22: what the oracle writes is a window -- the stored response, the reading,
+// the trigger_windows row with the event interval, and the outbox row naming
+// it -- and the dispatcher sends no trigger without one, so this writes the
+// same (node/test-support/windowedTrigger.mjs). The interval is an hour that
+// ended a minute ago, inside the policy's cover; each further trigger on a
+// policy an hour earlier, since a policy has one window per start.
+const windowsWritten = new Map();
 const fireTrigger = async (policyId, value) => {
   const { rows } = await pool.query(
     `SELECT c.cell_ids, p.current_version FROM policy_coverages c JOIN policies p ON p.id = c.policy_id
       WHERE c.policy_id = $1 AND c.coverage_code = 'FROST-COVER'`, [policyId]
   );
   const cell = rows[0].cell_ids[0];
-  const reading = (await pool.query(
-    `INSERT INTO oracle_readings (policy_id, coverage_code, cell_id, metric, value, measured_at, source)
-     VALUES ($1,'FROST-COVER',$2,'TEMPERATURE_C',$3,now(),'live-verification') RETURNING id`,
-    [policyId, cell, value]
-  )).rows[0];
-  await pool.query(
-    `INSERT INTO policy_events (policy_no, event_type, expected_version, reading_id, payload)
-     VALUES ($1,'trigger',$2,$3,$4)`,
-    [policyId, rows[0].current_version, reading.id,
-     JSON.stringify({ observedValue: value, metric: 'TEMPERATURE_C', coverageCode: 'FROST-COVER' })]
-  );
+  const earlier = windowsWritten.get(policyId) ?? 0;
+  windowsWritten.set(policyId, earlier + 1);
+  const eventEnd = new Date(Date.now() - 60 * 1000 - earlier * 60 * 60 * 1000);
+  const { eventId } = await insertWindowedTrigger(pool, {
+    policyId, coverageCode: 'FROST-COVER', cellId: cell, value,
+    eventStart: new Date(eventEnd.getTime() - 60 * 60 * 1000), eventEnd,
+    expectedVersion: rows[0].current_version,
+  });
   for (let i = 0; i < 60; i++) {
-    const { rows: ev } = await pool.query('SELECT * FROM policy_events WHERE reading_id = $1', [reading.id]);
+    const { rows: ev } = await pool.query('SELECT * FROM policy_events WHERE id = $1', [eventId]);
     if (ev[0] && (ev[0].status === 'done' || ev[0].status === 'failed')) return ev[0];
     await new Promise((r) => setTimeout(r, 1000));
   }
@@ -126,13 +143,20 @@ const ledger = async (entityName) => (await queryActiveContracts({
   moduleName: 'Insurance.PayoutBridge', entityName, parties: [insurerParty],
 })).map((e) => e.contractEntry.JsActiveContract.createdEvent);
 
+// The package line gives the DAML_PACKAGE_ID loaded above, the package this
+// run is against, beside the name in the source tree's daml/daml.yaml. The
+// heading's vNN stays the version the article shipped in.
+const packageName = fs.readFileSync(new URL('../daml/daml.yaml', import.meta.url), 'utf8').match(/^name:\s*(\S+)/m)?.[1];
+if (!packageName) throw new Error('daml/daml.yaml has no name line');
+const PACKAGE = `\`${packageName}\` (id \`${process.env.DAML_PACKAGE_ID}\`)`;
+
 const out = [];
 const say = (s = '') => { out.push(s); console.log(s); };
 
 say('## 3n. Live verification run (v17 — payout routing to the mortgagee)');
 say('');
 say('Through the real HTTP API against the real participant, package');
-say('`insurance-tokenization-v17`. A -2 reading pays 25% of the remaining');
+say(`${PACKAGE}. A -2 reading pays 25% of the remaining`);
 say('limit, so the first payout on a 100000 coverage is 25000.');
 say('');
 
@@ -251,7 +275,7 @@ say('');
 say('No sınırlı ayni hak reaches this indemnity, so m. 1456 has nothing to');
 say('say about it and the path is the one that has always been there.');
 
-const target = new URL('../docs/m1456-live-run.txt', import.meta.url).pathname.replace(/^\//, '');
+const target = fileURLToPath(new URL('../docs/m1456-live-run.txt', import.meta.url));
 fs.writeFileSync(target, out.join('\n') + '\n');
 console.log(`\nwritten to ${target}`);
 await pool.end();

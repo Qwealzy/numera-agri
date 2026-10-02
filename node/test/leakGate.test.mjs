@@ -39,7 +39,9 @@ test('the tests that write left no row in the test database', async () => {
         `The way back to an empty test database is to drop "${database}" -- the database current_database() ` +
         'returned here, which the guard has already confirmed is the marked test database -- and run ' +
         '`node scripts/setupTestDb.mjs` again from the repo root: it creates the database when it does not ' +
-        'exist, applies sql/schema.sql when it has no tables, and marks it. This test deletes nothing.'
+        'exist, applies sql/schema.sql when it has no tables, and marks it. Then, per the README Setup section, run ' +
+        '`psql ... -v mode=test -d <test db> -f sql/roles.sql` -- setupTestDb.mjs does not apply it, and ' +
+        'without it insurance_app has no table grants. This test deletes nothing.'
     );
   } finally {
     await client.end();

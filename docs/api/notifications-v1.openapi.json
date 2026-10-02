@@ -1,0 +1,599 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Payout notifications and policy reads",
+    "version": "1",
+    "description": "How an insurer learns of a payout: a signed webhook that says a payout exists (push), and two GET endpoints that say what it is (pull). A third GET endpoint returns one of the insurer's own policies and what became of the requests made on it, and a fourth lists those policies, a summary of each.\n\nThe webhook body is a thin envelope: which notification, what kind, which payout, when. Every detail of the payout is read from the GET endpoints with the insurer's own API key.\n\nNo money and no account data travel on either path. The platform moves no money: the insurer settles through its own systems and reports the outcome. No field here holds an account number or any other payment instrument, and none may be added.\n\nThe webhook address is the insurer's own declaration: the insurer states, in the integration agreement, whose address it is.\n\nNUMERIC values (amount, payoutPercentage) are JSON strings, exactly as stored. Parse them as decimals, not as floating point."
+  },
+  "servers": [
+    { "url": "/" }
+  ],
+  "security": [
+    { "ApiKeyAuth": [] }
+  ],
+  "paths": {
+    "/api/v1/payouts": {
+      "get": {
+        "operationId": "listPayouts",
+        "summary": "The caller's payouts, oldest first",
+        "description": "Ordered by (createdAt, payoutId) ascending. A caller that keeps the last nextCursor it was given and passes it as `after` sees every later payout exactly once. Reads only.",
+        "security": [
+          { "ApiKeyAuth": [] }
+        ],
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string", "enum": ["approved", "manual_review", "settled", "closed_unpaid"] }
+          },
+          {
+            "name": "recordKind",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string", "enum": ["payout", "unrouted_remainder", "unrouted_competing_claims"] }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "description": "A nextCursor from an earlier response, unchanged. Opaque: do not build or edit one.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PayoutPage" }
+              }
+            }
+          },
+          "400": {
+            "description": "An unknown status or recordKind, a limit outside its range, or an `after` that is not a cursor this API issued.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "401": {
+            "description": "No x-api-key header, or a key that names no active insurer.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/payouts/{payoutId}": {
+      "get": {
+        "operationId": "getPayout",
+        "summary": "One payout",
+        "description": "The payoutId is the one the webhook envelope carries. Reads only.",
+        "security": [
+          { "ApiKeyAuth": [] }
+        ],
+        "parameters": [
+          {
+            "name": "payoutId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The payout.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PayoutRecord" }
+              }
+            }
+          },
+          "400": {
+            "description": "A payoutId that is not a UUID.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "401": {
+            "description": "No x-api-key header, or a key that names no active insurer.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "404": {
+            "description": "No such payout among the caller's own. A payout that belongs to another insurer gets this same answer.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/policies": {
+      "get": {
+        "operationId": "listPolicies",
+        "summary": "The caller's policies, newest first, a summary of each",
+        "description": "Ordered by the policy's creation, newest first, ties broken by policyId. The first page holds the latest policies; a policy created after it was read is on a fresh first page, never on a later one. Each item is a summary: GET /api/v1/policies/{policyId} returns the rest. lastEvent is the policy's newest outbox event, built as an item of the policy's events there. No party id, customer reference, premium, document hash, cell id or free text is returned. Reads only.",
+        "security": [
+          { "ApiKeyAuth": [] }
+        ],
+        "parameters": [
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "description": "A nextCursor from an earlier response, unchanged. Opaque: do not build or edit one.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PolicyPage" }
+              }
+            }
+          },
+          "400": {
+            "description": "A limit outside its range, or an `after` that is not a cursor this API issued.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "401": {
+            "description": "No x-api-key header, or a key that names no active insurer.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/policies/{policyId}": {
+      "get": {
+        "operationId": "getPolicy",
+        "summary": "One policy, and what became of the requests made on it",
+        "description": "The policy's state, its coverages, and its outbox events newest first -- at most 50; eventsTruncated says there were more. eventId is the id the 202 answer to a POST returned. A renewal's event is listed on the predecessor, the policy the request was made on; trigger, expiry, termination, termination_archive, first_premium_deemed_withdrawal and two_notice_termination rows are written by the platform (oracle/sweeper), not in response to a request. A failed event carries a reason code and a fixed message, never the underlying error text. No party id, no request payload and no free text is returned. Reads only.",
+        "security": [
+          { "ApiKeyAuth": [] }
+        ],
+        "parameters": [
+          {
+            "name": "policyId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The policy.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PolicyRecord" }
+              }
+            }
+          },
+          "400": {
+            "description": "A policyId that is not a UUID.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "401": {
+            "description": "No x-api-key header, or a key that names no active insurer.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "404": {
+            "description": "No such policy among the caller's own. A policy that belongs to another insurer gets this same answer.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "x-webhooks": {
+    "payoutNotification": {
+      "post": {
+        "operationId": "receivePayoutNotification",
+        "summary": "Sent to the address the insurer declared",
+        "description": "Signature: X-Webhook-Signature is `v1=` followed by the lowercase hex HMAC-SHA256, keyed with the shared secret, of the string `${timestamp}.${rawBody}` -- the X-Webhook-Timestamp value, a full stop, and the request body byte for byte as received. Verify over the raw bytes before parsing them, and compare with a constant-time comparison. How old a timestamp may be is the receiver's choice.\n\nDelivery is at least once. Any 2xx answer means received; anything else, or no answer, is tried again later. The retry schedule is configuration and is not part of this contract. The same notification may therefore arrive more than once: X-Webhook-Id is the same on every attempt, and discarding repeats by it is the receiver's job.\n\nThe body says only that a payout exists. Read it with GET /api/v1/payouts/{payoutId}.",
+        "security": [],
+        "parameters": [
+          {
+            "name": "X-Webhook-Id",
+            "in": "header",
+            "required": true,
+            "description": "The notification's id; equal to the body's `id`, and the same on every attempt.",
+            "schema": { "type": "string", "format": "uuid" }
+          },
+          {
+            "name": "X-Webhook-Timestamp",
+            "in": "header",
+            "required": true,
+            "description": "When this attempt was signed, as Unix seconds in decimal. Part of the signed string, exactly as sent.",
+            "schema": { "type": "string", "pattern": "^[0-9]+$" }
+          },
+          {
+            "name": "X-Webhook-Signature",
+            "in": "header",
+            "required": true,
+            "description": "See the description above.",
+            "schema": { "type": "string", "pattern": "^v1=[0-9a-f]{64}$" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/Envelope" }
+            }
+          }
+        },
+        "responses": {
+          "2XX": { "description": "Received." }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "ApiKeyAuth": { "type": "apiKey", "in": "header", "name": "x-api-key" }
+    },
+    "schemas": {
+      "Envelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "type", "payoutId", "createdAt", "apiVersion"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid", "description": "The notification's id." },
+          "type": { "type": "string", "enum": ["payout.approved", "payout.review_required"] },
+          "payoutId": { "type": "string", "format": "uuid" },
+          "createdAt": { "type": "string", "format": "date-time", "description": "When the notification was queued." },
+          "apiVersion": { "type": "integer", "enum": [1] }
+        }
+      },
+      "PayoutRecord": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "payoutId", "policyId", "customerRef", "coverageCode", "productCode", "perilType", "tierLabel",
+          "payoutPercentage", "amount", "currency", "recipientRole", "recordKind", "isFullSettlement", "status",
+          "approvedAt", "createdAt", "settledAt", "resolvedAt", "triggerWindowId", "ledgerContractId",
+          "eventStart", "eventEnd", "evidenceDigest", "closedAt", "resolutionRecordContractId",
+          "notifications"
+        ],
+        "properties": {
+          "payoutId": { "type": "string", "format": "uuid" },
+          "policyId": { "type": "string", "format": "uuid" },
+          "customerRef": {
+            "type": "string",
+            "description": "The insurer's own reference for the policy's policyholder as of this read. If the policyholder has been substituted since the approval, this is the new person's reference."
+          },
+          "coverageCode": { "type": "string" },
+          "productCode": { "type": "string", "nullable": true, "description": "null if the coverage has since been removed from the policy." },
+          "perilType": { "type": "string", "nullable": true, "description": "null if the coverage has since been removed from the policy." },
+          "tierLabel": { "type": "string", "nullable": true },
+          "payoutPercentage": { "type": "string", "description": "Decimal, as a string." },
+          "amount": { "type": "string", "description": "Decimal, as a string." },
+          "currency": { "type": "string" },
+          "recipientRole": {
+            "type": "string",
+            "nullable": true,
+            "enum": ["PDR_Insured", "PDR_Mortgagee", "PDR_Beneficiary", "PDR_EnforcementOffice", null],
+            "description": "null when recordKind is not `payout`: nothing was routed to anyone."
+          },
+          "recordKind": { "type": "string", "enum": ["payout", "unrouted_remainder", "unrouted_competing_claims"] },
+          "isFullSettlement": {
+            "type": "boolean",
+            "description": "true when this trigger left every coverage limit of the policy exhausted and closed it (status becomes `claimed_and_closed`). It is policy-wide, not this payout's own tier, and it says nothing about whether this amount itself was paid in full."
+          },
+          "status": { "type": "string", "enum": ["approved", "manual_review", "settled", "closed_unpaid"] },
+          "approvedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "The approval instant as the ledger recorded it. null on a payout recorded before this value was kept. When recordKind is not `payout` nothing was approved: it is the instant the ledger recorded the review item holding the amount (ManualReviewRequired.flaggedAt)."
+          },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "settledAt": { "type": "string", "format": "date-time", "nullable": true, "description": "The settlement date the insurer reported." },
+          "resolvedAt": { "type": "string", "format": "date-time", "nullable": true },
+          "triggerWindowId": { "type": "string", "format": "uuid", "nullable": true },
+          "ledgerContractId": { "type": "string", "nullable": true, "description": "null when recordKind is not `payout`." },
+          "eventStart": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "The start of the event the payout was approved for, inclusive, as recorded on the ledger. null on a payout recorded before this value was kept."
+          },
+          "eventEnd": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "The end of the event the payout was approved for, exclusive, as recorded on the ledger. It is no later than the end of cover. null on a payout recorded before this value was kept."
+          },
+          "evidenceDigest": {
+            "type": "string",
+            "nullable": true,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "description": "The digest of the stored provider responses the event was evaluated on, as recorded on the ledger. null on a payout recorded before this value was kept."
+          },
+          "closedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "The closing instant the insurer declared when it closed the payout unpaid. null unless status is `closed_unpaid`."
+          },
+          "resolutionRecordContractId": {
+            "type": "string",
+            "nullable": true,
+            "description": "The ledger record the resolution left: a PayoutSettled when status is `settled`, a PayoutClosedUnpaid when it is `closed_unpaid`. null until then, and on a payout resolved before this value was kept."
+          },
+          "notifications": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "type", "status", "deliveredAt"],
+              "properties": {
+                "id": { "type": "string", "format": "uuid", "description": "Equal to the X-Webhook-Id of the webhook it describes." },
+                "type": { "type": "string", "enum": ["payout.approved", "payout.review_required"] },
+                "status": { "type": "string", "enum": ["pending", "processing", "delivered", "failed"] },
+                "deliveredAt": { "type": "string", "format": "date-time", "nullable": true }
+              }
+            }
+          }
+        }
+      },
+      "PolicyRecord": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "policyId", "status", "defaultState", "startDate", "endDate", "termStart", "expiry", "coverageBegun",
+          "coverageBeganAt", "onLedger", "ledgerContractId", "enforcementRoute", "coverages", "events", "eventsTruncated"
+        ],
+        "properties": {
+          "policyId": { "type": "string", "format": "uuid" },
+          "status": {
+            "type": "string",
+            "enum": ["pending_mint", "active", "grace_period", "suspended", "partially_paid", "expired", "cancelled", "claimed_and_closed", "manual_review"]
+          },
+          "defaultState": {
+            "type": "string",
+            "enum": ["none", "grace_period", "suspended", "terminated", "first_premium_unpaid", "withdrawn_for_first_premium", "two_notice_elected", "two_notice_terminated"],
+            "description": "The premium-default axis, moved independently of status."
+          },
+          "startDate": { "type": "string", "format": "date", "description": "The term's first day, as the insurer supplied it." },
+          "endDate": { "type": "string", "format": "date", "description": "The term's last day, as the insurer supplied it. It is the value at creation: an endorsement that moves the end does not change it. The current end is expiry." },
+          "termStart": { "type": "string", "format": "date-time", "nullable": true, "description": "The term's start instant. null until the policy is minted." },
+          "expiry": { "type": "string", "format": "date-time", "nullable": true, "description": "The term's end instant. null until the policy is minted." },
+          "coverageBegun": { "type": "boolean", "description": "Whether cover has begun. Minting does not begin it: cover begins with the first premium payment unless an earlier start was agreed." },
+          "coverageBeganAt": { "type": "string", "format": "date-time", "nullable": true, "description": "The instant cover began. null while it has not." },
+          "onLedger": { "type": "boolean", "description": "Whether the policy has a contract on the ledger now." },
+          "ledgerContractId": {
+            "type": "string",
+            "nullable": true,
+            "description": "The id of the policy's CURRENT contract on the ledger. It changes: every lifecycle event (an endorsement, a first-premium report, a notice, a renewal) archives the contract and creates a new one. null before the policy is minted, and null again once the token is archived without a re-mint (expired, cancelled, claimed_and_closed)."
+          },
+          "enforcementRoute": {
+            "type": "string",
+            "enum": ["ER_Takip", "ER_Dava", null],
+            "nullable": true,
+            "description": "The route of the policy's latest recorded fruitless enforcement of the premium debt (m. 1431(4)), as the insurer reported it: ER_Takip or ER_Dava. A later record replaces it. null until one is recorded."
+          },
+          "coverages": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["coverageCode", "productCode", "perilType", "sumInsured", "remainingLimit", "cellIds"],
+              "properties": {
+                "coverageCode": { "type": "string" },
+                "productCode": { "type": "string" },
+                "perilType": { "type": "string" },
+                "sumInsured": { "type": "string", "description": "Decimal, as a string." },
+                "remainingLimit": { "type": "string", "description": "Decimal, as a string." },
+                "cellIds": { "type": "array", "items": { "type": "string" } }
+              }
+            }
+          },
+          "events": {
+            "type": "array",
+            "description": "Newest first.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["eventId", "eventType", "status", "createdAt", "processedAt", "failure"],
+              "properties": {
+                "eventId": { "type": "string", "format": "uuid", "description": "Equal to the event id the 202 answer to the request returned. A renewal's event is listed on the predecessor, the policy the request was made on; trigger, expiry, termination, termination_archive, first_premium_deemed_withdrawal and two_notice_termination rows are written by the platform (oracle/sweeper), not in response to a request." },
+                "eventType": {
+                  "type": "string",
+                  "enum": [
+                    "activation", "trigger", "settlement", "expiry", "notice", "suspension", "termination", "termination_archive",
+                    "mortgagee_notice", "mortgagee_election", "reinstatement", "endorsement", "renewal", "release",
+                    "premium_due_date", "enforcement_commenced", "first_premium_paid", "first_premium_withdrawal",
+                    "first_premium_deemed_withdrawal", "enforcement_fruitless", "substitution_notice", "substitution",
+                    "mortgagee_info_request", "mortgagee_info_provided", "two_notice_election", "two_notice_termination",
+                    "attachment", "attachment_lifted"
+                  ]
+                },
+                "status": { "type": "string", "enum": ["pending", "processing", "done", "failed"] },
+                "createdAt": { "type": "string", "format": "date-time" },
+                "processedAt": { "type": "string", "format": "date-time", "nullable": true },
+                "failure": {
+                  "type": "object",
+                  "nullable": true,
+                  "additionalProperties": false,
+                  "required": ["code", "message"],
+                  "description": "null unless status is `failed`. internal_or_ledger_error covers every failure not listed; quote the eventId to the platform operator for it.",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "insurer_party_not_allocated", "oracle_party_not_configured", "oracle_party_is_insurer",
+                        "grace_period_not_configured", "grace_period_below_statutory_minimum",
+                        "retroactive_cover_check_refused", "retroactive_cover_check_no_cells", "cover_not_begun",
+                        "mortgagee_continuation_not_configured", "first_premium_withdrawal_window_not_configured",
+                        "internal_or_ledger_error"
+                      ]
+                    },
+                    "message": { "type": "string", "description": "A fixed text for the code. It is not the underlying error." }
+                  }
+                }
+              }
+            }
+          },
+          "eventsTruncated": { "type": "boolean", "description": "true when the policy has more events than the 50 returned." }
+        }
+      },
+      "PayoutPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["items", "nextCursor"],
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/PayoutRecord" } },
+          "nextCursor": { "type": "string", "nullable": true, "description": "null on the last page." }
+        }
+      },
+      "PolicySummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "policyId", "status", "defaultState", "currency", "startDate", "endDate", "coverageBegun", "coverageBeganAt",
+          "coverages", "lastEvent"
+        ],
+        "properties": {
+          "policyId": { "type": "string", "format": "uuid" },
+          "status": {
+            "type": "string",
+            "enum": ["pending_mint", "active", "grace_period", "suspended", "partially_paid", "expired", "cancelled", "claimed_and_closed", "manual_review"]
+          },
+          "defaultState": {
+            "type": "string",
+            "enum": ["none", "grace_period", "suspended", "terminated", "first_premium_unpaid", "withdrawn_for_first_premium", "two_notice_elected", "two_notice_terminated"],
+            "description": "The premium-default axis, moved independently of status."
+          },
+          "currency": { "type": "string", "description": "The policy's currency. Its coverages' amounts are in it." },
+          "startDate": { "type": "string", "format": "date", "description": "The term's first day, as the insurer supplied it." },
+          "endDate": { "type": "string", "format": "date", "description": "The term's last day, as the insurer supplied it. It is the value at creation: an endorsement that moves the end does not change it. The current end is expiry in GET /api/v1/policies/{policyId}." },
+          "coverageBegun": { "type": "boolean", "description": "Whether cover has begun. Minting does not begin it: cover begins with the first premium payment unless an earlier start was agreed." },
+          "coverageBeganAt": { "type": "string", "format": "date-time", "nullable": true, "description": "The instant cover began. null while it has not." },
+          "coverages": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["coverageCode", "productCode", "perilType", "sumInsured", "remainingLimit"],
+              "properties": {
+                "coverageCode": { "type": "string" },
+                "productCode": { "type": "string" },
+                "perilType": { "type": "string" },
+                "sumInsured": { "type": "string", "description": "Decimal, as a string." },
+                "remainingLimit": { "type": "string", "description": "Decimal, as a string." }
+              }
+            }
+          },
+          "lastEvent": {
+            "type": "object",
+            "nullable": true,
+            "additionalProperties": false,
+            "required": ["eventId", "eventType", "status", "createdAt", "processedAt", "failure"],
+            "description": "The policy's newest outbox event, the same object as an item of PolicyRecord.events. null when the policy has none.",
+            "properties": {
+              "eventId": { "type": "string", "format": "uuid", "description": "Equal to the event id the 202 answer to the request returned. A renewal's event is listed on the predecessor, the policy the request was made on; trigger, expiry, termination, termination_archive, first_premium_deemed_withdrawal and two_notice_termination rows are written by the platform (oracle/sweeper), not in response to a request." },
+              "eventType": {
+                "type": "string",
+                "enum": [
+                  "activation", "trigger", "settlement", "expiry", "notice", "suspension", "termination", "termination_archive",
+                  "mortgagee_notice", "mortgagee_election", "reinstatement", "endorsement", "renewal", "release",
+                  "premium_due_date", "enforcement_commenced", "first_premium_paid", "first_premium_withdrawal",
+                  "first_premium_deemed_withdrawal", "enforcement_fruitless", "substitution_notice", "substitution",
+                  "mortgagee_info_request", "mortgagee_info_provided", "two_notice_election", "two_notice_termination",
+                  "attachment", "attachment_lifted"
+                ]
+              },
+              "status": { "type": "string", "enum": ["pending", "processing", "done", "failed"] },
+              "createdAt": { "type": "string", "format": "date-time" },
+              "processedAt": { "type": "string", "format": "date-time", "nullable": true },
+              "failure": {
+                "type": "object",
+                "nullable": true,
+                "additionalProperties": false,
+                "required": ["code", "message"],
+                "description": "null unless status is `failed`. internal_or_ledger_error covers every failure not listed; quote the eventId to the platform operator for it.",
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "enum": [
+                      "insurer_party_not_allocated", "oracle_party_not_configured", "oracle_party_is_insurer",
+                      "grace_period_not_configured", "grace_period_below_statutory_minimum",
+                      "retroactive_cover_check_refused", "retroactive_cover_check_no_cells", "cover_not_begun",
+                      "mortgagee_continuation_not_configured", "first_premium_withdrawal_window_not_configured",
+                      "internal_or_ledger_error"
+                    ]
+                  },
+                  "message": { "type": "string", "description": "A fixed text for the code. It is not the underlying error." }
+                }
+              }
+            }
+          }
+        }
+      },
+      "PolicyPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["items", "nextCursor"],
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/PolicySummary" } },
+          "nextCursor": { "type": "string", "nullable": true, "description": "null on the last page." }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": { "type": "string" }
+        }
+      }
+    }
+  }
+}

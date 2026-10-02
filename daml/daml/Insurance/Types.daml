@@ -1,5 +1,8 @@
 module Insurance.Types where
 
+import DA.Optional (isNone)
+import qualified DA.Text as T
+
 -- One row of the parametric payout matrix (Module 2). Bounds are inclusive;
 -- None means unbounded on that side. Confirm inclusive/exclusive boundary
 -- semantics with underwriting before relying on exact-threshold behavior --
@@ -11,6 +14,28 @@ data PayoutTier = PayoutTier
     minValue  : Optional Decimal
     maxValue  : Optional Decimal
     payoutPct : Decimal
+    -- v22. TS_Step pays payoutPct, as before. TS_Linear interpolates
+    -- between pctAtMin (at minValue) and pctAtMax (at maxValue); both bounds
+    -- and both end percentages are then required, and payoutPct is not used
+    -- in the amount: it must equal the larger end percentage, the highest
+    -- rate the tier can pay (v22).
+    -- A step tier carries no end percentages. Enforced by validTier below,
+    -- through PolicyToken's ensure. Every value comes from the insurer.
+    shape     : TierShape
+    pctAtMin  : Optional Decimal
+    pctAtMax  : Optional Decimal
+  deriving (Eq, Show)
+
+data TierShape
+  = TS_Step
+  | TS_Linear
+  deriving (Eq, Show)
+
+-- v22. What a tier percentage is a percentage OF, per coverage and with
+-- no default. The remaining-limit cap applies under both.
+data PayoutBasis
+  = PB_RemainingLimit
+  | PB_SumInsured
   deriving (Eq, Show)
 
 -- Shared lifecycle vocabulary -- SQL's policy_status enum (sql/schema.sql)
@@ -172,12 +197,6 @@ data MortgageeElection
   | ME_Decline    -- elected not to
   deriving (Eq, Show)
 
-data PayoutStatus
-  = PA_Pending
-  | PA_Confirmed
-  | PA_Failed
-  deriving (Eq, Show)
-
 -- Stage 4: why an approved indemnity legitimately never settles. These are
 -- outcomes, not failures to pay -- a failure to pay is
 -- PayoutApproved_MarkFailed, which produces a review item that is still
@@ -303,6 +322,16 @@ data Coverage = Coverage
     -- identity for one -- the routing decision needs none.
     attachedAt            : Optional Time
     attachmentLiftedAt    : Optional Time
+    -- v22. The metric code the oracle emits, unit inside the code (e.g.
+    -- TEMPERATURE_C). A trigger must name the same one. Not empty.
+    metric                : Text
+    -- v22. See PayoutBasis.
+    payoutBasis           : PayoutBasis
+    -- v22. A salted commitment to the cell id, "sha256:" + 64 lowercase
+    -- hex; the salt stays off-ledger. A trigger must carry the same value.
+    -- Equality shows the oracle evaluated the cell the policy committed to;
+    -- it does not show the oracle read the right data for it.
+    cellCommitment        : Text
   deriving (Eq, Show)
 
 -- Coverage codes are a policy's coverages' permanent identity -- never the
@@ -365,11 +394,51 @@ matchTier tiers observed = find (inRange observed) tiers
 floorTo2dp : Decimal -> Decimal
 floorTo2dp x = intToDecimal (floor (x * 100.0)) / 100.0
 
--- Percentage is always applied to what is currently LEFT (remainingLimit),
--- never the original sumInsured, so a second partial claim after an earlier
--- one can never overpay past the policy's true remaining exposure.
-evaluateAgainstTiers : [PayoutTier] -> Decimal -> Decimal -> TriggerResult
-evaluateAgainstTiers tiers remainingLimit observed =
+-- v22. The structural rules a tier's shape needs. The [0, 100] range of
+-- a linear tier's end percentages is the range of a percentage, not a
+-- product value.
+validTier : PayoutTier -> Bool
+validTier tier = case tier.shape of
+  TS_Step -> isNone tier.pctAtMin && isNone tier.pctAtMax
+  TS_Linear -> case (tier.minValue, tier.maxValue, tier.pctAtMin, tier.pctAtMax) of
+    (Some lo, Some hi, Some pLo, Some pHi) ->
+      lo < hi && inPctRange pLo && inPctRange pHi &&
+      -- v22. On a linear tier payoutPct means "the
+      -- highest rate this tier can pay", so it is held to that value rather
+      -- than left as a number nothing reads.
+      tier.payoutPct == max pLo pHi
+    _ -> False
+  where
+    inPctRange : Decimal -> Bool
+    inPctRange p = p >= 0.0 && p <= 100.0
+
+-- v22. The percentage a matched tier pays for this observed value. A
+-- linear tier interpolates between its end percentages across its bounds
+-- (both inclusive, as inRange); a malformed one, which validTier keeps off
+-- the ledger, pays nothing rather than guessing.
+tierPct : PayoutTier -> Decimal -> Decimal
+tierPct tier observed = case tier.shape of
+  TS_Step -> tier.payoutPct
+  TS_Linear -> case (tier.minValue, tier.maxValue, tier.pctAtMin, tier.pctAtMax) of
+    (Some lo, Some hi, Some pLo, Some pHi) | lo < hi ->
+      pLo + (observed - lo) * (pHi - pLo) / (hi - lo)
+    _ -> 0.0
+
+-- v22. "sha256:" followed by exactly 64 lowercase hex characters.
+isSha256Digest : Text -> Bool
+isSha256Digest t = case T.stripPrefix "sha256:" t of
+  Some h -> T.length h == 64 && all (`elem` hexDigits) (T.explode h)
+  None -> False
+  where
+    hexDigits = T.explode "0123456789abcdef"
+
+-- v22: the percentage is applied to `basis` -- the coverage's remaining
+-- limit or its sum insured, as the coverage's payoutBasis says -- and the
+-- amount is capped at what is currently LEFT (remainingLimit) under either,
+-- so a second partial claim after an earlier one can never overpay past the
+-- policy's true remaining exposure.
+evaluateAgainstTiers : [PayoutTier] -> Decimal -> Decimal -> Decimal -> TriggerResult
+evaluateAgainstTiers tiers basis remainingLimit observed =
   case matchTier tiers observed of
     None ->
       TriggerResult with
@@ -379,12 +448,32 @@ evaluateAgainstTiers tiers remainingLimit observed =
         payoutAmount = 0.0
         isFullSettlement = False
     Some tier ->
-      let rawAmount = remainingLimit * (tier.payoutPct / 100.0)
+      let pct = tierPct tier observed
+          rawAmount = basis * pct / 100.0
           amount = min (floorTo2dp rawAmount) remainingLimit
-          isFull = tier.payoutPct >= 100.0 || amount >= remainingLimit
-      in TriggerResult with
+          isFull = pct >= 100.0 || amount >= remainingLimit
+      -- v22. A linear tier whose computed amount is
+      -- 0.00 -- a 0 end percentage, or a small one that floors to 0.00 -- is
+      -- NO MATCH, the same result as a value outside every tier: nothing is
+      -- created and the token is not touched. Without this it would reach
+      -- PayoutApproved's `amount > 0.0` ensure and fail as a generic
+      -- precondition. What such a
+      -- value means legally is left open; this decides only what the ledger does with it.
+      --
+      -- v22. The same for EVERY tier shape: the
+      -- amount is taken after the remaining-limit cap, so on a coverage whose
+      -- limit is exhausted a step tier gives 0.00 too, and without this every
+      -- matching reading would be a failed trigger.
+      in if amount == 0.0 then
+        TriggerResult with
+          matched = False
+          matchedTierLabel = None
+          payoutPct = 0.0
+          payoutAmount = 0.0
+          isFullSettlement = False
+      else TriggerResult with
         matched = True
         matchedTierLabel = Some tier.label
-        payoutPct = tier.payoutPct
+        payoutPct = pct
         payoutAmount = amount
         isFullSettlement = isFull

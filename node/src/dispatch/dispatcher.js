@@ -1,20 +1,41 @@
 import { pathToFileURL } from 'node:url';
 import { pool, withTransaction } from '../db.js';
 import { config } from '../config.js';
-import { allocateParty, commandIdFor, createContract, exerciseChoice, getLedgerEnd } from '../damlClient.js';
+import {
+  allocateParty,
+  commandIdFor,
+  createContract,
+  exerciseChoice,
+  getLedgerEnd,
+  insurerEndpoint,
+  oracleEndpoint,
+  oracleIsOnItsOwnParticipant,
+  queryActiveContracts,
+} from '../damlClient.js';
 import { enqueuePayoutNotification } from '../notifications/enqueue.js';
+import { saltedDigest } from './ledgerText.js';
+import { evaluateAgainstTiers, basisFor } from './tiers.js';
 
 // ---------------------------------------------------------------------------
 // Every ledger-changing action in this system enters through the
-// `policy_events` outbox and is processed here. No other code path may
-// submit a command to the ledger -- oracleBot.js and payoutListener.js
-// (Stage 2 Part 1) only read the ledger and write outbox rows now. This
-// map is the single place that says which event type does which ledger
-// action -- read top to bottom to see the whole system's write surface:
+// `policy_events` outbox and is processed here. No other code path in the
+// service may submit a command that changes the ledger -- oracleBot.js and
+// payoutListener.js (Stage 2 Part 1) only read the ledger and write outbox
+// rows now. The one command the service sends from elsewhere is the probe
+// POST /debug/roles/try-insurer-trigger (routes/debug.js), mounted only while
+// DEBUG_ROUTES_ENABLED is 'true': it submits a trigger as the insurer that
+// the ledger is expected to refuse, with a value outside every frozen tier,
+// so even an acceptance creates no contract. Operator, demo and measurement
+// scripts under scripts/ (the wire checks and the policy teardown among
+// them) also submit directly; they are not part of the running service. The
+// full list of event types, and the handler that does each one's ledger
+// action, is EVENT_HANDLERS below; this map names only some of them:
 //
 //   activation  -> create PolicyToken                                    [implemented]
 //   trigger     -> PolicyToken_EvaluateTrigger                           [implemented]
-//   settlement  -> PayoutApproved_MarkFailed (every payout, in this stage) [implemented]
+//   settlement  -> one of four, by payload.action (see handleSettlement):
+//                  PayoutApproved_ConfirmSettlement, PayoutApproved_MarkFailed,
+//                  ManualReviewRequired_ResolveSettled or _ResolveUnpaid  [implemented]
 //   expiry      -> PolicyToken_ArchiveForExpiry (archive, no re-mint)      [implemented]
 //   notice        -> PolicyToken_ServeNotice (-> grace period)             [implemented]
 //   termination         -> PolicyToken_Terminate (notice period elapsed ->
@@ -58,21 +79,21 @@ export const EVENT_HANDLERS = {
   // consequence, different vocabulary.
   premium_due_date: handlePremiumDueDate,
   enforcement_commenced: handleEnforcementCommenced,
-  // m. 1431(4). Three types, because they are three distinct acts with three
-  // distinct consequences and none may be inferred from another.
-  // m. 1456(6). The request is the mortgagee's act as reported by the
-  // insurer; the response is the insurer's own. Two types, because they are
-  // two acts and the gap between them is the state worth surfacing.
-  // m. 1434(4). The election is an act the insurer reports; the landing is a
-  // consequence a sweeper observes, exactly like the m. 1434(3) termination.
   // m. 1457. Two acts, both reported -- the platform cannot observe an icra
   // file.
   attachment: handleAttachment,
   attachment_lifted: handleAttachmentLifted,
+  // m. 1434(4). The election is an act the insurer reports; the landing is a
+  // consequence a sweeper observes, exactly like the m. 1434(3) termination.
   two_notice_election: handleTwoNoticeElection,
   two_notice_termination: handleTwoNoticeTermination,
+  // m. 1456(6). The request is the mortgagee's act as reported by the
+  // insurer; the response is the insurer's own. Two types, because they are
+  // two acts and the gap between them is the state worth surfacing.
   mortgagee_info_request: handleMortgageeInfoRequest,
   mortgagee_info_provided: handleMortgageeInfoProvided,
+  // m. 1431(4). Three types, because they are three distinct acts with three
+  // distinct consequences and none may be inferred from another.
   enforcement_fruitless: handleEnforcementFruitless,
   substitution_notice: handleSubstitutionNotice,
   substitution: handleSubstitution,
@@ -141,8 +162,9 @@ const DAML_REASON_TO_SQL = {
 };
 
 // Shared by every handler whose choice archives-and-re-mints and returns
-// the new ContractId directly (ServeNotice/Terminate/Reinstate/the two
-// mortgagee recorders --
+// the new ContractId directly (ServeNotice/Terminate/Reinstate/Amend and
+// the mortgagee, premium-due, enforcement, attachment, two-notice,
+// substitution and first-premium choices --
 // EvaluateTrigger's richer result shape needs its own handling, and
 // ArchiveForExpiry re-mints nothing at all). Pulls the new contract id out
 // of the exercise result and the new version off that same contract's own
@@ -175,8 +197,11 @@ function readReMintResult(responseData, choiceName, event) {
 // Serves every role, not only the policyholder: mortgagee and beneficiary
 // are rows in the same `policyholders` registry, so a bank named on four
 // hundred policies allocates ONE party and reuses it, and a person holding
-// two roles on one policy gets ONE party. That reuse is what keeps this off
-// the participant's 1000-rights ceiling.
+// two roles on one policy gets ONE party. That reuse used to be what kept
+// this off the participant's 1000-rights ceiling, while every allocation
+// also granted CanActAs; since a later change a role party gets no right at all
+// (allocateParty below is called without grantActAs), so the reuse now keeps
+// the party count down and spends no right.
 //
 // The party hint stays `ph-<uuid>` for every role. It is opaque on purpose:
 // party ids are visible to every participant that observes the contract, so
@@ -292,7 +317,7 @@ export function policyTermInstant(dateStr) {
 // default anywhere, never assumed if unset) but it has a FLOOR, and a value
 // below it is rejected rather than silently applied. Ten appears here only
 // as that floor, with the article that sets it.
-const STATUTORY_MIN_GRACE_PERIOD_DAYS = 10;
+export const STATUTORY_MIN_GRACE_PERIOD_DAYS = 10;
 
 function resolveGracePeriodDays(policy) {
   const days = policy.grace_period_days ?? policy.insurer_default_grace_period_days;
@@ -312,6 +337,47 @@ function resolveGracePeriodDays(policy) {
     );
   }
   return days;
+}
+
+// The oracle operator a token is minted with. PolicyToken_EvaluateTrigger is
+// controlled by oracleOperator, not insurer, so a token whose oracle is the
+// insurer itself lets the insurer trigger its own payouts. There is no
+// fallback: an insurer row with no oracle party, or with its own party in
+// that column, refuses the mint -- checked before any ledger call, including
+// party allocation.
+function resolveOracleOperatorParty(policy) {
+  const oracle = policy.oracle_operator_party;
+  if (!oracle) {
+    throw new Error(
+      `no oracle operator party configured for insurer ${policy.insurer_id} (policy ${policy.id}): ` +
+        `insurers.oracle_operator_party is empty -- onboardInsurer.js allocates and sets it; refusing to ` +
+        `mint with the insurer as its own oracle`
+    );
+  }
+  if (oracle === policy.insurer_canton_party_id) {
+    throw new Error(
+      `insurer ${policy.insurer_id} (policy ${policy.id}) has its own Canton party as ` +
+        `insurers.oracle_operator_party -- onboardInsurer.js allocates a distinct oracle party; refusing to ` +
+        `mint a token whose trigger the insurer controls`
+    );
+  }
+  return oracle;
+}
+
+// v22. The commitment a coverage's token carries and every trigger on it
+// repeats: "sha256:" + hex(SHA-256(salt || cell id)), with the salt drawn into
+// policy_coverages when the row was written (migration 036) and never sent.
+// The same function as the free-text digests (ledgerText.js). A coverage
+// names one cell (routes/policies.js); a row naming another number is refused
+// rather than committed to one of its cells.
+function cellCommitmentFor(coverageCode, cellIds, salt) {
+  if (!Array.isArray(cellIds) || cellIds.length !== 1) {
+    throw new Error(
+      `coverage ${coverageCode} names ${Array.isArray(cellIds) ? cellIds.length : 'no'} cells; its cell ` +
+        `commitment is made to exactly one`
+    );
+  }
+  return saltedDigest(salt, cellIds[0]);
 }
 
 // The event window rule (migration 030), frozen onto the policy at activation
@@ -356,18 +422,12 @@ const MORTGAGEE_ELECTIONS = new Set(['ME_Continue', 'ME_Decline']);
 // that, and it is a lawyer's question. This performs a mechanical check of
 // the platform's OWN data and records what that check saw.
 
-// The same predicate the ledger uses -- Types.daml's `inRange` and
-// `matchTier`, mirrored here so the check and the payout agree about what a
-// riziko IS. A reading that matches no tier pays nothing on the trigger path,
-// so it is not an occurrence here either. First matching tier wins; tiers
-// arrive pre-sorted by tier_order, as everywhere else.
-function matchTier(tiers, observed) {
-  return (tiers ?? []).find((t) => {
-    const aboveMin = t.minValue === null || t.minValue === undefined || observed >= Number(t.minValue);
-    const belowMax = t.maxValue === null || t.maxValue === undefined || observed <= Number(t.maxValue);
-    return aboveMin && belowMax;
-  });
-}
+// The same evaluation the ledger makes -- Types.daml's `evaluateAgainstTiers`,
+// step for step, in tiers.js -- so the check and the payout agree about what a
+// riziko IS. A reading the trigger path would pay nothing on (no tier, or an
+// amount of 0.00 after the cap, for every tier shape) is not an occurrence
+// here either. First matching tier wins; tiers arrive pre-sorted by
+// tier_order, as everywhere else.
 
 // Runs at mint, inside the advisory lock, before the ledger call.
 //
@@ -419,24 +479,35 @@ async function checkRetroactiveCover(policy, coverageRows) {
   // Evaluate every reading against the tiers of the coverage(s) whose cells
   // it falls in.
   //
-  // Metric is recorded but NOT filtered on: a coverage declares cells and
-  // tiers but no metric, so there is nothing to filter against. A reading of
-  // another metric whose value happens to fall in a tier's range therefore
-  // refuses the mint. That is the conservative direction, and it is a real
-  // limitation rather than a design choice -- noted here so it is not
-  // mistaken for one.
+  // Since v22 a coverage names its metric, and the ledger evaluates a value
+  // only against tiers written for the same one, so a reading of another
+  // metric is skipped here as it would be refused there. Each READING is
+  // evaluated, not a window's aggregate: that shape predates v22 and is
+  // recorded as a known limitation.
   for (const reading of readings) {
     for (const coverage of coverageRows) {
       if (!(coverage.cell_ids ?? []).includes(reading.cell_id)) continue;
-      const tier = matchTier(coverage.payout_tiers_snapshot, Number(reading.value));
-      if (!tier) continue;
+      if (reading.metric !== coverage.metric) continue;
+      const result = evaluateAgainstTiers(
+        coverage.payout_tiers_snapshot,
+        basisFor(coverage.payout_basis, {
+          sumInsured: String(coverage.sum_insured),
+          remainingLimit: String(coverage.remaining_limit),
+        }),
+        String(coverage.remaining_limit),
+        String(reading.value)
+      );
+      if (!result.matched) continue;
+      // The start of this message is matched as text elsewhere; see the list
+      // above FAILURE_REASONS in notifications/policyRecord.js.
       throw new Error(
         `m. 1458 retroactive-cover check REFUSED the mint for policy ${policy.id}. ` +
           `The platform's own recorded data contains a tier-matching reading inside the requested ` +
           `backdated window: reading ${reading.id} on cell ${reading.cell_id} measured ` +
           `${new Date(reading.measured_at).toISOString()} (metric ${reading.metric}, value ` +
-          `${reading.value}, source ${reading.source}) falls in tier "${tier.label}" of coverage ` +
-          `${coverage.coverage_code}. The window searched was ${coverStart.toISOString()} to ` +
+          `${reading.value}, source ${reading.source}) falls in tier "${result.matchedTierLabel}" of coverage ` +
+          `${coverage.coverage_code}, which the trigger path would pay ${result.payoutAmount} on. ` +
+          `The window searched was ${coverStart.toISOString()} to ` +
           `${contractMadeAt.toISOString()} -- cover start to contract formation. ` +
           `THIS IS THE PLATFORM'S OWN RULE, not a legal conclusion: it does NOT assert that the ` +
           `contract is void, that the sigortacı, sigorta ettiren or sigortalı knew anything, or ` +
@@ -494,6 +565,7 @@ async function handleActivation(event, policy) {
   // minting a token that no later notice could ever compute a deadline
   // for.
   const gracePeriodDays = resolveGracePeriodDays(policy);
+  const oracleOperatorParty = resolveOracleOperatorParty(policy);
 
   const partyId = await ensurePolicyholderParty(policy.policyholder_id);
   const termStartInstant = policyTermInstant(pgDateToDateString(policy.start_date));
@@ -547,6 +619,11 @@ async function handleActivation(event, policy) {
     // new contract with its own coverage rows -- has neither set.
     attachedAt: c.attached_at ? new Date(c.attached_at).toISOString() : null,
     attachmentLiftedAt: c.attachment_lifted_at ? new Date(c.attachment_lifted_at).toISOString() : null,
+    // v22: the coverage's terms as its row holds them; no
+    // default for any of the three.
+    metric: c.metric,
+    payoutBasis: c.payout_basis,
+    cellCommitment: cellCommitmentFor(c.coverage_code, c.cell_ids, c.cell_commitment_salt),
   }));
 
   const { contractId, commandId } = await createContract({
@@ -582,7 +659,7 @@ async function handleActivation(event, policy) {
       // to distinguish that from "described but not named".
       beneficiaryDescriptorHash: policy.beneficiary_descriptor_hash ?? null,
       mortgagee: mortgageeParty,
-      oracleOperator: policy.oracle_operator_party ?? policy.insurer_canton_party_id,
+      oracleOperator: oracleOperatorParty,
       coverages,
       // Stage 4: the term START, added so a refund under m. 1419 has the
       // facts it needs on-ledger. Same noon-Europe/Istanbul conversion as
@@ -640,6 +717,7 @@ async function handleActivation(event, policy) {
       await txClient.query(
         `UPDATE policies SET status = 'active', current_version = 1, daml_contract_id = $1,
            expiry = $2, term_start = $5, grace_period_days = $3,
+           mortgagee_continuation_days = $12, first_premium_withdrawal_days = $13,
            retroactive_cover_checked_at = $6, retroactive_cover_check_status = $7,
            retroactive_cover_check_result = $8,
            event_window_timezone = $9, event_window_start_hour = $10, event_aggregation = $11
@@ -656,6 +734,8 @@ async function handleActivation(event, policy) {
           frozenEventWindow(policy).timezone,
           frozenEventWindow(policy).startHour,
           frozenEventWindow(policy).aggregation,
+          policy.insurer_mortgagee_continuation_days,
+          policy.insurer_first_premium_withdrawal_days,
         ]
       );
       await txClient.query(
@@ -672,8 +752,9 @@ async function handleActivation(event, policy) {
 // oracleBot.js no longer exercises anything itself (Stage 2 Part 1) -- it
 // only fetches a reading, writes it to oracle_readings, and inserts this
 // row; observedValue/metric/coverageCode travel in `payload`, keyed for
-// idempotency on `reading_id` (see migration 006 for why expected_version
-// can't serve that role for this event type). No version-conflict
+// idempotency on `trigger_window_id` since migration 030 (`reading_id`, the
+// key before it, is left over and no longer written; see migration 006 for
+// why expected_version can't serve that role for this event type). No version-conflict
 // precondition here by design: two different readings against the same
 // policy version are both meant to fire, in sequence, each against
 // whatever the ledger currently holds -- the contract id comes from
@@ -681,6 +762,157 @@ async function handleActivation(event, policy) {
 // processEvent below, same as every other event type. Which coverage is
 // named is the choice's own job to validate (assertMsg "unknown coverage"
 // in PolicyToken.daml) -- not duplicated here.
+// ---------------------------------------------------------------------------
+// THE ONE LEDGER SUBMISSION IN THIS SYSTEM THAT IS EVER RETRIED, and the
+// narrowest exception that could be written to the rule stated in processEvent
+// below ("It is never auto-retried: retrying a successful create/exercise
+// risks doing it twice").
+//
+// WHY THERE IS A RACE AT ALL. When the oracle operator is hosted on a
+// participant of its own (DAML_JSON_API_URL_ORACLE), the token is minted on
+// the INSURER's participant and the trigger is submitted on the ORACLE's. The
+// oracle's participant has to have seen the freshly created contract before it
+// can be asked to exercise a choice on it, and
+// a two-participant check kept outside this repository measured that this is a race, not
+// a latency a fixed sleep clears: over five runs the same window both failed
+// (404 CONTRACT_NOT_FOUND at +473ms after the mint, accepted at +1122ms) and
+// succeeded first try (+455, +482, +926 and +1046ms).
+//
+// WHY RE-SUBMITTING IS SAFE. Three independent reasons, none of them assumed:
+//   1. A command refused with CONTRACT_NOT_FOUND was NOT committed to the
+//      ledger. The participant rejected it before any effect, so there is no
+//      half-applied exercise that a second attempt could do twice.
+//   2. Every attempt carries the SAME command id -- commandIdFor('exercise',
+//      event.id), seeded with the outbox row id -- so the participant's own
+//      deduplication sees one command and not several. That is precisely the
+//      retry damlClient.js's commandIdFor comment now names; the seeding is
+//      what made it a meaningful thing to build.
+//   3. PolicyToken_EvaluateTrigger is nonconsuming, and a trigger matching no
+//      tier creates nothing at all.
+//
+// WHEN IT RUNS. All four conditions, or the error is rethrown and the outbox
+// row fails exactly as it does today:
+//   - the event is a `trigger` -- this is only called from handleTrigger;
+//   - the two participants really are different. In the single-participant
+//     configuration this path never runs, and a CONTRACT_NOT_FOUND there is a
+//     token that is genuinely gone (archived, superseded), which has to fail
+//     loudly and immediately;
+//   - the ledger's answer is CONTRACT_NOT_FOUND and nothing else;
+//   - the policy's contract id in SQL, re-read between attempts, is still the
+//     one that was submitted. A different id means the submitted one is stale
+//     -- something else moved the policy on -- and a stale id keeps today's
+//     behaviour: fail.
+//
+// The evidence row is NOT written here. handleTrigger writes it before the
+// first call and attested_evidence is append-only with
+// (policy_event_id, raw_response_id) as its primary key, so every attempt of
+// one outbox row shares the single row written before any of them.
+//
+// Exported so a test can drive it with an injected submission and an injected
+// clock, without a ledger and without a database.
+export async function exerciseTriggerWithVisibilityRetry({
+  submit,
+  submittedContractId,
+  currentContractId,
+  schedule,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+}) {
+  let attempts = 0;
+  for (;;) {
+    attempts += 1;
+    try {
+      return await submit();
+    } catch (err) {
+      const isVisibilityRace =
+        err.response?.data?.code === 'CONTRACT_NOT_FOUND' &&
+        oracleIsOnItsOwnParticipant() &&
+        (await currentContractId()) === submittedContractId;
+      if (!isVisibilityRace) throw err;
+      if (attempts > schedule.length) {
+        err.message =
+          `${err.message} -- the oracle's participant still did not have contract ${submittedContractId} ` +
+          `after ${attempts} attempts over ${schedule.reduce((a, b) => a + b, 0)}ms ` +
+          `(ORACLE_TRIGGER_RETRY_SCHEDULE_MS)`;
+        throw err;
+      }
+      console.warn(
+        `[dispatcher] trigger attempt ${attempts} refused CONTRACT_NOT_FOUND by the oracle's participant, ` +
+          `and the contract id in SQL is unchanged -- retrying in ${schedule[attempts - 1]}ms`
+      );
+      await sleep(schedule[attempts - 1]);
+    }
+  }
+}
+
+// The one other refusal the same submission is re-sent after: the ledger
+// refused the trigger ONLY because the event has not ended yet on the ledger's
+// clock (PolicyToken_EvaluateTrigger asserts eventEnd <= getTime). The oracle
+// queues a window once it has closed on its own process's clock
+// (eventWindow.js, isClosed); the choice judges the same eventEnd against the
+// transaction's ledger time, which is not that clock. A window that has just
+// closed here can be refused there for as long as the two differ, and a
+// window has one trigger row (idx_policy_events_trigger_window_key), so a row
+// failed for this reason is not queued again.
+//
+// Re-submitting is safe for the three reasons stated above the visibility
+// retry, with this refusal in place of CONTRACT_NOT_FOUND in the first: a
+// command the choice's own assertion refused was not committed, every attempt
+// carries the same command id, and the choice is nonconsuming. The evidence
+// rows are shared the same way: handleTrigger writes them once, before the
+// first attempt of either retry.
+//
+// WHEN IT RUNS. All three conditions, or the error is rethrown and the outbox
+// row fails exactly as it does today:
+//   - the ledger's answer is DAML_FAILURE and its cause carries that
+//     assertion's own sentence -- no other refusal;
+//   - the policy's contract id in SQL, re-read between attempts, is still the
+//     one that was submitted;
+//   - the schedule (ORACLE_TRIGGER_UNENDED_RETRY_SCHEDULE_MS) has not run out.
+// Unlike the visibility retry it does not need a second participant: one
+// participant's ledger time can differ from this process's clock as well.
+//
+// handleTrigger passes it to the visibility retry as that retry's submission,
+// so a token that is not visible yet is waited for there, and an event that
+// has not ended on the ledger's clock here.
+//
+// Exported so a test can drive it with an injected submission and an injected
+// clock, without a ledger and without a database.
+const EVENT_NOT_ENDED_REFUSAL = "the event has not ended yet -- eventEnd is after this transaction's ledger time";
+
+export async function exerciseTriggerWithUnendedRetry({
+  submit,
+  submittedContractId,
+  currentContractId,
+  schedule,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+}) {
+  let attempts = 0;
+  for (;;) {
+    attempts += 1;
+    try {
+      return await submit();
+    } catch (err) {
+      const isUnended =
+        err.response?.data?.code === 'DAML_FAILURE' &&
+        String(err.response?.data?.cause ?? '').includes(EVENT_NOT_ENDED_REFUSAL) &&
+        (await currentContractId()) === submittedContractId;
+      if (!isUnended) throw err;
+      if (attempts > schedule.length) {
+        err.message =
+          `${err.message} -- the ledger still judged the event unfinished on its clock ` +
+          `after ${attempts} attempts over ${schedule.reduce((a, b) => a + b, 0)}ms ` +
+          `(ORACLE_TRIGGER_UNENDED_RETRY_SCHEDULE_MS)`;
+        throw err;
+      }
+      console.warn(
+        `[dispatcher] trigger attempt ${attempts} refused by the ledger: the event has not ended yet on its clock, ` +
+          `and the contract id in SQL is unchanged -- retrying in ${schedule[attempts - 1]}ms`
+      );
+      await sleep(schedule[attempts - 1]);
+    }
+  }
+}
+
 async function handleTrigger(event, policy) {
   if (!policy.daml_contract_id) {
     throw new Error(`policy ${policy.id} has no active token to evaluate a trigger against`);
@@ -695,16 +927,32 @@ async function handleTrigger(event, policy) {
   // source, so the attestation on the ledger and the one in SQL are the same
   // string -- and refuses to evaluate if the row carries none: a payout the
   // ledger cannot tie back to its evidence is exactly what this exists to
-  // prevent. The direct-SQL trigger rows tests and verify scripts write carry
-  // no window, and keep their reading id for both.
+  // prevent.
+  //
+  // v22. The window is also where the event interval, the cell and
+  // the evidence digest come from, and the ledger accepts no trigger
+  // without all three -- so a row with no window, which is what tests and
+  // verify scripts wrote directly before v22, is refused here and nothing is
+  // sent.
+  if (!event.trigger_window_id) {
+    throw new Error(
+      `trigger event ${event.id} names no trigger window -- since v22 a trigger sends its window's event ` +
+        `interval, cell commitment and evidence digest, and a row without a window has none of them; ` +
+        `nothing was sent`
+    );
+  }
   let attestationRef = event.reading_id;
   let causingReadingId = event.reading_id;
   // Computed once: the evidence rows below record it, and the exercise is
   // submitted under it.
   const exerciseCommandId = commandIdFor('exercise', event.id);
+  let eventInterval;
+  let evidenceDigest;
+  let cellCommitment;
   if (event.trigger_window_id) {
     const { rows: windowRows } = await pool.query(
-      `SELECT attestation_ref, determining_reading_id FROM trigger_windows WHERE id = $1`,
+      `SELECT attestation_ref, determining_reading_id, cell_id, event_start, event_end
+         FROM trigger_windows WHERE id = $1`,
       [event.trigger_window_id]
     );
     if (!windowRows[0]?.attestation_ref) {
@@ -717,6 +965,49 @@ async function handleTrigger(event, policy) {
     // null for a mean, which has no single deciding reading; the window id
     // below is what names every reading of it.
     causingReadingId = windowRows[0].determining_reading_id;
+
+    // v22. The interval fixed when the window was queued (oracleBot.js),
+    // sent as it is: the bound is never recomputed here.
+    const { event_start: eventStart, event_end: eventEnd } = windowRows[0];
+    if (!eventStart || !eventEnd) {
+      throw new Error(
+        `trigger event ${event.id}: window ${event.trigger_window_id} records no event interval -- it was ` +
+          `queued before v22, and the interval is fixed when a window is queued, not derived later; ` +
+          `nothing was sent`
+      );
+    }
+    eventInterval = { eventStart: new Date(eventStart).toISOString(), eventEnd: new Date(eventEnd).toISOString() };
+
+    // v22: the digest IS the attestation's own
+    // evidence.sha256 -- the deciding response's hash for min and max, the
+    // hash over the sorted per-response hashes for a mean -- so the
+    // attestation and the payout cannot disagree. Evidence recorded as
+    // absent has no digest, and the ledger accepts no trigger without one.
+    const attestedEvidence = JSON.parse(attestationRef).evidence;
+    if (attestedEvidence === 'absent') {
+      throw new Error(
+        `trigger event ${event.id}: window ${event.trigger_window_id} records its evidence as absent -- at ` +
+          `least one of its readings has no stored provider response, so there is no evidence digest to ` +
+          `send, and the ledger takes no trigger without one. Nothing was sent. This says what the platform ` +
+          `holds; it is not a finding about whether the riziko occurred`
+      );
+    }
+    evidenceDigest = `sha256:${attestedEvidence.sha256}`;
+
+    // v22. The window's own cell, committed with the coverage's salt:
+    // equal to the token's commitment exactly when it is the cell the
+    // coverage was minted for.
+    const { rows: coverageRows } = await pool.query(
+      `SELECT cell_commitment_salt FROM policy_coverages WHERE policy_id = $1 AND coverage_code = $2`,
+      [policy.id, coverageCode]
+    );
+    if (!coverageRows[0]) {
+      throw new Error(
+        `trigger event ${event.id}: policy ${policy.id} has no coverage ${coverageCode} in SQL, so there is ` +
+          `no salt to commit the window's cell with; nothing was sent`
+      );
+    }
+    cellCommitment = saltedDigest(coverageRows[0].cell_commitment_salt, windowRows[0].cell_id);
 
     // The bytes behind the hash are held before the ledger sees it (migration
     // 032), in a statement of their own that commits here: a call that fails,
@@ -753,18 +1044,23 @@ async function handleTrigger(event, policy) {
     }
   }
 
-  // One value, used twice: the choice stamps it onto PayoutApproved.approvedAt
-  // and the write-back mirrors it into payout_events.approved_at. Reading the
-  // clock a second time for the SQL row would put a different instant in SQL
-  // than the one on the ledger, and m. 1427 runs maturity from the approval.
-  const approvedAt = new Date().toISOString();
+  // v22. No approval instant is sent: the choice stamps
+  // PayoutApproved.approvedAt with the transaction's ledger time, and the
+  // write-back below reads it back off the created contract, so SQL holds the
+  // instant the ledger holds -- m. 1427 runs maturity from the approval.
 
-  const responseData = await exerciseChoice({
+  const submitTrigger = () => exerciseChoice({
     commandId: exerciseCommandId,
     moduleName: 'Insurance.PolicyToken',
     entityName: 'PolicyToken',
     contractId: policy.daml_contract_id,
     choice: 'PolicyToken_EvaluateTrigger',
+    // The ONE submission in this system made as an oracle party, and so the
+    // one that goes to the oracle's participant. Every other actAs in this
+    // file is the insurer's and stays on the insurer's participant; with
+    // DAML_JSON_API_URL_ORACLE unset the two are the same participant and
+    // nothing about this call changes.
+    endpoint: oracleEndpoint(),
     actAs: [policy.oracle_operator_party],
     argument: {
       // Supplied because `show self` renders a redacted placeholder on this
@@ -776,8 +1072,32 @@ async function handleTrigger(event, policy) {
       metric,
       attestationRef,
       currency: policy.currency,
-      now: approvedAt,
+      // v22. An eventEnd after the ledger's own time is refused
+      // there ("the event has not ended yet"); that refusal is retried on its
+      // own schedule (exerciseTriggerWithUnendedRetry) and fails this row
+      // once the schedule runs out, like any other refusal.
+      eventStart: eventInterval.eventStart,
+      eventEnd: eventInterval.eventEnd,
+      cellCommitment,
+      evidenceDigest,
     },
+  });
+  // Re-read, never captured: the whole point of the check is to notice that
+  // something else moved the policy on while this was being retried.
+  const currentContractId = async () =>
+    (await pool.query('SELECT daml_contract_id FROM policies WHERE id = $1', [policy.id])).rows[0]
+      ?.daml_contract_id ?? null;
+  const responseData = await exerciseTriggerWithVisibilityRetry({
+    submit: () =>
+      exerciseTriggerWithUnendedRetry({
+        submit: submitTrigger,
+        submittedContractId: policy.daml_contract_id,
+        schedule: config.oracleTrigger.unendedRetryScheduleMs,
+        currentContractId,
+      }),
+    submittedContractId: policy.daml_contract_id,
+    schedule: config.oracleTrigger.retryScheduleMs,
+    currentContractId,
   });
 
   const commandId = responseData?.transaction?.commandId;
@@ -824,6 +1144,20 @@ async function handleTrigger(event, policy) {
       )?.CreatedEvent?.createArgument
     : null;
   const newVersion = newTokenPayload ? Number(newTokenPayload.version) : null;
+
+  // v22. The ledger time the choice stamped, read off the contract it
+  // created: approvedAt on a PayoutApproved, flaggedAt on the review item an
+  // unrouted amount raises -- the same `now` inside one exercise. Kept as the
+  // ledger's own string, so SQL is given the instant at the precision the
+  // ledger holds it. Read in the write-back, so a missing value fails the row
+  // with the ledger's command id beside it rather than before it.
+  const ledgerInstant = (cid, field) => {
+    const value = events.find((e) => e.CreatedEvent?.contractId === cid)?.CreatedEvent?.createArgument?.[field];
+    if (!value) {
+      throw new Error(`trigger event ${event.id}: contract ${cid} created by the trigger carries no ${field}`);
+    }
+    return value;
+  };
 
   // Whether the POLICY closed is `!newPolicyCid` -- Daml's own
   // `allExhausted` decision (every coverage exhausted, not just this one)
@@ -892,15 +1226,17 @@ async function handleTrigger(event, policy) {
           `INSERT INTO payout_events
              (policy_id, coverage_code, tier_label, payout_percentage, payout_amount, currency,
               is_full_settlement, status, daml_contract_id, recipient, record_kind,
-              oracle_reading_id, trigger_window_id, approved_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,'approved',$8,$9,'payout',$10,$11,$12)
+              oracle_reading_id, trigger_window_id, approved_at, event_start, event_end, evidence_digest)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,'approved',$8,$9,'payout',$10,$11,$12,$13,$14,$15)
            ON CONFLICT (daml_contract_id) DO NOTHING
            RETURNING id`,
           [
             policy.id,
             coverageCode,
             result.trigger.matchedTierLabel,
-            Number(result.trigger.payoutPct),
+            // The ledger's Decimal as text, never through a float: on a linear
+            // tier it is an interpolated rate, held exactly (migration 036).
+            result.trigger.payoutPct,
             Number(leg.amount),
             policy.currency,
             policyClosed,
@@ -908,7 +1244,10 @@ async function handleTrigger(event, policy) {
             leg.recipient,
             causingReadingId,
             event.trigger_window_id ?? null,
-            approvedAt,
+            ledgerInstant(leg.cid, 'approvedAt'),
+            eventInterval.eventStart,
+            eventInterval.eventEnd,
+            evidenceDigest,
           ]
         );
         // Only when the INSERT actually added the row. ON CONFLICT means the
@@ -937,14 +1276,15 @@ async function handleTrigger(event, policy) {
           `INSERT INTO payout_events
              (policy_id, coverage_code, tier_label, payout_percentage, payout_amount, currency,
               is_full_settlement, status, daml_contract_id, recipient, record_kind,
-              review_contract_id, oracle_reading_id, trigger_window_id, approved_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,'manual_review',NULL,NULL,$9,$8,$10,$11,$12)
+              review_contract_id, oracle_reading_id, trigger_window_id, approved_at,
+              event_start, event_end, evidence_digest)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,'manual_review',NULL,NULL,$9,$8,$10,$11,$12,$13,$14,$15)
            RETURNING id`,
           [
             policy.id,
             coverageCode,
             result.trigger.matchedTierLabel,
-            Number(result.trigger.payoutPct),
+            result.trigger.payoutPct,
             Number(remainder.amount),
             policy.currency,
             policyClosed,
@@ -954,7 +1294,10 @@ async function handleTrigger(event, policy) {
               : 'unrouted_remainder',
             causingReadingId,
             event.trigger_window_id ?? null,
-            approvedAt,
+            ledgerInstant(remainder.reviewCid, 'flaggedAt'),
+            eventInterval.eventStart,
+            eventInterval.eventEnd,
+            evidenceDigest,
           ]
         );
         // Both remainder kinds are one notification kind: what the insurer is
@@ -1067,9 +1410,40 @@ async function refuseIfCoverageAttached(event, payout, paidRole) {
   );
 }
 
+// settledAt and closedAt, bounded as routes/policies.js bounds them: not
+// after this dispatcher's clock, with no margin, and not before
+// payout_events.approved_at -- the PayoutApproved's approvedAt on a payout,
+// the review item's flaggedAt on an unrouted amount, and on an item
+// MarkFailed raised the approval of the payout it came from, since that
+// item's own flaggedAt is not held in SQL. Checked here as well because a
+// settlement row can be queued by a path other than the route. A payout with
+// no approved_at cannot be checked, and the row fails rather than reaching
+// the ledger unchecked.
+function refuseReportedInstant(event, payout, field, instant) {
+  if (instant.getTime() > Date.now()) {
+    throw new Error(
+      `settlement event ${event.id}: ${field} ${instant.toISOString()} is in the future -- it reports ` +
+        `something that has not happened yet`
+    );
+  }
+  if (!payout.approved_at) {
+    throw new Error(
+      `settlement event ${event.id}: payout ${payout.id} has no approved_at, so its ${field} cannot be ` +
+        `checked against the instant the ledger recorded for it -- refused rather than recorded unchecked`
+    );
+  }
+  if (instant.getTime() < new Date(payout.approved_at).getTime()) {
+    throw new Error(
+      `settlement event ${event.id}: ${field} ${instant.toISOString()} is before payout ${payout.id}'s ` +
+        `approved_at ${new Date(payout.approved_at).toISOString()} -- it cannot precede the instant the ` +
+        `ledger recorded for it`
+    );
+  }
+}
+
 async function handleSettlement(event, policy) {
   const contractId = event.source_contract_id;
-  const { action, bankReference, settledAt, paidRole, failureReason, unpaidReason, note } =
+  const { action, bankReference, settledAt, paidRole, failureReason, unpaidReason, note, textSalt, closedAt } =
     event.payload ?? {};
 
   if (!SETTLEMENT_ACTIONS.has(action)) {
@@ -1113,6 +1487,7 @@ async function handleSettlement(event, policy) {
     if (Number.isNaN(settledAtInstant.getTime())) {
       throw new Error(`settlement event ${event.id} has an unparseable settledAt: ${settledAt}`);
     }
+    refuseReportedInstant(event, payout, 'settledAt', settledAtInstant);
     if (!PAID_ROLES.has(paidRole)) {
       throw new Error(
         `settlement event ${event.id}: paidRole must be one of ${[...PAID_ROLES].join(', ')}, got '${paidRole}'`
@@ -1160,6 +1535,14 @@ async function handleSettlement(event, policy) {
   let responseData;
   let newStatus;
   let reviewContractId = null;
+  // v22. The PayoutSettled or PayoutClosedUnpaid a resolving choice
+  // leaves on the ledger, as its return value; and the insurer's declared
+  // closing instant on a close-unpaid.
+  let recordContractId = null;
+  let closedAtInstant = null;
+  const exerciseResultOf = (choiceName) =>
+    (responseData?.transaction?.events ?? []).find((e) => e.ExercisedEvent?.choice === choiceName)
+      ?.ExercisedEvent?.exerciseResult;
 
   if (action === 'settle') {
     responseData = await exerciseChoice({
@@ -1169,8 +1552,9 @@ async function handleSettlement(event, policy) {
       contractId,
       choice: 'PayoutApproved_ConfirmSettlement',
       actAs,
-      argument: { bankReference, settledAt: settledAtInstant.toISOString(), paidRole },
+      argument: { bankReference: saltedDigest(textSalt, bankReference), settledAt: settledAtInstant.toISOString(), paidRole },
     });
+    recordContractId = exerciseResultOf('PayoutApproved_ConfirmSettlement');
     newStatus = 'settled';
   } else if (action === 'fail') {
     if (!failureReason) {
@@ -1188,9 +1572,9 @@ async function handleSettlement(event, policy) {
       actAs,
       // The contract id is supplied rather than derived: `show self` inside
       // the choice renders "<contract-id>" on this participant, not an id.
+      // v22: no `now` -- the review item's flaggedAt is the ledger time.
       argument: {
-        failureReason,
-        now: new Date().toISOString(),
+        failureReason: saltedDigest(textSalt, failureReason),
         sourcePayoutContractId: contractId,
       },
     });
@@ -1211,8 +1595,9 @@ async function handleSettlement(event, policy) {
       contractId,
       choice: 'ManualReviewRequired_ResolveSettled',
       actAs,
-      argument: { bankReference, settledAt: settledAtInstant.toISOString(), paidRole },
+      argument: { bankReference: saltedDigest(textSalt, bankReference), settledAt: settledAtInstant.toISOString(), paidRole },
     });
+    recordContractId = exerciseResultOf('ManualReviewRequired_ResolveSettled');
     newStatus = 'settled';
   } else {
     if (!UNPAID_REASONS.has(unpaidReason)) {
@@ -1227,6 +1612,19 @@ async function handleSettlement(event, policy) {
           `enum alone cannot carry the circumstances`
       );
     }
+    // v22. The insurer's declared closing instant, like settledAt: its
+    // reported fact, never a clock reading here.
+    if (!closedAt) {
+      throw new Error(
+        `settlement event ${event.id}: closedAt is required when closing a review item unpaid -- the ` +
+          `closing instant is the insurer's declared fact and is never taken from a system clock`
+      );
+    }
+    closedAtInstant = new Date(closedAt);
+    if (Number.isNaN(closedAtInstant.getTime())) {
+      throw new Error(`settlement event ${event.id} has an unparseable closedAt: ${closedAt}`);
+    }
+    refuseReportedInstant(event, payout, 'closedAt', closedAtInstant);
     responseData = await exerciseChoice({
       commandSeed: event.id,
       moduleName: 'Insurance.PayoutBridge',
@@ -1234,21 +1632,25 @@ async function handleSettlement(event, policy) {
       contractId,
       choice: 'ManualReviewRequired_ResolveUnpaid',
       actAs,
-      argument: { unpaidReason, note },
+      argument: { unpaidReason, note: saltedDigest(textSalt, note), closedAt: closedAtInstant.toISOString() },
     });
+    recordContractId = exerciseResultOf('ManualReviewRequired_ResolveUnpaid');
     newStatus = 'closed_unpaid';
   }
 
   // 'fail' supersedes rather than resolves: the payout is not finished, it
   // has moved to a review item that still has to end somewhere. Only the
-  // three terminal actions stamp resolved_at, which is what the dashboards
-  // and the unresolved index key off.
+  // three terminal actions stamp resolved_at, which is what the debug dashboard,
+  // the story page and the unresolved index key off.
   const resolvesNow = action !== 'fail';
 
   return {
     contractId: reviewContractId ?? contractId,
     commandId: responseData?.transaction?.commandId,
     writeBack: async (txClient) => {
+      if (resolvesNow && !recordContractId) {
+        throw new Error(`settlement event ${event.id}: the ${action} choice returned no record contract id`);
+      }
       await txClient.query(
         `UPDATE payout_events SET
            status = $1,
@@ -1261,7 +1663,11 @@ async function handleSettlement(event, policy) {
            -- PayoutApproved that started the chain, and the review item that
            -- replaced it lands here rather than overwriting it.
            review_contract_id = COALESCE($7, review_contract_id),
-           resolved_at     = CASE WHEN $8::boolean THEN now() ELSE resolved_at END
+           resolved_at     = CASE WHEN $8::boolean THEN now() ELSE resolved_at END,
+           -- v22: the record the resolution left on the ledger, and the
+           -- insurer's declared closing instant on a close-unpaid.
+           resolution_record_contract_id = COALESCE($10, resolution_record_contract_id),
+           closed_at       = COALESCE($11, closed_at)
          WHERE id = $9`,
         [
           newStatus,
@@ -1273,12 +1679,30 @@ async function handleSettlement(event, policy) {
           reviewContractId,
           resolvesNow,
           payout.id,
+          recordContractId,
+          closedAtInstant ? closedAtInstant.toISOString() : null,
         ]
       );
     },
   };
 }
 
+
+// v22. What an archive of the token returns: when the CONTRACT ended
+// (the token's expiry, or its frozen termination instant) and when the token
+// was archived (ledger time), kept apart. Returned as a function the
+// write-back calls, so a result without them fails the row there, with the
+// ledger's command id beside it, rather than writing two NULLs.
+function archiveInstantsOf(responseData, choiceName) {
+  const result = (responseData?.transaction?.events ?? []).find((e) => e.ExercisedEvent?.choice === choiceName)
+    ?.ExercisedEvent?.exerciseResult;
+  return () => {
+    if (!result?.contractEndedAt || !result?.recordClosedAt) {
+      throw new Error(`${choiceName} returned no ArchiveInstants (contractEndedAt, recordClosedAt)`);
+    }
+    return result;
+  };
+}
 
 // Exercises PolicyToken_ArchiveForExpiry for one 'expiry' outbox row.
 // expirySweeper.js only ever inserts this row for a policy it already
@@ -1303,19 +1727,25 @@ async function handleExpiry(event, policy) {
     contractId: policy.daml_contract_id,
     choice: 'PolicyToken_ArchiveForExpiry',
     actAs: [policy.insurer_canton_party_id],
+    // v22: no archivedAt. The ledger refuses the archive while its own
+    // time is before `expiry` -- with no allowance for clock difference -- and
+    // that refusal fails this row like any other.
     argument: {
-      archivedAt: new Date().toISOString(),
       reason: 'policy term expired',
     },
   });
+  const instants = archiveInstantsOf(responseData, 'PolicyToken_ArchiveForExpiry');
 
   return {
     contractId: policy.daml_contract_id,
     commandId: responseData?.transaction?.commandId,
     writeBack: async (txClient) => {
-      await txClient.query(`UPDATE policies SET status = 'expired', daml_contract_id = NULL WHERE id = $1`, [
-        policy.id,
-      ]);
+      const { contractEndedAt, recordClosedAt } = instants();
+      await txClient.query(
+        `UPDATE policies SET status = 'expired', daml_contract_id = NULL,
+           contract_ended_at = $2, record_closed_at = $3 WHERE id = $1`,
+        [policy.id, contractEndedAt, recordClosedAt]
+      );
       await txClient.query(
         `INSERT INTO policy_status_history
            (policy_id, event_type, old_status, new_status, old_daml_contract_id, new_daml_contract_id, reason)
@@ -1334,7 +1764,8 @@ async function handleExpiry(event, policy) {
 // The service date is REQUIRED in the payload and never inferred,
 // defaulted, or backfilled: statutory time runs from when the notice was
 // actually served on the policyholder, which this system cannot observe --
-// only the insurer knows it. recordedAt (when the platform was told) is
+// only the insurer knows it. recordedAt (the instant the dispatcher processes
+// this row, not when the outbox row was written) is
 // generated here, and is a genuinely different fact; both go on the token
 // so a gap between them stays visible on-ledger.
 async function handleNotice(event, policy) {
@@ -1464,16 +1895,18 @@ async function handleTermination(event, policy) {
 
   // m. 1456(5) opens a continuation window for a known real-right holder at
   // termination. Only meaningful when the policy names a mortgagee; its
-  // length is per-insurer configuration and is never a literal here. A
-  // policy WITH a mortgagee and no configured window fails loudly rather
-  // than assuming a statutory number -- same rule as the grace period.
+  // length is the insurer's configuration, frozen onto the policy at its
+  // activation (migration 037), and is never a literal here. A policy WITH a
+  // mortgagee and no window frozen fails loudly rather than assuming a
+  // statutory number -- same rule as the grace period.
   let mortgageeContinuationEndsAt = null;
   if (policy.mortgagee_policyholder_id) {
-    const days = policy.insurer_mortgagee_continuation_days;
+    const days = policy.mortgagee_continuation_days;
     if (days === null || days === undefined) {
       throw new Error(
-        `policy ${policy.id} names a mortgagee but no continuation window is configured: set ` +
-          `insurers.mortgagee_continuation_days -- refusing to assume a statutory value`
+        `policy ${policy.id} names a mortgagee but no continuation window is configured: no value was ` +
+          `frozen onto the policy at activation (insurers.mortgagee_continuation_days was unset then) -- ` +
+          `refusing to assume a statutory value`
       );
     }
     mortgageeContinuationEndsAt = new Date(
@@ -1563,7 +1996,12 @@ async function handleTerminationArchive(event, policy) {
   if (!policy.daml_contract_id) {
     throw new Error(`policy ${policy.id} has no live token to archive`);
   }
-  if (policy.default_state !== 'terminated') {
+  // v22: a contract whose elected termination has landed
+  // (two_notice_terminated) is archived by this same route, queued by
+  // twoNoticeSweeper.js; the ledger choice accepts both states and reads each
+  // one's own frozen end. The two states stay distinct on the default axis.
+  const twoNotice = policy.default_state === 'two_notice_terminated';
+  if (policy.default_state !== 'terminated' && !twoNotice) {
     throw new Error(
       `policy ${policy.id} is not terminated (default_state='${policy.default_state}') -- only a ` +
         `terminated contract's token is archived for non-payment`
@@ -1590,19 +2028,25 @@ async function handleTerminationArchive(event, policy) {
     contractId: policy.daml_contract_id,
     choice: 'PolicyToken_ArchiveForNonPayment',
     actAs: [policy.insurer_canton_party_id],
+    // v22: no archivedAt, as in handleExpiry; refused on the ledger
+    // while its time is before the frozen termination instant.
     argument: {
-      archivedAt: new Date().toISOString(),
-      reason: 'premium unpaid; notice period elapsed and all payouts resolved',
+      reason: twoNotice
+        ? 'elected termination took effect at the end of the insurance period and all payouts resolved'
+        : 'premium unpaid; notice period elapsed and all payouts resolved',
     },
   });
+  const instants = archiveInstantsOf(responseData, 'PolicyToken_ArchiveForNonPayment');
 
   return {
     contractId: policy.daml_contract_id,
     commandId: responseData?.transaction?.commandId,
     writeBack: async (txClient) => {
+      const { contractEndedAt, recordClosedAt } = instants();
       await txClient.query(
-        `UPDATE policies SET status = 'cancelled', daml_contract_id = NULL WHERE id = $1`,
-        [policy.id]
+        `UPDATE policies SET status = 'cancelled', daml_contract_id = NULL,
+           contract_ended_at = $2, record_closed_at = $3 WHERE id = $1`,
+        [policy.id, contractEndedAt, recordClosedAt]
       );
       await txClient.query(
         `INSERT INTO policy_status_history
@@ -1615,7 +2059,9 @@ async function handleTerminationArchive(event, policy) {
           policy.status,
           policy.default_state,
           policy.daml_contract_id,
-          'all payouts resolved; token burned for non-payment (phase two of termination)',
+          twoNotice
+            ? 'all payouts resolved; token burned after the elected termination took effect (phase two of the two-notice termination)'
+            : 'all payouts resolved; token burned for non-payment (phase two of termination)',
         ]
       );
     },
@@ -1705,6 +2151,9 @@ async function handleMortgageeElection(event, policy) {
     contractId: newContractId,
     commandId,
     writeBack: async (txClient) => {
+      // mortgagee_election_at is the instant this write-back runs, not the
+      // date the election was made: the route takes no date and the token
+      // records none.
       await txClient.query(
         `UPDATE policies SET daml_contract_id = $1, current_version = COALESCE($2, current_version),
            mortgagee_election = $3, mortgagee_election_at = now() WHERE id = $4`,
@@ -1740,7 +2189,7 @@ async function handleMortgageeElection(event, policy) {
 //
 // Reinstatement is also the ONLY exit from default. Nothing else may clear
 // it -- in particular a claim payout must not, however large: this system
-// cannot observe a premium payment, and per TTK 1431/3 any set-off of the
+// cannot observe a premium payment, and per TTK 1431(5) any set-off of the
 // outstanding premium against the indemnity is the insurer's own
 // arithmetic in its own system. The insurer knows, and says so by queueing
 // this event.
@@ -1803,12 +2252,27 @@ async function handleReinstatement(event, policy) {
   };
 }
 
+// An amount in the form policy_coverages.sum_insured NUMERIC(14,2) holds:
+// at most 12 integer digits and 2 decimals, greater than zero. A number or a
+// numeric string; the
+// ledger's Decimal would take more decimals, and the SQL mirror would round
+// them. routes/policies.js imports it, so the route and this file hold one rule.
+export const NUMERIC_14_2_AMOUNT = /^\d{1,12}(\.\d{1,2})?$/;
+
+export function isNumeric14_2Amount(value) {
+  return (typeof value === 'number' || typeof value === 'string') &&
+    NUMERIC_14_2_AMOUNT.test(String(value)) &&
+    Number(value) > 0;
+}
+
 // Stage 3 Part 3, Part B: exercises PolicyToken_Amend for one 'endorsement'
 // outbox row -- the third lifecycle mechanism, alongside the claim path
-// (trigger) and the premium-default path (notice/suspension/reinstatement).
+// (trigger) and the premium-default path (notice/termination/reinstatement).
 //
 // Every field of the endorsement comes from the insurer through the API and
-// is passed straight to the choice. Nothing is computed or defaulted here:
+// is passed straight to the choice, except an added coverage's
+// payoutDestination and remainingLimit, which are derived here.
+// Nothing else is computed or defaulted here:
 // which coverages change, by how much, what the new term is, and the reason
 // code are all the insurer's decisions. The choice itself enforces every
 // invariant that matters (remainingLimit moves by the sum-insured delta
@@ -1816,7 +2280,14 @@ async function handleReinstatement(event, policy) {
 // cannot be empty or contain duplicate codes, and a terminated policy
 // cannot be amended at all) -- deliberately NOT re-implemented here, so there is
 // exactly one place those rules live and SQL can never disagree with the
-// ledger about them.
+// ledger about them. One check repeated here before the ledger is the
+// sumInsured form (isNumeric14_2Amount below), which the route
+// makes too; it is a SQL column bound, not one of those invariants. Another
+// is the refusal of an added coverage carrying payoutDestination or
+// remainingLimit, the two values derived here. The last two are
+// the route's refusals, repeated here before the ledger: a code
+// both removed and added, and the removal of a coverage attached now
+// (m. 1457), which the choice itself allows.
 //
 // The coverage rows are re-mirrored wholesale from the re-minted token
 // rather than patched field-by-field, because an endorsement can add and
@@ -1848,6 +2319,20 @@ async function handleEndorsement(event, policy) {
         `expected one of ${Object.keys(DAML_REASON_TO_SQL).join(', ')}`
     );
   }
+  // The same sumInsured rule the route applies, so a row queued
+  // past it fails here, before the ledger.
+  if (!Array.isArray(sumInsuredChanges)) {
+    throw new Error(`endorsement event ${event.id}: sumInsuredChanges is not an array`);
+  }
+  for (const c of sumInsuredChanges) {
+    if (!c?.coverageCode || !isNumeric14_2Amount(c.sumInsured)) {
+      throw new Error(
+        `endorsement event ${event.id}: sumInsuredChanges for coverage ${c?.coverageCode ?? '(no code)'} needs a ` +
+          `coverageCode and a sumInsured greater than zero with at most 12 integer digits and 2 decimals ` +
+          `(policy_coverages.sum_insured NUMERIC(14,2)) -- nothing is sent to the ledger`
+      );
+    }
+  }
   // An added coverage needs product_code/peril_type/cell_ids for its SQL
   // row (tier lookup and oracle cell-reading both key off them), but the
   // Daml Coverage record carries none of the three -- the ledger never
@@ -1860,7 +2345,85 @@ async function handleEndorsement(event, policy) {
           `productCode, perilType, or cellIds -- required for its SQL row, never defaulted`
       );
     }
+    // v22: the coverage's terms and the salt its cell commitment is
+    // made with, drawn by the route when the row was queued, so a
+    // retried row sends the same commitment. None is defaulted.
+    if (!c.metric || !c.payoutBasis || !c.cellCommitmentSalt) {
+      throw new Error(
+        `endorsement event ${event.id}: added coverage ${c.coverageCode} is missing metric, payoutBasis ` +
+          `or cellCommitmentSalt -- required by the v22 token, never defaulted`
+      );
+    }
+    if (!isNumeric14_2Amount(c.sumInsured)) {
+      throw new Error(
+        `endorsement event ${event.id}: added coverage ${c.coverageCode} needs a sumInsured greater than zero ` +
+          `with at most 12 integer digits and 2 decimals (policy_coverages.sum_insured NUMERIC(14,2)) ` +
+          `-- nothing is sent to the ledger`
+      );
+    }
+    // Both are derived below, so a row carrying either fails here.
+    for (const key of ['payoutDestination', 'remainingLimit']) {
+      if (key in c) {
+        throw new Error(
+          `endorsement event ${event.id}: added coverage ${c.coverageCode} carries ${key}, which is derived, ` +
+            `not accepted -- nothing is sent to the ledger`
+        );
+      }
+    }
   }
+  // The route's two refusals, so a row queued past them fails
+  // here, before the ledger. The attachment is read under the lock;
+  // 'attached now' is schema.sql's idx_policy_coverages_attached.
+  const replacedCodes = coveragesToAdd
+    .map((c) => c.coverageCode)
+    .filter((code) => coverageCodesToRemove.includes(code));
+  if (replacedCodes.length > 0) {
+    throw new Error(
+      `endorsement event ${event.id}: coverage(s) ${replacedCodes.join(', ')} are both removed and added -- ` +
+        `add the coverage under a different code; nothing is sent to the ledger`
+    );
+  }
+  const { rows: attachedRows } = await pool.query(
+    `SELECT coverage_code FROM policy_coverages
+      WHERE policy_id = $1 AND coverage_code = ANY($2::text[])
+        AND attached_at IS NOT NULL
+        AND (attachment_lifted_at IS NULL OR attachment_lifted_at < attached_at)`,
+    [policy.id, coverageCodesToRemove]
+  );
+  if (attachedRows.length > 0) {
+    throw new Error(
+      `endorsement event ${event.id}: coverage(s) ${attachedRows.map((r) => r.coverage_code).join(', ')} ` +
+        `are under attachment (m. 1457) and cannot be removed -- a coverage added in their place would carry ` +
+        `no attachment; nothing is sent to the ledger`
+    );
+  }
+
+  // policies.mortgagee_policyholder_id mirrors the token's mortgagee, and
+  // handleTermination and a renewal read it. A mortgagee that is set must be
+  // one of this insurer's policyholders, looked up here so the write-back can
+  // record it. The route answers 400; a row queued past it fails here, before
+  // the ledger.
+  const changesMortgagee = newMortgagee !== undefined && newMortgagee !== null;
+  let mortgageePolicyholderId = null;
+  if (changesMortgagee && (newMortgagee.value ?? null) !== null) {
+    const { rows: [mortgagee] } = await pool.query(
+      'SELECT id FROM policyholders WHERE canton_party_id = $1 AND insurer_id = $2',
+      [newMortgagee.value, policy.insurer_id]
+    );
+    if (!mortgagee) {
+      throw new Error(
+        `endorsement event ${event.id}: newMortgagee is not the party of one of this insurer's policyholders ` +
+          `-- policies.mortgagee_policyholder_id could not record it, so nothing is sent to the ledger`
+      );
+    }
+    mortgageePolicyholderId = mortgagee.id;
+  }
+  // Create's rule: an added coverage routes to the mortgagee too
+  // when it carries a claim and the policy names a mortgagee once this
+  // endorsement applies -- the change it makes, or else the fresh row's.
+  const effectiveMortgagee = changesMortgagee
+    ? newMortgagee.value ?? null
+    : policy.mortgagee_policyholder_id;
 
   const responseData = await exerciseChoice({
     commandSeed: event.id,
@@ -1881,10 +2444,16 @@ async function handleEndorsement(event, policy) {
       coveragesToAdd: coveragesToAdd.map((c) => ({
         coverageCode: c.coverageCode,
         sumInsured: String(c.sumInsured),
-        remainingLimit: String(c.remainingLimit ?? c.sumInsured),
+        remainingLimit: String(c.sumInsured),
         payoutTiers: c.payoutTiers,
-        payoutDestination: c.payoutDestination,
+        payoutDestination:
+          effectiveMortgagee && c.mortgageeClaimAmount !== undefined && c.mortgageeClaimAmount !== null
+            ? ['PDR_Insured', 'PDR_Mortgagee']
+            : ['PDR_Insured'],
         mortgageeClaimAmount: c.mortgageeClaimAmount ?? null,
+        metric: c.metric,
+        payoutBasis: c.payoutBasis,
+        cellCommitment: cellCommitmentFor(c.coverageCode, c.cellIds, c.cellCommitmentSalt),
       })),
       coverageCodesToRemove,
       newExpiry,
@@ -1922,6 +2491,14 @@ async function handleEndorsement(event, policy) {
          WHERE id = $5`,
         [newContractId, newVersion, newPayload?.expiry ?? null, DAML_REASON_TO_SQL[reason], policy.id, newDocumentHash]
       );
+      // The mortgagee moves only when the endorsement changed it: to the
+      // policyholder looked up above, or to NULL when it was cleared.
+      if (changesMortgagee) {
+        await txClient.query('UPDATE policies SET mortgagee_policyholder_id = $1 WHERE id = $2', [
+          mortgageePolicyholderId,
+          policy.id,
+        ]);
+      }
 
       // Mirror the token's coverage list exactly. Deliberately NOT an
       // upsert: product_code/peril_type/cell_ids are NOT NULL and have no
@@ -1968,8 +2545,9 @@ async function handleEndorsement(event, policy) {
         await txClient.query(
           `INSERT INTO policy_coverages
              (policy_id, coverage_code, product_code, peril_type, cell_ids,
-              sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination, mortgagee_claim_amount)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+              sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination, mortgagee_claim_amount,
+              metric, payout_basis, cell_commitment_salt)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
           [
             policy.id,
             c.coverageCode,
@@ -1981,6 +2559,11 @@ async function handleEndorsement(event, policy) {
             JSON.stringify(c.payoutTiers),
             JSON.stringify(c.payoutDestination),
             c.mortgageeClaimAmount ?? null,   // see the note above
+            // v22: the token's metric and basis, and the salt the committed
+            // cell was hashed with -- the triggers on this coverage need it.
+            c.metric,
+            c.payoutBasis,
+            added.cellCommitmentSalt,
           ]
         );
       }
@@ -2070,6 +2653,22 @@ async function handleRenewal(event, predecessor) {
         `${predecessor.renewed_by_policy_id} -- a period is succeeded exactly once`
     );
   }
+  // An earlier renewal whose create succeeded but whose
+  // write-back failed ends 'failed' with its resulting_contract_id set
+  // (processEvent) and renewed_by_policy_id still NULL. Its successor is on
+  // the ledger; refused from SQL alone, before any ledger read.
+  const { rows: unrecordedRows } = await pool.query(
+    `SELECT id, resulting_contract_id FROM policy_events
+     WHERE policy_no = $1 AND event_type = 'renewal' AND status = 'failed' AND resulting_contract_id IS NOT NULL`,
+    [predecessor.id]
+  );
+  if (unrecordedRows.length > 0) {
+    throw new Error(
+      `cannot renew policy ${predecessor.id}: renewal event ${unrecordedRows[0].id} already put successor ` +
+        `contract ${unrecordedRows[0].resulting_contract_id} on the ledger but its write-back failed -- ` +
+        `reconcile that row by hand; a period is succeeded exactly once`
+    );
+  }
 
   const { rows: successorRows } = await pool.query(
     `SELECT p.*, i.canton_party_id AS insurer_canton_party_id, i.oracle_operator_party,
@@ -2103,6 +2702,7 @@ async function handleRenewal(event, predecessor) {
   // period is configured anywhere, rather than minting a token no later
   // notice could compute a deadline for.
   const gracePeriodDays = resolveGracePeriodDays(successor);
+  const oracleOperatorParty = resolveOracleOperatorParty(successor);
 
   // The party is REUSED, never reallocated -- ensurePolicyholderParty
   // returns the existing one without a ledger call when the policyholder
@@ -2162,7 +2762,44 @@ async function handleRenewal(event, predecessor) {
     // new contract with its own coverage rows -- has neither set.
     attachedAt: c.attached_at ? new Date(c.attached_at).toISOString() : null,
     attachmentLiftedAt: c.attachment_lifted_at ? new Date(c.attachment_lifted_at).toISOString() : null,
+    // v22, from the successor's own rows, as at activation.
+    metric: c.metric,
+    payoutBasis: c.payout_basis,
+    cellCommitment: cellCommitmentFor(c.coverage_code, c.cell_ids, c.cell_commitment_salt),
   }));
+
+  // The ledger has no key on predecessorRef, so the SQL guards
+  // above miss a successor that reached the ledger while its row ended
+  // 'failed' with nothing recorded (a create that timed out after the
+  // participant took it). Refused if any active PolicyToken the insurer sees
+  // already names this predecessor. Accepted costs: the read returns ALL of
+  // the insurer party's active contracts (see queryActiveContracts), so once
+  // they pass the participant's list cap every renewal for that insurer fails
+  // here, not only a repeat; and a repeat that arrives while the earlier
+  // command is still in flight does not see its token yet -- that window is
+  // closed only by checking the earlier row's command (scripts/findOutboxCommand.mjs).
+  let liveTokens;
+  try {
+    liveTokens = await queryActiveContracts({
+      moduleName: 'Insurance.PolicyToken',
+      entityName: 'PolicyToken',
+      parties: [successor.insurer_canton_party_id],
+    });
+  } catch (err) {
+    throw new Error(
+      `renewal event ${event.id}: could not read the insurer's active PolicyTokens to check for an existing ` +
+        `successor of ${predecessor.id} (${err.message}) -- nothing was submitted`
+    );
+  }
+  const existing = liveTokens
+    .map((e) => e.contractEntry.JsActiveContract.createdEvent)
+    .find((c) => c.createArgument.predecessorRef === predecessor.id);
+  if (existing) {
+    throw new Error(
+      `cannot renew policy ${predecessor.id}: a successor is already on the ledger (contract ` +
+        `${existing.contractId}, policyNo ${existing.createArgument.policyNo}) -- a period is succeeded exactly once`
+    );
+  }
 
   const { contractId, commandId } = await createContract({
     commandSeed: event.id,
@@ -2200,7 +2837,7 @@ async function handleRenewal(event, predecessor) {
       // to distinguish that from "described but not named".
       beneficiaryDescriptorHash: successor.beneficiary_descriptor_hash ?? null,
       mortgagee: mortgageeParty,
-      oracleOperator: successor.oracle_operator_party ?? successor.insurer_canton_party_id,
+      oracleOperator: oracleOperatorParty,
       coverages,
       // Stage 4: the term START, added so a refund under m. 1419 has the
       // facts it needs on-ledger. Same noon-Europe/Istanbul conversion as
@@ -2249,6 +2886,7 @@ async function handleRenewal(event, predecessor) {
       await txClient.query(
         `UPDATE policies SET status = 'active', current_version = 1, daml_contract_id = $1,
            expiry = $2, term_start = $6, grace_period_days = $3, predecessor_policy_id = $4,
+           mortgagee_continuation_days = $10, first_premium_withdrawal_days = $11,
            event_window_timezone = $7, event_window_start_hour = $8, event_aggregation = $9
          WHERE id = $5`,
         [
@@ -2261,6 +2899,8 @@ async function handleRenewal(event, predecessor) {
           frozenEventWindow(successor).timezone,
           frozenEventWindow(successor).startHour,
           frozenEventWindow(successor).aggregation,
+          successor.insurer_mortgagee_continuation_days,
+          successor.insurer_first_premium_withdrawal_days,
         ]
       );
       // The forward link on the predecessor, so the chain is navigable both
@@ -2313,13 +2953,20 @@ async function markFailed(eventId, message) {
 // of `fn`. Different policies proceed independently; two events for the
 // SAME policy never process concurrently, even across restarts or a
 // second dispatcher process.
-async function withPolicyLock(policyNo, fn) {
+export async function withPolicyLock(policyNo, fn) {
   const client = await pool.connect();
+  // As in db.js withTransaction: an 'error' on the held client is logged, not
+  // thrown. Removed only right before release(), which puts the pool's own
+  // listener back synchronously: a second 'error' can still come while the
+  // unlock below is awaited.
+  const onError = (err) => console.error('[dispatcher] policy lock client error:', err.message);
+  client.on('error', onError);
   try {
     await client.query('SELECT pg_advisory_lock(hashtext($1))', [policyNo]);
     return await fn(client);
   } finally {
     await client.query('SELECT pg_advisory_unlock(hashtext($1))', [policyNo]).catch(() => {});
+    client.removeListener('error', onError);
     client.release();
   }
 }
@@ -2367,7 +3014,7 @@ async function processEvent(event) {
     // contractId embedded in the error text, so a human can find the real
     // on-ledger state and reconcile by hand. It is never auto-retried:
     // retrying a successful create/exercise risks doing it twice. This
-    // fallback is shared by all three implemented event types; only
+    // fallback is shared by every implemented event type; only
     // `result.writeBack` (each handler's own SQL, see EVENT_HANDLERS)
     // differs between them.
     try {
@@ -2403,14 +3050,50 @@ async function processEvent(event) {
   });
 }
 
+// claimNext's hold condition (described below), as SQL over a policy_events
+// row. Exported so scripts/doctor.mjs counts the held rows with this text
+// rather than a copy.
+export const TRIGGER_HOLD_PREDICATE = `event_type = 'trigger' AND EXISTS (
+          SELECT 1 FROM policies p JOIN trigger_windows w ON w.id = policy_events.trigger_window_id
+           WHERE p.id = policy_events.policy_no
+             AND ((p.default_state = 'grace_period' AND p.substituted_at IS NULL
+                   AND p.notice_service_date IS NOT NULL AND p.grace_period_days IS NOT NULL
+                   AND w.event_end > p.notice_service_date + p.grace_period_days * INTERVAL '24 hours')
+               OR (p.default_state = 'two_notice_elected' AND p.two_notice_effective_at IS NOT NULL
+                   AND w.event_end > p.two_notice_effective_at)))`;
+
 // SKIP LOCKED so a second concurrent dispatcher process, if one is ever
 // run, can't claim the same row twice.
+//
+// v22: a trigger row is HELD, not
+// claimed, while its policy's m. 1434(3) deadline -- the service date plus the
+// frozen grace period in whole 24-hour days, the instant handleTermination
+// records -- lies before the row's event_end and the notice's outcome is not
+// yet recorded (default_state still 'grace_period', no substitution). The
+// oracle does not queue such a window (oracleBot.js, coverBoundFor); this is
+// the re-check before sending, for a row already queued -- e.g. one queued
+// before a notice was reported with an earlier service date. A claimed row
+// can only end done or failed, so a held row is left pending instead:
+// nothing is sent while the outcome is undecided, and nothing is lost. Once
+// the sweeper records a termination the row is claimed and the ledger judges
+// its interval against the termination instant; once a payment is reported
+// and the policy reinstated, it is sent as queued.
+//
+// The m. 1434(4) twin: a trigger row whose event_end is after the policy's
+// two_notice_effective_at, while the election is recorded but has not landed
+// ('two_notice_elected'). The end is decided there -- an election is not
+// undone -- but until the landing the token's coverageValidThrough is still
+// its expiry and the ledger would accept such a row. It is held until the
+// sweeper records the landing; the ledger then judges it against the
+// effective instant. (The oracle clips at that instant from the election on,
+// so only a row queued before a late-reported election can be one.)
 async function claimNext() {
   const { rows } = await pool.query(`
     UPDATE policy_events SET status = 'processing'
     WHERE id = (
       SELECT id FROM policy_events
       WHERE status = 'pending'
+        AND NOT (${TRIGGER_HOLD_PREDICATE})
       ORDER BY created_at ASC
       LIMIT 1
       FOR UPDATE SKIP LOCKED
@@ -2420,11 +3103,6 @@ async function claimNext() {
   return rows[0] ?? null;
 }
 
-// Processes pending events one at a time. Different policies' events could
-// safely run concurrently (the per-policy advisory lock is what makes that
-// safe) -- this loop doesn't do so, sequential is simple and fast enough
-// at this scale; the locking is what keeps that a safe choice to revisit
-// later rather than a correctness requirement now.
 // ---------------------------------------------------------------------------
 // m. 1434(2) -- first-premium default. One handler per act.
 // ---------------------------------------------------------------------------
@@ -2463,11 +3141,12 @@ function addCalendarMonths(date, months) {
 // less time in which the insurer may withdraw, so it is not to their
 // detriment and is permitted; a longer one is.
 function resolveFirstPremiumWindow(policy) {
-  const days = policy.insurer_first_premium_withdrawal_days;
+  const days = policy.first_premium_withdrawal_days;
   if (days === null || days === undefined) {
     throw new Error(
-      `no first-premium withdrawal window configured for policy ${policy.id}: set ` +
-        `insurers.first_premium_withdrawal_days -- refusing to assume a statutory value`
+      `no first-premium withdrawal window configured for policy ${policy.id}: no value was frozen onto ` +
+        `the policy at activation (insurers.first_premium_withdrawal_days was unset then) -- refusing to ` +
+        `assume a statutory value`
     );
   }
   if (!policy.premium_due_date) {
@@ -2505,6 +3184,16 @@ const WITHDRAWAL_PATHS = new Set(['WP_InsurerWithdrew', 'WP_DeemedNoEnforcement'
 async function handlePremiumDueDate(event, policy) {
   if (!policy.daml_contract_id) {
     throw new Error(`policy ${policy.id} has no active token`);
+  }
+  // Refused once the first premium is recorded paid: a due date after the
+  // payment would move a paid policy into first-premium default. The route
+  // answers 409; a row queued past it fails here, before the ledger.
+  if (policy.first_premium_paid_at) {
+    throw new Error(
+      `premium due date event ${event.id}: policy ${policy.id} already has its first premium recorded ` +
+        `as paid at ${new Date(policy.first_premium_paid_at).toISOString()} -- a due date reported after ` +
+        `the payment is refused rather than moving a paid policy into first-premium default`
+    );
   }
   const { dueDate } = event.payload ?? {};
   if (!dueDate) {
@@ -2567,7 +3256,8 @@ async function handlePremiumDueDate(event, policy) {
 // "dava veya takip yoluyla" -- the insurer says it pursued the premium claim.
 // Recording COMMENCEMENT only: whether it proved fruitless (semeresiz) is
 // m. 1431(4)'s trigger for substitution by the sigortalı, a different fact,
-// deliberately not implemented.
+// recorded by its own event type (enforcement_fruitless,
+// handleEnforcementFruitless below), never inferred from this one.
 async function handleEnforcementCommenced(event, policy) {
   if (!policy.daml_contract_id) {
     throw new Error(`policy ${policy.id} has no active token`);
@@ -3152,6 +3842,17 @@ async function handleFirstPremiumPaid(event, policy) {
   if (!policy.daml_contract_id) {
     throw new Error(`policy ${policy.id} has no active token`);
   }
+  // Reported once. The ledger can accept a second report and keep the cover
+  // start it already has, while the write-back below would overwrite
+  // first_premium_paid_at, and the two would disagree. The route answers 409;
+  // a row queued past it fails here, before the ledger.
+  if (policy.first_premium_paid_at) {
+    throw new Error(
+      `first-premium-paid event ${event.id}: policy ${policy.id} already has its first premium recorded ` +
+        `as paid at ${new Date(policy.first_premium_paid_at).toISOString()} -- it is reported once, and a ` +
+        `second report is refused rather than overwriting the first`
+    );
+  }
   // m. 1421: this date is when the insurer's liability begins, so it is the
   // insurer's REPORTED date and never a clock reading. Until v15 the argument
   // was supplied as Date.now() and then discarded by the choice; harmless
@@ -3383,6 +4084,10 @@ function noteLedgerReachable() {
 export async function runOnce({ probeLedger = getLedgerEnd } = {}) {
   // The probe costs one GET per poll, so it is only worth making when there
   // is something to claim: an idle dispatcher makes no ledger call at all.
+  // "Something" here is any pending row, held ones included: this query does
+  // not apply TRIGGER_HOLD_PREDICATE, so while a trigger row is held (see
+  // claimNext) the probe still runs every poll, and an unreachable ledger is
+  // still logged, although claimNext will not take that row.
   const { rows: waiting } = await pool.query(
     `SELECT 1 FROM policy_events WHERE status = 'pending' LIMIT 1`
   );
@@ -3396,6 +4101,11 @@ export async function runOnce({ probeLedger = getLedgerEnd } = {}) {
   }
   noteLedgerReachable();
 
+  // Processes pending events one at a time. Different policies' events could
+  // safely run concurrently (the per-policy advisory lock is what makes that
+  // safe) -- this loop doesn't do so, sequential is simple and fast enough
+  // at this scale; the locking is what keeps that a safe choice to revisit
+  // later rather than a correctness requirement now.
   for (;;) {
     const event = await claimNext();
     if (!event) break;
@@ -3403,10 +4113,60 @@ export async function runOnce({ probeLedger = getLedgerEnd } = {}) {
   }
 }
 
-export function startDispatcher() {
+// Which participant this dispatcher will send oracle submissions to, said out
+// loud once at startup, and -- when it is a second participant -- probed. A
+// configured-but-unreachable second participant is the one state that must
+// never be quiet: nothing falls back to the insurer's participant, so every
+// trigger would fail, and the reason has to be on the console before the first
+// one does. The probe does not stop the process: the participant may come up
+// later, and a dispatcher that refuses to start would not notice when it did.
+async function announceOracleParticipant() {
+  if (!oracleIsOnItsOwnParticipant()) {
+    console.log(
+      `[dispatcher] oracle submissions go to ${oracleEndpoint()} -- the same participant as the insurer ` +
+        `(DAML_JSON_API_URL_ORACLE is unset)`
+    );
+    return;
+  }
+  try {
+    const offset = await getLedgerEnd({ endpoint: oracleEndpoint() });
+    console.log(
+      `[dispatcher] oracle submissions go to ${oracleEndpoint()} (DAML_JSON_API_URL_ORACLE); it answers, ` +
+        `ledger end offset ${offset}`
+    );
+  } catch (err) {
+    console.error(
+      `[dispatcher] CRITICAL: DAML_JSON_API_URL_ORACLE is set to ${oracleEndpoint()} but it does not answer ` +
+        `(${err.message}). Every trigger will fail: nothing falls back to ${insurerEndpoint()}, because ` +
+        `submitting as the oracle party there is refused and would be the wrong participant if it were not`
+    );
+  }
+}
+
+// One run at a time in this process. setInterval does not wait for the
+// previous run, and overlapping runs each hold a pool connection on an
+// advisory lock until the pool is full. A tick that finds a run still going
+// is skipped; the flag drops when the run ends, resolved or rejected.
+let running = false;
+function runGuarded(run, failure) {
+  if (running) return;
+  running = true;
+  run()
+    .catch((err) => console.error(failure, err))
+    .finally(() => {
+      running = false;
+    });
+}
+
+// run is the seam tests use to supply a fake run, the same shape as runOnce's
+// probeLedger. Production passes nothing.
+export function startDispatcher({ run = runOnce } = {}) {
   console.log(`[dispatcher] polling every ${config.mintWatcher.pollMs}ms`);
+  announceOracleParticipant().catch((err) =>
+    console.error('[dispatcher] the oracle participant could not be announced:', err)
+  );
   setInterval(() => {
-    runOnce().catch((err) => console.error('[dispatcher] run failed:', err));
+    runGuarded(run, '[dispatcher] run failed:');
   }, config.mintWatcher.pollMs);
 }
 
@@ -3414,5 +4174,5 @@ export function startDispatcher() {
 // string concatenation (Windows path-format mismatch made that dead code).
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   startDispatcher();
-  runOnce().catch((err) => console.error('[dispatcher] initial run failed:', err));
+  runGuarded(runOnce, '[dispatcher] initial run failed:');
 }

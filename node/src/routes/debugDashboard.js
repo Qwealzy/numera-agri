@@ -11,6 +11,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // amounts), just pre-rendered instead of raw JSON. Delete alongside
 // debug.js before any deployment that isn't literally your own machine's
 // LocalNet.
+// It is mounted only when DEBUG_ROUTES_ENABLED is 'true'; unset, it is off.
 const LOOPBACK_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 debugDashboardRouter.use((req, res, next) => {
   if (!LOOPBACK_ADDRESSES.has(req.socket.remoteAddress)) {
@@ -23,4 +24,15 @@ debugDashboardRouter.use((req, res, next) => {
 // GET /debug/contracts. This route only ever serves the static page.
 debugDashboardRouter.get('/dashboard', (_req, res) => {
   res.sendFile(path.join(__dirname, '..', '..', 'public', 'debug-dashboard.html'));
+});
+
+// Read-only too: the story page fetches GET /debug/story-data client-side.
+debugDashboardRouter.get('/story', (_req, res) => {
+  res.sendFile(path.join(__dirname, '..', '..', 'public', 'story.html'));
+});
+
+// The roles page fetches GET /debug/roles-data and POST
+// /debug/roles/try-insurer-trigger client-side, each only when a button asks.
+debugDashboardRouter.get('/roles', (_req, res) => {
+  res.sendFile(path.join(__dirname, '..', '..', 'public', 'roles.html'));
 });

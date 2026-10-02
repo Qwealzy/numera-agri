@@ -8,12 +8,13 @@
 
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
 // POST /policies requires the policy document's SHA-256 in lowercase hex
 // (migration 034); the document itself never reaches the platform.
 const DOCUMENT_HASH = crypto.createHash('sha256').update('verify-m1456-6 policy document').digest('hex');
 
-const ENV_PATH = new URL('../node/.env', import.meta.url).pathname.replace(/^\//, '');
+const ENV_PATH = fileURLToPath(new URL('../node/.env', import.meta.url));
 for (const line of fs.readFileSync(ENV_PATH, 'utf8').split('\n')) {
   const m = line.trim().match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
   if (m) process.env[m[1]] = m[2].trim().replace(/^["']/, '').replace(/["']$/, '');
@@ -25,6 +26,13 @@ const { pool } = await import('../node/src/db.js');
 const { queryActiveContracts } = await import('../node/src/damlClient.js');
 
 const RUN = Date.now().toString(36);
+// Cell ids in the oracle's own format, "metno:<lat>,<lon>" with at most 4 decimals. The
+// first two decimals of the latitude name this script, the first two of the longitude
+// count the cells this run hands out, and the last two of each carry the run.
+const CELL_RUN = String(parseInt(RUN, 36) % 10000).padStart(4, '0');
+let cellCount = 0;
+const nextCell = () =>
+  `metno:0.13${CELL_RUN.slice(0, 2)},0.${String(++cellCount).padStart(2, '0')}${CELL_RUN.slice(2)}`;
 const BASE_T = Date.now();
 const iso = (d) => new Date(d).toISOString();
 const ago = (n) => iso(BASE_T - n * 86400000);
@@ -72,6 +80,13 @@ const tokenFor = async (cid) => (await queryActiveContracts({
   moduleName: 'Insurance.PolicyToken', entityName: 'PolicyToken', parties: [insurerParty],
 })).map((e) => e.contractEntry.JsActiveContract.createdEvent).find((c) => c.contractId === cid);
 
+// The package line gives the DAML_PACKAGE_ID loaded above, the package this
+// run is against, beside the name in the source tree's daml/daml.yaml. The
+// heading's vNN stays the version the article shipped in.
+const packageName = fs.readFileSync(new URL('../daml/daml.yaml', import.meta.url), 'utf8').match(/^name:\s*(\S+)/m)?.[1];
+if (!packageName) throw new Error('daml/daml.yaml has no name line');
+const PACKAGE = `\`${packageName}\` (id \`${process.env.DAML_PACKAGE_ID}\`)`;
+
 const out = [];
 const say = (s = '') => { out.push(s); console.log(s); };
 const short = (p) => String(p).split('::')[0].slice(0, 22);
@@ -79,7 +94,7 @@ const short = (p) => String(p).split('::')[0].slice(0, 22);
 say('## 3p. Live verification run (v19 — the m. 1456(6) information duty)');
 say('');
 say('Through the real HTTP API against the real participant, package');
-say('`insurance-tokenization-v19`.');
+say(`${PACKAGE}.`);
 say('');
 
 const created = await call('POST', '/policies', {
@@ -90,7 +105,9 @@ const created = await call('POST', '/policies', {
   agreedCoverageStart: ago(30),
   coverages: [{
     coverageCode: 'FROST-COVER', productCode: 'FROST-STANDARD', perilType: 'FROST',
-    cellIds: [`cell-1456-6-${RUN}`], sumInsured: 100000,
+    cellIds: [nextCell()], sumInsured: 100000,
+    // v22: required by the API, with no default. The basis v21 applied.
+    metric: 'TEMPERATURE_C', payoutBasis: 'PB_RemainingLimit',
   }],
 });
 const policyId = created.policy.id;
@@ -209,7 +226,7 @@ say('');
 say('Reproduced by `scripts/verify-m1456-6.mjs`, which drives all of the above');
 say('through the HTTP API and writes this section.');
 
-const target = new URL('../docs/m1456-6-live-run.txt', import.meta.url).pathname.replace(/^\//, '');
+const target = fileURLToPath(new URL('../docs/m1456-6-live-run.txt', import.meta.url));
 fs.writeFileSync(target, out.join('\n') + '\n');
 console.log(`\nwritten to ${target}`);
 await pool.end();

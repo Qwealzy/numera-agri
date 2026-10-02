@@ -1,0 +1,15 @@
+{
+  "note": "synthetic demo terms set by the demo insurer -- not an actuarial figure, not a product anyone sells",
+  "productCode": "DEMO-LOWTEMP",
+  "perilType": "DEMO-TEMPERATURE",
+  "tiers": [
+    {
+      "tierOrder": 1,
+      "label": "Near-frost night (demo term)",
+      "thresholdMin": "0.0001",
+      "thresholdMax": "1.0",
+      "payoutPercentage": "10",
+      "shape": "TS_Step"
+    }
+  ]
+}

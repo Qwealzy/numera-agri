@@ -7,4 +7,4 @@ dependencies:
   - daml-stdlib
   - daml-script
 data-dependencies:
-  - ../daml/.daml/dist/insurance-tokenization-v21-1.0.0.dar
+  - ../daml/.daml/dist/insurance-tokenization-v22-1.0.0.dar

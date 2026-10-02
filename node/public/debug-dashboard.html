@@ -112,8 +112,9 @@
     <div class="note">
       Bildirim tebliğ tarihi dışarıdan verilir; ödemesiz sürenin bittiği an =
       tebliğ tarihi + poliçenin kendi <code>grace_period_days</code> değeri.
-      Süre dolduğunda <code>graceSweeper.js</code> poliçeyi askıya alır — teminat durur,
-      ancak poliçe sonlandırılmaz.
+      Süre ödemesiz dolduğunda <code>graceSweeper.js</code> fesih kaydını kuyruğa yazar —
+      sözleşme sürenin bittiği anda feshedilmiş olur; o ana kadar teminat tam sürer.
+      Token ise poliçedeki bütün ödemeler sonuçlandıktan sonra, ayrı bir adımda arşivlenir.
     </div>
     <div id="defaultTable"></div>
   </section>

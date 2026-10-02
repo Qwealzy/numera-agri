@@ -1,7 +1,8 @@
 # ---------------------------------------------------------------------------
-# Secrets. node/.env holds DAML_PACKAGE_ID, the database password
-# (DATABASE_URL, TEST_DATABASE_URL) and the LocalNet JWT secret
-# (DAML_UNSAFE_JWT_SECRET) or a ledger token (DAML_LEDGER_TOKEN). .env.example is the tracked template
+# Secrets. node/.env holds DAML_PACKAGE_ID, the database passwords
+# (DATABASE_URL, TEST_DATABASE_URL, DATABASE_MAINT_URL), the LocalNet JWT secret
+# (DAML_UNSAFE_JWT_SECRET) or a ledger token (DAML_LEDGER_TOKEN), and the webhook
+# signing master key (WEBHOOK_SIGNING_MASTER_KEY); node/.env.example lists every key. .env.example is the tracked template
 # and is deliberately NOT excluded by these rules.
 # ---------------------------------------------------------------------------
 .env
@@ -42,6 +43,7 @@ _*.js
 scratch-*
 *.log
 docs/m*-live-run.txt
+recordings/
 
 # ---------------------------------------------------------------------------
 # OS noise
@@ -49,3 +51,8 @@ docs/m*-live-run.txt
 .DS_Store
 Thumbs.db
 desktop.ini
+
+demo-secrets/
+
+# a maintenance script kept outside this repository writes the party identifiers it finds here when given no output path.
+contracts.json

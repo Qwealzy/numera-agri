@@ -92,16 +92,20 @@ function zonedParts(instantMillis, timezone) {
 // The UTC instant of a local wall-clock time. Same Intl technique as
 // dispatcher.js's policyTermInstant, with a second correction pass so it
 // also lands right on a DST transition day, which a single pass does not
-// guarantee for zones that have one.
+// guarantee for zones that have one. When the wall time falls in a
+// spring-forward gap it does not exist, and the later of the two passes is
+// the end of the gap, which is what is returned then.
 function localToInstant(year, month, day, hour, timezone) {
   const guess = Date.UTC(year, month - 1, day, hour, 0, 0);
   const offsetAt = (t) => {
     const z = zonedParts(t, timezone);
     return Date.UTC(z.year, z.month - 1, z.day, z.hour, z.minute, z.second) - t;
   };
-  let t = guess - offsetAt(guess);
-  t = guess - offsetAt(t);
-  return t;
+  const t1 = guess - offsetAt(guess);
+  const t2 = guess - offsetAt(t1);
+  const z = zonedParts(t2, timezone);
+  if (z.year !== year || z.month !== month || z.day !== day || z.hour !== hour) return Math.max(t1, t2);
+  return t2;
 }
 
 // Calendar arithmetic on a local date, with no zone involved at all.

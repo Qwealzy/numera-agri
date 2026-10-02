@@ -7,12 +7,13 @@
 
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
 // POST /policies requires the policy document's SHA-256 in lowercase hex
 // (migration 034); the document itself never reaches the platform.
 const DOCUMENT_HASH = crypto.createHash('sha256').update('verify-m1434-4 policy document').digest('hex');
 
-const ENV_PATH = new URL('../node/.env', import.meta.url).pathname.replace(/^\//, '');
+const ENV_PATH = fileURLToPath(new URL('../node/.env', import.meta.url));
 for (const line of fs.readFileSync(ENV_PATH, 'utf8').split('\n')) {
   const m = line.trim().match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
   if (m) process.env[m[1]] = m[2].trim().replace(/^["']/, '').replace(/["']$/, '');
@@ -25,6 +26,13 @@ const { queryActiveContracts } = await import('../node/src/damlClient.js');
 const { runOnce: sweepTwoNotice } = await import('../node/src/sweepers/twoNoticeSweeper.js');
 
 const RUN = Date.now().toString(36);
+// Cell ids in the oracle's own format, "metno:<lat>,<lon>" with at most 4 decimals. The
+// first two decimals of the latitude name this script, the first two of the longitude
+// count the cells this run hands out, and the last two of each carry the run.
+const CELL_RUN = String(parseInt(RUN, 36) % 10000).padStart(4, '0');
+let cellCount = 0;
+const nextCell = () =>
+  `metno:0.12${CELL_RUN.slice(0, 2)},0.${String(++cellCount).padStart(2, '0')}${CELL_RUN.slice(2)}`;
 const T0 = Date.now();
 const iso = (d) => new Date(d).toISOString();
 const at = (n) => iso(T0 + n * 86400000);
@@ -79,7 +87,9 @@ const makePolicy = async (label) => {
     agreedCoverageStart: at(-200),
     coverages: [{
       coverageCode: 'FROST-COVER', productCode: 'FROST-STANDARD', perilType: 'FROST',
-      cellIds: [`cell-1434-4-${label}-${RUN}`], sumInsured: 100000,
+      cellIds: [nextCell()], sumInsured: 100000,
+      // v22: required by the API, with no default. The basis v21 applied.
+      metric: 'TEMPERATURE_C', payoutBasis: 'PB_RemainingLimit',
     }],
   });
   const id = created.policy.id;
@@ -96,13 +106,20 @@ const noticeThenPay = async (id, serviceDate) => {
   await settle(id, 'reinstatement');
 };
 
+// The package line gives the DAML_PACKAGE_ID loaded above, the package this
+// run is against, beside the name in the source tree's daml/daml.yaml. The
+// heading's vNN stays the version the article shipped in.
+const packageName = fs.readFileSync(new URL('../daml/daml.yaml', import.meta.url), 'utf8').match(/^name:\s*(\S+)/m)?.[1];
+if (!packageName) throw new Error('daml/daml.yaml has no name line');
+const PACKAGE = `\`${packageName}\` (id \`${process.env.DAML_PACKAGE_ID}\`)`;
+
 const out = [];
 const say = (s = '') => { out.push(s); console.log(s); };
 
 say('## 3q. Live verification run (v20 — the two-notice termination right, m. 1434(4))');
 say('');
 say('Through the real HTTP API against the real participant, package');
-say('`insurance-tokenization-v20`. Every notice below is served and then PAID');
+say(`${PACKAGE}. Every notice below is served and then PAID`);
 say('OFF, because that is the only way the right is ever reachable: where the');
 say('ten days elapse unpaid, m. 1434(3) has already ended the contract.');
 say('');
@@ -228,7 +245,7 @@ say('');
 say('Reproduced by `scripts/verify-m1434-4.mjs`, which drives all of the above');
 say('through the HTTP API and writes this section.');
 
-const target = new URL('../docs/m1434-4-live-run.txt', import.meta.url).pathname.replace(/^\//, '');
+const target = fileURLToPath(new URL('../docs/m1434-4-live-run.txt', import.meta.url));
 fs.writeFileSync(target, out.join('\n') + '\n');
 console.log(`\nwritten to ${target}`);
 await pool.end();

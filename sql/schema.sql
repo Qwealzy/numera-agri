@@ -182,10 +182,12 @@ CREATE TABLE insurers (
   -- activation fails loudly rather than assuming a number.
   default_grace_period_days INTEGER,
   -- The m. 1456(5) continuation window offered to a known real-right holder
-  -- at termination, per insurer. Nullable with NO default for exactly the
-  -- same reason as the column above: a statutory period is legally
-  -- constrained configuration, never a literal. A policy that names a
-  -- mortgagee and has this unset fails termination loudly.
+  -- at termination, per insurer, frozen onto the policy at its activation
+  -- (policies.mortgagee_continuation_days, migration 037). Nullable with NO
+  -- default for exactly the same reason as the column above: a statutory
+  -- period is legally constrained configuration, never a literal. A policy
+  -- that names a mortgagee and was activated while this was unset fails
+  -- termination loudly.
   mortgagee_continuation_days INTEGER,
   -- m. 1434(2)'s window. A CEILING, not a floor -- the inverse of
   -- default_grace_period_days above. The article gives the insurer a right
@@ -215,8 +217,10 @@ CREATE TABLE insurers (
   updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- webhook_url has been on insurers since the first schema and no code has ever
--- read it. It is the notification address, set by the insurer through the CLI.
+-- webhook_url has been on insurers since the first schema. It is the
+-- notification address, set by the insurer through the CLI:
+-- node/src/scripts/setWebhook.js writes it, and
+-- node/src/notifications/sender.js reads it to post each notification.
 COMMENT ON COLUMN insurers.webhook_url IS
   'The notification address, set with the CLI. May belong to a sub-processor of the insurer.';
 
@@ -224,7 +228,8 @@ COMMENT ON COLUMN insurers.webhook_url IS
 -- 2. policyholders -- the insurer's own end customers (e.g. farmers). One
 --    Canton Party per policyholder, reused across all of that
 --    policyholder's policies (never one party per policy). No IBAN or bank
---    detail here -- payment destination is a Stage 2 decision.
+--    detail here -- the platform stores no account numbers, a standing
+--    decision (migration 015).
 -- ---------------------------------------------------------------------------
 CREATE TABLE policyholders (
   id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -243,9 +248,10 @@ CREATE TABLE policyholders (
 
 -- ---------------------------------------------------------------------------
 -- 3. payout_tiers -- Module 2: the tiered payout matrix, configured per
---    insurer + product + peril. Snapshotted onto the Daml PolicyToken
---    contract at mint time so evaluation stays fully on-ledger and
---    auditable -- editing a row here only affects policies minted afterward.
+--    insurer + product + peril. Snapshotted at policy creation and at the
+--    renewal request and carried onto the Daml PolicyToken contract, so
+--    evaluation stays fully on-ledger and auditable -- editing a row here
+--    only affects a policy created, or a renewal requested, afterward.
 -- ---------------------------------------------------------------------------
 CREATE TABLE payout_tiers (
   id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -256,10 +262,36 @@ CREATE TABLE payout_tiers (
   label               TEXT NOT NULL,
   threshold_min       NUMERIC(12,4),                   -- inclusive lower bound; NULL = unbounded below
   threshold_max       NUMERIC(12,4),                   -- inclusive upper bound; NULL = unbounded above
-  payout_percentage   NUMERIC(5,2) NOT NULL CHECK (payout_percentage > 0 AND payout_percentage <= 100),
+  payout_percentage   NUMERIC(5,2) NOT NULL,
+  -- v22 (migration 036). TS_Step pays payout_percentage; TS_Linear
+  -- interpolates from pct_at_min at threshold_min to pct_at_max at
+  -- threshold_max, and payout_percentage is then the larger of the two. The
+  -- rules are Types.daml's validTier, below as CHECKs.
+  shape               TEXT NOT NULL,
+  pct_at_min          NUMERIC(5,2),
+  pct_at_max          NUMERIC(5,2),
   created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (insurer_id, product_code, peril_type, tier_order)
 );
+
+ALTER TABLE payout_tiers ADD CONSTRAINT payout_tiers_shape_known
+  CHECK (shape IN ('TS_Step', 'TS_Linear'));
+-- A step tier carries no end percentages. A linear tier needs both bounds,
+-- in order, both end percentages inside [0, 100], and payout_percentage equal
+-- to the larger end percentage -- "the highest rate this tier can pay".
+ALTER TABLE payout_tiers ADD CONSTRAINT payout_tiers_shape_fields
+  CHECK ((shape = 'TS_Step' AND pct_at_min IS NULL AND pct_at_max IS NULL)
+         OR (shape = 'TS_Linear'
+             AND threshold_min IS NOT NULL AND threshold_max IS NOT NULL
+             AND threshold_min < threshold_max
+             AND pct_at_min IS NOT NULL AND pct_at_min >= 0 AND pct_at_min <= 100
+             AND pct_at_max IS NOT NULL AND pct_at_max >= 0 AND pct_at_max <= 100
+             AND payout_percentage = GREATEST(pct_at_min, pct_at_max)));
+-- payout_percentage > 0 for a step tier. A linear tier whose two end
+-- percentages are both 0 has 0 as its highest rate, which validTier admits.
+ALTER TABLE payout_tiers ADD CONSTRAINT payout_tiers_payout_percentage_range
+  CHECK (payout_percentage <= 100
+         AND (payout_percentage > 0 OR (shape = 'TS_Linear' AND payout_percentage >= 0)));
 
 -- ---------------------------------------------------------------------------
 -- 4. policies -- created by POST /api/v1/policies (SQL only, no ledger
@@ -296,7 +328,8 @@ CREATE TABLE policies (
   -- handleActivation and written here the same time as current_version)
   -- so expirySweeper.js can query "expiry in the past" without
   -- recomputing that conversion a second time in SQL. NULL until
-  -- activated; never modified afterward in this stage.
+  -- activated; afterwards an endorsement's write-back moves it to the
+  -- re-minted token's expiry.
   expiry              TIMESTAMPTZ,
   -- Stage 3 Part 2: this policy's own grace period, if it overrides the
   -- insurer's default (insurers.default_grace_period_days). Nullable, no
@@ -314,6 +347,19 @@ CREATE TABLE policies (
   event_aggregation TEXT
     CONSTRAINT policies_event_aggregation_known
       CHECK (event_aggregation IN ('min', 'max', 'mean')),
+  -- The m. 1456(5) continuation window, frozen here at activation from
+  -- insurers.mortgagee_continuation_days (migration 037), so a later change
+  -- to the insurer's value never moves an activated policy's window. NULL
+  -- until activated; NULL after it means none was configured then, and
+  -- termination of a policy that names a mortgagee fails loudly.
+  mortgagee_continuation_days INTEGER,
+  -- m. 1434(2)'s window, frozen here at activation from
+  -- insurers.first_premium_withdrawal_days (migration 037) the same way. Its
+  -- three-month CEILING is checked where the window is used
+  -- (resolveFirstPremiumWindow, dispatcher.js), not here. NULL after
+  -- activation means none was configured then: the sweeper does not select
+  -- the policy, and a withdrawal fails loudly.
+  first_premium_withdrawal_days INTEGER,
   -- Mirrors of the token's own noticeServiceDate/noticeRecordedAt, written
   -- by dispatcher.js's handleNotice write-back. notice_service_date is the
   -- statutory service date supplied by the insurer (never system-generated);
@@ -451,8 +497,8 @@ CREATE TABLE policies (
   retroactive_cover_check_status TEXT,
   retroactive_cover_check_result JSONB,
   -- The sigortalı where distinct from the sigorta ettiren. A PRECONDITION
-  -- for m. 1454 and m. 1431(4); neither is implemented. NULL means "the
-  -- same person", the common case.
+  -- for m. 1454 and m. 1431(4); the m. 1431(4) substitution (migration 020)
+  -- acts on it. NULL means "the same person", the common case.
   insured_policyholder_id     UUID REFERENCES policyholders(id),
   -- Hash of the policy document. The document itself never reaches this
   -- platform.
@@ -475,9 +521,11 @@ CREATE TABLE policies (
   -- m. 1434(4) counts notices within one insurance period. Mirrors the
   -- token's own noticeCount, read back off the re-minted contract rather
   -- than incremented here, so SQL cannot drift from the ledger. Counting is
-  -- all that happens: the further right the paragraph gives the insurer
-  -- after a second notice is deliberately not implemented, and nothing
-  -- reads this column to act on it. Per insurance period without a reset --
+  -- all this column does: nothing reads it to act on it. The further right
+  -- the paragraph gives the insurer after a second notice, the two-notice
+  -- election (migrations 024/025), checks notice_service_dates against a
+  -- supplied period instead. Per policy, not per insurance period (see
+  -- notice_service_dates above), without a reset --
   -- a renewal is a new row and a new token, both starting at zero -- and
   -- reinstatement does NOT reset it, since paying after the first notice is
   -- exactly the case the paragraph is about.
@@ -493,8 +541,9 @@ CREATE TABLE policies (
   --
   -- enforcement_commenced_at records that the insurer says it pursued the
   -- claim "dava veya takip yoluyla". COMMENCEMENT only: whether it proved
-  -- fruitless (semeresiz) is m. 1431(4)'s trigger, a different fact, not
-  -- implemented. Its presence forecloses the deemed path.
+  -- fruitless (semeresiz) is m. 1431(4)'s trigger, a different fact,
+  -- recorded in enforcement_fruitless_at (migration 020). Its presence
+  -- forecloses the deemed path.
   --
   -- There is deliberately NO refund figure here and no analogue of
   -- unrun_days: m. 1419 returns only premiums actually paid, and in
@@ -520,12 +569,20 @@ CREATE TABLE policies (
   -- and does the arithmetic, exactly as with set-off under m. 1431(5).
   terminated_at       TIMESTAMPTZ,
   unrun_days          INTEGER,
+  -- v22 (migration 036): the two instants an archive of the token
+  -- returns. contract_ended_at is when the CONTRACT ended (the token's
+  -- expiry, or its frozen termination instant); record_closed_at is the
+  -- ledger time of the archive. Kept apart: neither stands in for the other.
+  -- NULL on a policy archived before v22 or not archived at all.
+  contract_ended_at   TIMESTAMPTZ,
+  record_closed_at    TIMESTAMPTZ,
   -- m. 1456(4) and (5). All recorded facts, never actions -- this system
   -- generates and sends no notification, and does not implement the
   -- mortgagee taking the contract over. mortgagee_notified_at is the
   -- insurer's reported date for having notified a known real-right holder;
   -- the continuation window opens at termination and its end is computed
-  -- from insurers.mortgagee_continuation_days, never a literal; the
+  -- from mortgagee_continuation_days above, frozen from the insurer's value
+  -- at activation (migration 037), never a literal; the
   -- election is recorded if one is reported, and nothing acts on it.
   mortgagee_notified_at          TIMESTAMPTZ,
   mortgagee_continuation_ends_at TIMESTAMPTZ,
@@ -591,6 +648,9 @@ ALTER TABLE policies ADD CONSTRAINT policies_two_notice_facts_together
   CHECK ((two_notice_election_at IS NULL) = (two_notice_effective_at IS NULL));
 ALTER TABLE policies ADD CONSTRAINT policies_two_notice_effect_is_deferred
   CHECK (two_notice_election_at IS NULL OR two_notice_effective_at > two_notice_election_at);
+-- v22, mirroring migration 036.
+ALTER TABLE policies ADD CONSTRAINT policies_archive_instants_together
+  CHECK ((contract_ended_at IS NULL) = (record_closed_at IS NULL));
 
 -- m. 1456(6), mirroring the token's own ensure clauses. Ordering only --
 -- deliberately NOT provided_at >= requested_at, because the outstanding state
@@ -710,6 +770,16 @@ CREATE TABLE policy_coverages (
   -- office identifier or party identity is held for any of it.
   attached_at             TIMESTAMPTZ,
   attachment_lifted_at    TIMESTAMPTZ,
+  -- v22 (migration 036). The metric code the coverage's tiers are written
+  -- for the metric -- required at the API and checked there against the codes the
+  -- oracle can supply; what a tier percentage is a percentage OF, with
+  -- no default; and the salt of the cell commitment the token and every
+  -- trigger carry, "sha256:" + hex(SHA-256(salt || cell id)). The salt
+  -- never reaches the ledger. Random, not a product value, so a default draws
+  -- it.
+  metric                  TEXT NOT NULL,
+  payout_basis            TEXT NOT NULL,
+  cell_commitment_salt    TEXT NOT NULL DEFAULT encode(gen_random_bytes(32), 'hex'),
   created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (policy_id, coverage_code)
@@ -731,6 +801,12 @@ ALTER TABLE policy_coverages ADD CONSTRAINT policy_coverages_lifting_needs_attac
   CHECK (attachment_lifted_at IS NULL OR attached_at IS NOT NULL);
 ALTER TABLE policy_coverages ADD CONSTRAINT policy_coverages_claim_needs_mortgagee
   CHECK (mortgagee_claim_amount IS NULL OR mortgagee_claim_amount >= 0);
+ALTER TABLE policy_coverages ADD CONSTRAINT policy_coverages_metric_not_empty
+  CHECK (metric <> '');
+ALTER TABLE policy_coverages ADD CONSTRAINT policy_coverages_payout_basis_known
+  CHECK (payout_basis IN ('PB_RemainingLimit', 'PB_SumInsured'));
+ALTER TABLE policy_coverages ADD CONSTRAINT policy_coverages_cell_commitment_salt_hex
+  CHECK (cell_commitment_salt ~ '^[0-9a-f]{64}$');
 CREATE INDEX idx_policies_status ON policies(status);
 CREATE INDEX idx_policies_contract_id ON policies(daml_contract_id);
 
@@ -915,6 +991,12 @@ CREATE TABLE trigger_windows (
   -- dispatcher reads, so the ledger copy and this one cannot drift (031).
   attestation_ref        TEXT,
   created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- v22 (migration 036). The event interval the trigger sends: the window
+  -- clipped to the recorded cover start and to the contract's end as SQL
+  -- records it when the window is queued. Written once, at queueing. NULL on
+  -- a row written before v22, never backfilled.
+  event_start            TIMESTAMPTZ,
+  event_end              TIMESTAMPTZ,
   CONSTRAINT trigger_windows_key UNIQUE (policy_id, coverage_code, cell_id, window_start),
   CONSTRAINT trigger_windows_ordered CHECK (window_end > window_start),
   CONSTRAINT trigger_windows_aggregation_known CHECK (aggregation IN ('min', 'max', 'mean')),
@@ -922,6 +1004,11 @@ CREATE TABLE trigger_windows (
   CONSTRAINT trigger_windows_determining_reading
     CHECK ((aggregation = 'mean') = (determining_reading_id IS NULL))
 );
+-- v22, mirroring migration 036.
+ALTER TABLE trigger_windows ADD CONSTRAINT trigger_windows_event_interval
+  CHECK ((event_start IS NULL) = (event_end IS NULL)
+         AND (event_start IS NULL
+              OR (event_start < event_end AND event_start >= window_start AND event_end <= window_end)));
 
 -- ---------------------------------------------------------------------------
 -- 4b. policy_events -- the outbox. This table, and only this table, is what
@@ -929,11 +1016,11 @@ CREATE TABLE trigger_windows (
 --    stray write to `policies` must never cause a ledger action on its
 --    own. Every ledger-changing action for every event type enters here --
 --    there is no second channel and no per-event-type table.
---    'activation', 'trigger', and 'settlement' have dispatcher handlers;
---    'endorsement', 'renewal', 'notice', and 'release' are accepted and
---    explicitly rejected when processed (not implemented, not silently
---    skipped). Idempotency is scoped per event type via three partial
---    unique indexes below, not one shared triple -- a (policy_no,
+--    Every event type has a working dispatcher handler (EVENT_HANDLERS)
+--    except 'release' and 'suspension', which are accepted and explicitly
+--    rejected when processed (notImplemented, not silently skipped).
+--    Idempotency is scoped per event type via partial unique indexes
+--    below, not one shared triple -- a (policy_no,
 --    expected_version) pair is not a unique key for a *reading* (two
 --    different readings can legitimately share it), and 'settlement' has
 --    no policy-version concept at all, only a PayoutApproved contract id.
@@ -947,7 +1034,8 @@ CREATE TABLE trigger_windows (
 -- policy_status above, and the full reasoning is there. This list is grouped
 -- by meaning; a database grown through sql/migrations/ carries the same
 -- values in the chronological order the features were built (003's five
--- first, then 006, 008, 009, 013, 016 appending). Same set, different sort.
+-- first, then 006, 008, 009, 013, 016, 020, 022, 024, 026 appending). Same
+-- set, different sort.
 -- Guarded by node/test/enumOrdering.test.mjs.
 CREATE TYPE event_type AS ENUM ('activation', 'trigger', 'settlement', 'expiry', 'notice', 'suspension', 'termination', 'termination_archive', 'mortgagee_notice', 'mortgagee_election', 'reinstatement', 'endorsement', 'renewal', 'release',
   -- m. 1434(2). Each is a distinct act with a distinct consequence, so each
@@ -972,10 +1060,10 @@ CREATE TABLE policy_events (
   policy_no              UUID NOT NULL REFERENCES policies(id),
   event_type             event_type NOT NULL,
   expected_version       INTEGER,                     -- the token version this event is built on; 0 for activation, informational for trigger, NULL (no concept) for settlement
-  reading_id             UUID REFERENCES oracle_readings(id), -- idempotency key for 'trigger' -- the same reading must never produce two payouts
+  reading_id             UUID REFERENCES oracle_readings(id), -- the 'trigger' idempotency key before migration 030, left over from then; no production path writes it -- trigger_window_id below is the key now
   trigger_window_id      UUID REFERENCES trigger_windows(id), -- idempotency key for windowed 'trigger' rows (migration 030) -- one evaluation per (coverage, cell, window)
   source_contract_id     TEXT,                         -- idempotency key for 'settlement' -- the PayoutApproved contract id being processed
-  payload                JSONB,                       -- event-specific data only -- never a name, national id, IBAN, or document content; carries observedValue/metric for 'trigger'
+  payload                JSONB,                       -- event-specific data only; the platform accepts no name, national id, IBAN or document content, so none is copied here -- but a 'settlement' row holds the insurer's free text (bank reference, failure reason, note) raw, beside its salt, and that text is whatever the insurer typed; the ledger gets only its salted digest; carries observedValue/metric for 'trigger'
   status                 outbox_status NOT NULL DEFAULT 'pending',
   resulting_contract_id  TEXT,
   error                  TEXT,
@@ -988,9 +1076,12 @@ CREATE UNIQUE INDEX idx_policy_events_activation_key
 CREATE UNIQUE INDEX idx_policy_events_trigger_key
   ON policy_events (reading_id) WHERE event_type = 'trigger';
 -- A second trigger row for one window cannot be created, whatever inserts
--- it (migration 030). Partial, so the direct-SQL trigger rows tests and
--- verify scripts still write -- keyed on reading_id, no window -- are
--- unaffected.
+-- it (migration 030). This is the trigger idempotency key;
+-- idx_policy_events_trigger_key above, on reading_id, is left over from
+-- before migration 030, and no production path writes reading_id. Partial,
+-- so a row with no window can still be inserted -- the dispatcher refuses
+-- such a row before sending anything, and only that refusal's test in
+-- node/test/dispatcher.test.mjs still writes one.
 CREATE UNIQUE INDEX idx_policy_events_trigger_window_key
   ON policy_events (trigger_window_id) WHERE event_type = 'trigger' AND trigger_window_id IS NOT NULL;
 -- In-flight only (Stage 4), like every other lifecycle event type since
@@ -1122,7 +1213,7 @@ CREATE INDEX idx_policy_documents_type ON policy_documents(document_type);
 
 -- ---------------------------------------------------------------------------
 -- 5. policy_status_history -- append-only audit trail, one row per
---    Archive+Create cycle on the Daml side (mint, partial re-mint, lapse,
+--    Archive+Create cycle on the Daml side (mint, partial re-mint, cancelled,
 --    settle, expire). Without contract keys on this PV34 network, this is
 --    the supersession chain -- the only audit trail linking a re-minted
 --    token to its predecessor. Never key anything off old/new
@@ -1136,8 +1227,10 @@ CREATE TABLE policy_status_history (
   old_status            policy_status,
   new_status            policy_status NOT NULL,
   -- The premium-default axis (Stage 3 Part 3). Both NULL on an event that
-  -- moved only the claim axis; both set on notice/suspension/
-  -- reinstatement, which move only this one and leave status unchanged.
+  -- moved only the claim axis; both set on notice, termination,
+  -- reinstatement and the first-premium and two-notice events, which move
+  -- only this one and leave status unchanged ('suspension' is dead -- see
+  -- the event_type comment).
   old_default_state     default_state,
   new_default_state     default_state,
   old_daml_contract_id  TEXT,
@@ -1147,9 +1240,11 @@ CREATE TABLE policy_status_history (
 );
 
 -- ---------------------------------------------------------------------------
--- 7. payout_events -- one row per Daml PayoutApproved contract.
---    UNIQUE(daml_contract_id) is what makes both the oracle bot and the
---    payout listener idempotent if they ever race on the same event.
+-- 7. payout_events -- one row per Daml PayoutApproved contract, plus the
+--    unrouted rows (record_kind below), which have no PayoutApproved.
+--    Inserted by dispatch/dispatcher.js (handleTrigger) and
+--    listeners/payoutListener.js; UNIQUE(daml_contract_id) is what makes
+--    both idempotent if they ever race on the same event.
 -- ---------------------------------------------------------------------------
 CREATE TABLE payout_events (
   id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1158,7 +1253,9 @@ CREATE TABLE payout_events (
   oracle_reading_id    UUID REFERENCES oracle_readings(id),
   trigger_window_id    UUID REFERENCES trigger_windows(id), -- the aggregated event that caused this payout (migration 031); names every reading, including a mean's
   tier_label           TEXT,
-  payout_percentage    NUMERIC(5,2) NOT NULL,
+  -- v22 (migration 036): the rate the ledger applied, at a Daml Decimal's ten
+  -- places, so an interpolated rate from a linear tier is held exactly.
+  payout_percentage    NUMERIC(13,10) NOT NULL,
   payout_amount        NUMERIC(14,2) NOT NULL CHECK (payout_amount > 0),
   currency             TEXT NOT NULL,
   is_full_settlement   BOOLEAN NOT NULL DEFAULT FALSE,
@@ -1202,18 +1299,32 @@ CREATE TABLE payout_events (
   -- account number is stored here or anywhere else, by design.
   bank_reference       TEXT,
   settled_at           TIMESTAMPTZ,
-  paid_role            TEXT,                        -- PDR_Insured / PDR_Mortgagee / PDR_Beneficiary, as asserted
+  paid_role            TEXT,                        -- PDR_Insured / PDR_Mortgagee / PDR_Beneficiary / PDR_EnforcementOffice, as asserted
   unpaid_reason        TEXT,                        -- UR_Waived / UR_Disputed / UR_Litigation / UR_Other
   resolution_note      TEXT,
   review_contract_id   TEXT,                        -- the ManualReviewRequired superseding it, if MarkFailed fired
   resolved_at          TIMESTAMPTZ,                 -- when a terminal state was reached; elapsed time derived, never stored
   -- The approval instant as the LEDGER recorded it: PayoutApproved.approvedAt,
   -- which is the same `now` the dispatcher hands PolicyToken_EvaluateTrigger --
-  -- not the moment the SQL row happened to be written. m. 1427 runs maturity
+  -- not the moment the SQL row happened to be written. On an unrouted row
+  -- (record_kind above), which has no PayoutApproved, it is the review
+  -- item's ManualReviewRequired.flaggedAt, the same `now` of the same
+  -- exercise. m. 1427 runs maturity
   -- from the approval, so the value carried to the insurer has to be the value
   -- on the ledger. NULL means a row written before this column existed; there
   -- is no backfill, because no true value for those rows exists off the ledger.
   approved_at          TIMESTAMPTZ,
+  -- v22 (migration 036). The event the payout was approved for, as the
+  -- trigger sent it ([event_start, event_end)), and the evidence digest
+  -- the ledger recorded on PayoutApproved; the insurer's declared
+  -- closing instant on a review item closed unpaid; and the PayoutSettled or
+  -- PayoutClosedUnpaid the resolution left on the ledger. NULL on a row
+  -- written before v22; never backfilled, the same rule as approved_at.
+  event_start          TIMESTAMPTZ,
+  event_end            TIMESTAMPTZ,
+  evidence_digest      TEXT,
+  closed_at            TIMESTAMPTZ,
+  resolution_record_contract_id TEXT,
   created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -1234,6 +1345,16 @@ ALTER TABLE payout_events ADD CONSTRAINT payout_events_contract_id_matches_kind
 ALTER TABLE payout_events ADD CONSTRAINT payout_events_remainder_needs_review
   CHECK (record_kind = 'payout'
          OR (review_contract_id IS NOT NULL AND recipient IS NULL));
+-- v22, mirroring migration 036.
+ALTER TABLE payout_events ADD CONSTRAINT payout_events_event_interval
+  CHECK ((event_start IS NULL) = (event_end IS NULL)
+         AND (event_start IS NULL OR event_start < event_end));
+ALTER TABLE payout_events ADD CONSTRAINT payout_events_evidence_digest_form
+  CHECK (evidence_digest IS NULL OR evidence_digest ~ '^sha256:[0-9a-f]{64}$');
+ALTER TABLE payout_events ADD CONSTRAINT payout_events_record_only_when_resolved
+  CHECK (resolution_record_contract_id IS NULL OR status IN ('settled', 'closed_unpaid'));
+ALTER TABLE payout_events ADD CONSTRAINT payout_events_closed_at_only_when_closed_unpaid
+  CHECK (closed_at IS NULL OR status = 'closed_unpaid');
 
 -- The unrouted remainders, findable. A queue a human has to work: m. 1456(3)
 -- makes leaving one unattended the insurer's exposure, not untidiness.
@@ -1264,7 +1385,8 @@ CREATE INDEX idx_payout_events_status ON payout_events(status);
 --
 --    NOT a policy_events row. That table is the outbox for ledger-changing
 --    actions and forbids retry on purpose (README "One outbox...",
---    dispatch/dispatcher.js:6-12, :2334-2336): a create or an exercise that
+--    dispatch/dispatcher.js's header comment on the outbox and
+--    processEvent's "never auto-retried" comment): a create or an exercise that
 --    already succeeded must never be attempted twice. An HTTPS notification is
 --    the opposite kind of work -- it has to be retried until it lands. So it
 --    gets a table of its own, run with the same discipline (a status-transition

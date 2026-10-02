@@ -8,16 +8,26 @@ import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { pool } from '../src/db.js';
 import { config } from '../src/config.js';
-import { allocateParty, queryActiveContracts, exerciseChoice, listUserRights, getLedgerEnd } from '../src/damlClient.js';
-import { runOnce, pgDateToDateString, policyTermInstant } from '../src/dispatch/dispatcher.js';
+import { allocateParty, queryActiveContracts, exerciseChoice, listUserRights, getLedgerEnd, revokeUserRights } from '../src/damlClient.js';
+import { runOnce, pgDateToDateString, policyTermInstant, EVENT_HANDLERS } from '../src/dispatch/dispatcher.js';
+import { newTextSalt, saltedDigest, matchesSaltedDigest } from '../src/dispatch/ledgerText.js';
+import { createApp } from '../src/app.js';
+import { readPolicyAsRoles } from '../src/routes/debug.js';
+import { buildPolicyRecord } from '../src/notifications/policyRecord.js';
 import { runOnce as sweepFirstPremium } from '../src/sweepers/firstPremiumSweeper.js';
 import { runOnce as sweepTwoNotice } from '../src/sweepers/twoNoticeSweeper.js';
+import { insertWindowedTrigger, deleteWindowedTriggerRows } from '../test-support/windowedTrigger.mjs';
+import { windowFor } from '../src/oracle/eventWindow.js';
 
 // Runs against the real, already-running Postgres + Canton LocalNet (no
 // mocks) -- consistent with how the rest of this project is verified.
 
 let insurerId;
 let insurerParty;
+
+// Every party this file allocates with a CanActAs, so after() can take each
+// grant back: left behind, they count toward the ledger user's rights cap.
+const grantedActAs = [];
 
 // policies.document_hash is required, as a SHA-256 in lowercase hex (migration
 // 034), and these fixtures write policies directly.
@@ -29,6 +39,7 @@ before(async () => {
     `test-insurer-${crypto.randomUUID()}`,
     { grantActAs: true }
   );
+  grantedActAs.push(insurerPartyId);
   // Stage 3 Part 1: this fixture never allocated an oracle_operator_party
   // before -- harmless while every test here only ever exercised
   // handleActivation, but handleTrigger's actAs comes from this column, so
@@ -40,6 +51,7 @@ before(async () => {
     `test-oracle-operator-${crypto.randomUUID()}`,
     { grantActAs: true }
   );
+  grantedActAs.push(oracleOperatorPartyId);
   // Stage 3 Part 2: default_grace_period_days is required for activation to
   // succeed at all now (handleActivation refuses to mint a policy whose
   // grace period is configured nowhere -- see resolveGracePeriodDays). 14 is
@@ -56,9 +68,9 @@ before(async () => {
   insurerParty = insurerPartyId;
   await pool.query(
     `INSERT INTO payout_tiers
-       (insurer_id, product_code, peril_type, tier_order, label, threshold_min, threshold_max, payout_percentage)
-     VALUES ($1, 'TEST-PRODUCT', 'TEST-PERIL', 1, 'test tier', -2.0, 0.0, 25.00),
-            ($1, 'TEST-PRODUCT', 'TEST-PERIL', 2, 'test total loss', NULL, -4.0, 100.00)`,
+       (insurer_id, product_code, peril_type, tier_order, label, threshold_min, threshold_max, payout_percentage, shape)
+     VALUES ($1, 'TEST-PRODUCT', 'TEST-PERIL', 1, 'test tier', -2.0, 0.0, 25.00, 'TS_Step'),
+            ($1, 'TEST-PRODUCT', 'TEST-PERIL', 2, 'test total loss', NULL, -4.0, 100.00, 'TS_Step')`,
     [insurerId]
   );
 });
@@ -66,14 +78,16 @@ before(async () => {
 // Removes every row this file created, in FK dependency order, so a suite run
 // leaves the database as it found it.
 //
-// This exists for one screen: a fixture policy carrying `fake-cid` (or no
-// contract id) while still `active` is exactly what /debug/dashboard reports
-// as ORPHAN_SQL, so every run used to add noise to the one view that says
-// whether the system is healthy. The orphan detection is right -- it was the
-// fixtures that were wrong.
+// The tests that write run against their own marked test database,
+// and the leak gate (leakGate.test.mjs) fails the run on any row left in it,
+// so each writing test file removes its own. When this was written
+// the tests still wrote to the working database, where a fixture policy
+// carrying `fake-cid` (or no contract id) while still `active` read as
+// ORPHAN_SQL on /debug/dashboard; that page reads the working database, so
+// these rows no longer reach it.
 //
-// Scoped by this file's own insurerId, so the three test files cannot delete
-// each other's rows, and nothing outside the fixtures is touched. Deleting by
+// Scoped by this file's own insurerId, so each writing test file can delete
+// only its own rows, and nothing outside the fixtures is touched. Deleting by
 // insurer also sweeps the role registry whole, which matters: the v13 round
 // showed a mortgagee's or beneficiary's `policyholders` row survives a
 // policyholder-only sweep as residue.
@@ -84,8 +98,10 @@ before(async () => {
 // two rows together) which must be nulled before any delete.
 //
 // It does NOT revoke the Canton parties allocated during a run -- those are
-// participant state, not rows, and revoking them is the package-migration
-// cleanup step.
+// participant state, not rows, and they stay. The CanActAs rights this file
+// granted them are revoked by revokeFixtureRights below, after the archive and
+// this delete; the package-migration cleanup still covers the rights
+// that earlier runs left behind.
 async function removeFixtureRows() {
   if (!insurerId) return;
   const client = await pool.connect();
@@ -103,6 +119,10 @@ async function removeFixtureRows() {
     await client.query(`DELETE FROM payout_notifications WHERE payout_event_id IN (SELECT id FROM payout_events WHERE policy_id IN (${mine}))`, [insurerId]);
     await client.query(`DELETE FROM payout_events WHERE policy_id IN (${mine})`, [insurerId]);
     await client.query(`DELETE FROM policy_events WHERE policy_no IN (${mine})`, [insurerId]);
+    // v22: the triggers here are windows with stored evidence
+    // (test-support/windowedTrigger.mjs), so their windows, readings, evidence
+    // rows and responses go too, after the payout and outbox rows naming them.
+    await deleteWindowedTriggerRows(client, (await client.query(mine, [insurerId])).rows.map((r) => r.id));
     for (const t of ['policy_documents', 'policy_status_history', 'policy_coverages', 'oracle_readings']) {
       await client.query(`DELETE FROM ${t} WHERE policy_id IN (${mine})`, [insurerId]);
     }
@@ -123,15 +143,19 @@ async function removeFixtureRows() {
 }
 
 // Unlike the two sweeper files, this one mints REAL tokens. Deleting its SQL
-// rows without archiving those contracts would just trade ORPHAN_SQL for
-// ORPHAN_LEDGER on the same dashboard -- a live contract with no SQL row is
-// equally a reconciliation failure. So the ledger is cleared first, then SQL.
+// rows without archiving those contracts would leave them live in the ledger's
+// active contract set, which is shared -- the test database is the tests' own,
+// the participant is not -- and a live contract with no SQL row is a
+// reconciliation failure. So the ledger is cleared first, then SQL.
 async function archiveFixtureContracts() {
   if (!insurerParty) return;
   for (const [moduleName, entityName] of [
     ['Insurance.PolicyToken', 'PolicyToken'],
     ['Insurance.PayoutBridge', 'PayoutApproved'],
     ['Insurance.PayoutBridge', 'ManualReviewRequired'],
+    // v22: the records a settlement or a close-unpaid leaves.
+    ['Insurance.PayoutBridge', 'PayoutSettled'],
+    ['Insurance.PayoutBridge', 'PayoutClosedUnpaid'],
   ]) {
     let entries = [];
     try {
@@ -160,11 +184,33 @@ async function archiveFixtureContracts() {
   }
 }
 
+// The same archive also runs at the start of each section's first ledger test,
+// not only in after(): every contract this file mints is seen by one fixture
+// insurer party, and a party past the participant's 200-element list cap fails
+// every active-contract read made for it (413, the read-limit
+// incident: the read path has no paging). No test reads a contract another
+// test minted, and the two sweepers that read every policy of the insurer run
+// inside their own section, so a section's contracts are not needed once the
+// next section starts. The distinct-oracle-party pair, inside a loop, is left to the section
+// after it. The SQL rows stay until after().
+
+// After the archive, which acts as these parties. Loud if the ledger takes back
+// fewer than it was asked to.
+async function revokeFixtureRights() {
+  if (grantedActAs.length === 0) return;
+  const rights = grantedActAs.map((party) => ({ kind: { CanActAs: { value: { party } } } }));
+  const revoked = await revokeUserRights(config.daml.unsafeJwtSub, rights);
+  if (revoked.length !== rights.length) {
+    throw new Error(`[fixture cleanup] asked to revoke ${rights.length} CanActAs, the ledger revoked ${revoked.length}`);
+  }
+}
+
 // node:test runs after() even when tests fail, so a failing run cleans up too.
 after(async () => {
   try {
     await archiveFixtureContracts();
     await removeFixtureRows();
+    await revokeFixtureRights();
   } finally {
     await pool.end();
   }
@@ -191,7 +237,10 @@ async function createPolicyholder() {
 // payout_tiers_snapshot moved from `policies` to `policy_coverages` --
 // this fixture now inserts one coverage row too, same values as before,
 // just relocated.
-async function createPolicy(policyholderId) {
+// v22: the ledger refuses an expiry archive before the token's expiry,
+// so a test that expires a policy mints it with a term that has already
+// ended: `endDate` (YYYY-MM-DD), PAST_END_DATE below.
+async function createPolicy(policyholderId, { endDate = '2027-03-31' } = {}) {
   // created_at is pinned rather than left to now(): the m. 1458 check reads
   // "backdated" as cover starting before the CONTRACT WAS MADE, so a fixture
   // whose cover start is a fixed date and whose formation is the wall clock
@@ -200,18 +249,18 @@ async function createPolicy(policyholderId) {
     `INSERT INTO policies
        (insurer_id, policyholder_id, premium_amount, currency, start_date, end_date, status,
         coverage_began_at, coverage_start_basis, created_at, document_hash)
-     VALUES ($1,$2,500,'TRY','2026-09-01','2027-03-31','pending_mint','2026-09-01','CSB_AgreedWithoutPayment','2026-08-01',$3)
+     VALUES ($1,$2,500,'TRY','2026-09-01',$4,'pending_mint','2026-09-01','CSB_AgreedWithoutPayment','2026-08-01',$3)
      RETURNING *`,
-    [insurerId, policyholderId, DOCUMENT_HASH]
+    [insurerId, policyholderId, DOCUMENT_HASH, endDate]
   );
   const policy = rows[0];
   await pool.query(
     `INSERT INTO policy_coverages
        (policy_id, coverage_code, product_code, peril_type, cell_ids,
-        sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination)
+        sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination, metric, payout_basis)
      VALUES ($1,'TEST-COVERAGE','TEST-PRODUCT','TEST-PERIL','["cell-test"]',10000,10000,
-       '[{"tierOrder":1,"label":"test tier","minValue":"-2.0","maxValue":"0.0","payoutPct":"25.0"},{"tierOrder":2,"label":"test total loss","minValue":null,"maxValue":"-4.0","payoutPct":"100.0"}]',
-       '["PDR_Insured"]')`,
+       '[{"tierOrder":1,"label":"test tier","minValue":"-2.0","maxValue":"0.0","payoutPct":"25.0","shape":"TS_Step","pctAtMin":null,"pctAtMax":null},{"tierOrder":2,"label":"test total loss","minValue":null,"maxValue":"-4.0","payoutPct":"100.0","shape":"TS_Step","pctAtMin":null,"pctAtMax":null}]',
+       '["PDR_Insured"]','TEMPERATURE_C','PB_RemainingLimit')`,
     [policy.id]
   );
   return policy;
@@ -233,10 +282,10 @@ async function addSecondCoverage(policyId) {
   await pool.query(
     `INSERT INTO policy_coverages
        (policy_id, coverage_code, product_code, peril_type, cell_ids,
-        sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination)
+        sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination, metric, payout_basis)
      VALUES ($1,'TEST-COVERAGE-2','TEST-PRODUCT','TEST-PERIL','["cell-test-2"]',5000,5000,
-       '[{"tierOrder":1,"label":"test tier","minValue":"-2.0","maxValue":"0.0","payoutPct":"25.0"},{"tierOrder":2,"label":"test total loss","minValue":null,"maxValue":"-4.0","payoutPct":"100.0"}]',
-       '["PDR_Insured"]')`,
+       '[{"tierOrder":1,"label":"test tier","minValue":"-2.0","maxValue":"0.0","payoutPct":"25.0","shape":"TS_Step","pctAtMin":null,"pctAtMax":null},{"tierOrder":2,"label":"test total loss","minValue":null,"maxValue":"-4.0","payoutPct":"100.0","shape":"TS_Step","pctAtMin":null,"pctAtMax":null}]',
+       '["PDR_Insured"]','TEMPERATURE_C','PB_RemainingLimit')`,
     [policyId]
   );
 }
@@ -282,25 +331,32 @@ async function activateAndServeNotice(policyId, serviceDate) {
   return rows[0];
 }
 
-async function insertTriggerReading(policyId, observedValue) {
-  const reading = (
-    await pool.query(
-      `INSERT INTO oracle_readings (policy_id, coverage_code, cell_id, metric, value, measured_at, source)
-       VALUES ($1,'TEST-COVERAGE','cell-test','TEMPERATURE_C',$2,now(),'test-fixture') RETURNING id`,
-      [policyId, observedValue]
-    )
-  ).rows[0];
-  await pool.query(
-    `INSERT INTO policy_events (policy_no, event_type, expected_version, reading_id, payload)
-     VALUES ($1, 'trigger', 1, $2, $3)`,
-    [
-      policyId,
-      reading.id,
-      JSON.stringify({ observedValue, metric: 'TEMPERATURE_C', coverageCode: 'TEST-COVERAGE' }),
-    ]
+// v22: a trigger reaches the ledger only through a window with its event
+// interval and stored evidence (test-support/windowedTrigger.mjs), so this
+// writes one on TEST-COVERAGE's own cell. The interval is an hour that ended
+// a minute ago; each further call on the same policy an hour earlier, since a
+// policy has one window per start. `eventEnd` fixes the end where a test
+// needs a particular instant (before a notice deadline, or an expiry).
+// Returns the trigger's outbox row id.
+const triggerWindowsWritten = new Map();
+async function insertTriggerReading(policyId, observedValue, { eventEnd } = {}) {
+  const { rows: [coverage] } = await pool.query(
+    `SELECT cell_ids FROM policy_coverages WHERE policy_id = $1 AND coverage_code = 'TEST-COVERAGE'`,
+    [policyId]
   );
-  return reading.id;
+  const earlier = triggerWindowsWritten.get(policyId) ?? 0;
+  triggerWindowsWritten.set(policyId, earlier + 1);
+  const end = eventEnd ? new Date(eventEnd) : new Date(Date.now() - 60 * 1000 - earlier * 60 * 60 * 1000);
+  const { eventId } = await insertWindowedTrigger(pool, {
+    policyId, coverageCode: 'TEST-COVERAGE', cellId: coverage.cell_ids[0], value: observedValue,
+    eventStart: new Date(end.getTime() - 60 * 60 * 1000), eventEnd: end,
+  });
+  return eventId;
 }
+
+// A term that has ended: two days ago, as a DATE, so the token's expiry (noon
+// Istanbul on it) is in the past whatever the hour this runs at.
+const PAST_END_DATE = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
 test('activation mints exactly one token', async () => {
   const ph = await createPolicyholder();
@@ -334,7 +390,7 @@ test('a duplicate policy_events row is a no-op', async () => {
   ).rows[0].daml_contract_id;
 
   // Same write routes/policies.js's activate endpoint does on a retry --
-  // ON CONFLICT on (policy_no, event_type, expected_version).
+  // ON CONFLICT on (policy_no, expected_version) WHERE event_type = 'activation'.
   await activate(policy.id);
   await runOnce();
 
@@ -430,7 +486,7 @@ test('unimplemented event types are rejected explicitly, not silently skipped', 
 
 test('an expired multi-coverage policy is archived and marked expired', async () => {
   const ph = await createPolicyholder();
-  const policy = await createPolicy(ph.id);
+  const policy = await createPolicy(ph.id, { endDate: PAST_END_DATE });
   await addSecondCoverage(policy.id);
   await activate(policy.id);
   await runOnce();
@@ -442,9 +498,17 @@ test('an expired multi-coverage policy is archived and marked expired', async ()
   await insertExpiryEvent(policy.id);
   await runOnce();
 
-  const { rows } = await pool.query('SELECT status, daml_contract_id FROM policies WHERE id = $1', [policy.id]);
+  const { rows } = await pool.query(
+    'SELECT status, daml_contract_id, expiry, contract_ended_at, record_closed_at FROM policies WHERE id = $1',
+    [policy.id]
+  );
   assert.equal(rows[0].status, 'expired');
   assert.equal(rows[0].daml_contract_id, null);
+  // v22: the two instants the archive returned, kept apart. The
+  // contract ended at its expiry; the record closed at the ledger time of the
+  // archive, which comes later.
+  assert.equal(new Date(rows[0].contract_ended_at).getTime(), new Date(rows[0].expiry).getTime());
+  assert.ok(new Date(rows[0].record_closed_at) > new Date(rows[0].contract_ended_at), 'archived after the term ended');
 
   const event = await pool.query(`SELECT * FROM policy_events WHERE policy_no = $1 AND event_type = 'expiry'`, [
     policy.id,
@@ -453,34 +517,41 @@ test('an expired multi-coverage policy is archived and marked expired', async ()
   assert.equal(event.rows[0].resulting_contract_id, beforeExpiry.daml_contract_id);
 });
 
-test('a partially-paid policy that expires still becomes expired and its remaining limit lapses', async () => {
+// v22: the ledger refuses an expiry archive while its own time is before
+// the token's expiry, with no allowance -- the row fails, nothing is archived.
+test('an expiry archive before the term has ended is refused by the ledger', async () => {
   const ph = await createPolicyholder();
   const policy = await createPolicy(ph.id);
   await activate(policy.id);
   await runOnce();
 
+  await insertExpiryEvent(policy.id);
+  await runOnce();
+
+  const event = (await pool.query(`SELECT * FROM policy_events WHERE policy_no = $1 AND event_type = 'expiry'`, [
+    policy.id,
+  ])).rows[0];
+  assert.equal(event.status, 'failed');
+  assert.match(event.error, /the term has not ended yet on the ledger clock/);
+  const { rows } = await pool.query('SELECT status, daml_contract_id, contract_ended_at FROM policies WHERE id = $1', [policy.id]);
+  assert.equal(rows[0].status, 'active');
+  assert.ok(rows[0].daml_contract_id, 'the token is still live');
+  assert.equal(rows[0].contract_ended_at, null);
+});
+
+test('a partially-paid policy that expires still becomes expired and its remaining limit lapses', async () => {
+  const ph = await createPolicyholder();
+  const policy = await createPolicy(ph.id, { endDate: PAST_END_DATE });
+  await activate(policy.id);
+  await runOnce();
+
   // Mild-frost reading on TEST-COVERAGE: 25% payout, re-mints the token
   // with a reduced remainingLimit -- the "still has limit left" state this
-  // test needs before expiring it. attestationRef is Text on the Daml side
-  // (not Optional), so this needs a real oracle_readings row to point
-  // reading_id at, same as oracleBot.js's own insert -- not just a bare
-  // trigger row.
-  const reading = (
-    await pool.query(
-      `INSERT INTO oracle_readings (policy_id, coverage_code, cell_id, metric, value, measured_at, source)
-       VALUES ($1,'TEST-COVERAGE','cell-test','TEMPERATURE_C',-1,now(),'test-fixture') RETURNING id`,
-      [policy.id]
-    )
-  ).rows[0];
-  await pool.query(
-    `INSERT INTO policy_events (policy_no, event_type, expected_version, reading_id, payload)
-     VALUES ($1, 'trigger', 1, $2, $3)`,
-    [
-      policy.id,
-      reading.id,
-      JSON.stringify({ observedValue: -1, metric: 'TEMPERATURE_C', coverageCode: 'TEST-COVERAGE' }),
-    ]
-  );
+  // test needs before expiring it. Since v22 the trigger is a window with its
+  // event interval and stored evidence, and the interval has to lie inside
+  // cover, so it ends an hour before the (past) expiry.
+  const { expiry } = (await pool.query('SELECT expiry FROM policies WHERE id = $1', [policy.id])).rows[0];
+  await insertTriggerReading(policy.id, -1, { eventEnd: new Date(new Date(expiry).getTime() - 60 * 60 * 1000) });
   await runOnce();
 
   const partiallyPaid = (
@@ -551,7 +622,11 @@ test('a notice event with no serviceDate fails loudly instead of defaulting one'
 test('a trigger during the grace period pays normally', async () => {
   const ph = await createPolicyholder();
   const policy = await createPolicy(ph.id);
-  await activateAndServeNotice(policy.id, '2026-08-01T09:00:00.000Z');
+  // Served two days ago against the fixture's 14-day period: still running.
+  // v22 holds a window that ends after a passed deadline while no outcome
+  // is recorded (oracleBot.js coverBoundFor, dispatcher.js claimNext), so the
+  // notice here is one whose period has not elapsed.
+  await activateAndServeNotice(policy.id, new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString());
 
   await insertTriggerReading(policy.id, -1);
   await runOnce();
@@ -576,8 +651,9 @@ test('a trigger during the grace period pays normally', async () => {
   const payout = await pool.query('SELECT * FROM payout_events WHERE policy_id = $1', [policy.id]);
   assert.equal(payout.rows.length, 1, 'a payout during the grace period is recorded exactly as any other');
 
-  // Migration 035. approved_at is the LEDGER's instant -- the same `now` the
-  // dispatcher handed the choice -- not the moment the SQL row was written.
+  // Migration 035. approved_at is the LEDGER's instant -- since v22 the
+  // ledger time the choice stamped, read back off the created contract -- not
+  // the moment the SQL row was written. Compared as instants.
   const onLedger = (await ledgerContracts('Insurance.PayoutBridge', 'PayoutApproved'))
     .find((c) => c.contractId === payout.rows[0].daml_contract_id);
   assert.ok(onLedger, 'the payout row must name a PayoutApproved that is really on the ledger');
@@ -598,6 +674,60 @@ test('a trigger during the grace period pays normally', async () => {
     queued.rows,
     [{ kind: 'payout_approved', status: 'pending', attempt_count: 0 }],
     'an approved payout queues exactly one payout_approved notification'
+  );
+});
+
+// The ledger refuses a trigger whose eventEnd is after the transaction's
+// ledger time, and the dispatcher re-sends that refusal alone on
+// ORACLE_TRIGGER_UNENDED_RETRY_SCHEDULE_MS under the same command id. The
+// window here ends 3 seconds after this process's clock reads it, so the
+// participant refuses the first attempt unless its clock runs more than 3
+// seconds ahead of this one -- which the assertion below would report, not
+// hide.
+test('a trigger the ledger refuses only because its event has not ended yet is re-sent, and pays once it has', async () => {
+  const ph = await createPolicyholder();
+  const policy = await createPolicy(ph.id);
+  await activate(policy.id);
+  await runOnce();
+
+  const eventEnd = new Date(Date.now() + 3000);
+  const eventId = await insertTriggerReading(policy.id, -1, { eventEnd });
+  const warned = [];
+  const warn = console.warn;
+  console.warn = (...args) => {
+    warned.push(args.join(' '));
+    warn(...args);
+  };
+  try {
+    await runOnce();
+  } finally {
+    console.warn = warn;
+  }
+
+  const row = (await pool.query('SELECT status, error FROM policy_events WHERE id = $1', [eventId])).rows[0];
+  assert.equal(row.status, 'done', row.error ?? '');
+  assert.ok(
+    warned.some((w) => w.includes('the event has not ended yet on its clock')),
+    'the participant refused at least the first attempt, and the dispatcher said so'
+  );
+
+  const evidence = (
+    await pool.query('SELECT command_id FROM attested_evidence WHERE policy_event_id = $1', [eventId])
+  ).rows;
+  assert.deepEqual(
+    evidence.map((e) => e.command_id),
+    [`exercise-${eventId}`],
+    'one evidence row, written once before the first attempt, under the one command id'
+  );
+
+  const payouts = (await pool.query('SELECT * FROM payout_events WHERE policy_id = $1', [policy.id])).rows;
+  assert.equal(payouts.length, 1, 'one payout, from the one attempt the ledger accepted');
+  const onLedger = (await ledgerContracts('Insurance.PayoutBridge', 'PayoutApproved'))
+    .find((c) => c.contractId === payouts[0].daml_contract_id);
+  assert.ok(onLedger, 'the payout row names a PayoutApproved that is really on the ledger');
+  assert.ok(
+    new Date(onLedger.createArgument.approvedAt).getTime() >= eventEnd.getTime(),
+    'approved on the ledger at or after the event ended'
   );
 });
 
@@ -689,16 +819,19 @@ test('a trigger after termination is rejected and leaves a failed row recording 
   const readingId = await insertTriggerReading(policy.id, -1);
   await runOnce();
 
-  const event = await pool.query(`SELECT * FROM policy_events WHERE reading_id = $1`, [readingId]);
+  const event = await pool.query(`SELECT * FROM policy_events WHERE id = $1`, [readingId]);
   assert.equal(event.rows[0].status, 'failed', 'the attempt must never be silently skipped');
   assert.equal(
     event.rows[0].payload.observedValue,
     -1,
     'the observed value stays on the row, so what was seen is recoverable'
   );
+  // v22: a terminated contract is judged by the event's time, so
+  // the refusal names the interval against coverageValidThrough, which
+  // termination moved to the termination instant.
   assert.match(
     event.rows[0].error,
-    /terminated for premium default/i,
+    /the event ends after coverageValidThrough/i,
     'the reason the ledger refused must be readable on the failed row'
   );
 
@@ -721,7 +854,10 @@ test('a payout raised during the notice period survives termination and gates th
   await activateAndServeNotice(policy.id, serviceDate);
 
   // A loss DURING the notice period: payable, exactly as on any other policy.
-  await insertTriggerReading(policy.id, -1);
+  // Its window ends an hour before the deadline (service date + 14 days),
+  // which has passed: v22 holds only a window that ends AFTER it.
+  const deadline = new Date(new Date(serviceDate).getTime() + 14 * 24 * 60 * 60 * 1000);
+  await insertTriggerReading(policy.id, -1, { eventEnd: new Date(deadline.getTime() - 60 * 60 * 1000) });
   await runOnce();
   const payout = (await pool.query('SELECT * FROM payout_events WHERE policy_id = $1', [policy.id])).rows[0];
   assert.ok(payout, 'a loss during the notice period must pay');
@@ -775,6 +911,11 @@ test('a payout raised during the notice period survives termination and gates th
   assert.equal(rows[0].status, 'cancelled');
   assert.equal(rows[0].daml_contract_id, null, 'the token is burned only once every payout has closed');
   assert.equal(rows[0].default_state, 'terminated', 'the termination itself stays on the record');
+  // v22: the contract ended at the frozen termination instant; the
+  // record closed at the archive's ledger time, later. Neither stands in for
+  // the other.
+  assert.equal(new Date(rows[0].contract_ended_at).getTime(), new Date(rows[0].terminated_at).getTime());
+  assert.ok(new Date(rows[0].record_closed_at) > new Date(rows[0].contract_ended_at));
 });
 
 // The ten-day period is configuration, never a literal -- but a value BELOW
@@ -871,12 +1012,12 @@ test('payment within the notice period reinstates and no termination is ever rec
 // sends no notification, and does not implement the mortgagee taking the
 // contract over.
 //
-// This tests the reachable half. `dispatcher.js` mints every token with
-// `mortgagee: null` -- there is no mortgagee intake anywhere in this
-// platform, a Stage 1 decision this task did not change -- so on any policy
-// the system can actually create, the m. 1456 path is unreachable and must
-// refuse rather than record a notification to nobody. The positive path is
-// proven at the ledger layer, where a token can be minted WITH a mortgagee:
+// This tests only the no-mortgagee path: the refusals, and a termination
+// that opens no window. There the m. 1456 path must refuse rather than
+// record a notification to nobody. The
+// positive path is proven in this file, by 'the m. 1456 flows run end to end
+// on a policy that has a mortgagee',
+// and at the ledger layer:
 // test_mortgageeNoticeWindowAndElectionAreRecorded in InsuranceTests.daml
 // walks notice -> mortgagee notice -> termination -> election and asserts
 // the window and the election are recorded and that ME_Continue revives
@@ -943,6 +1084,7 @@ test('the mortgagee path refuses on a policy with no mortgagee, and termination 
 // again could never be noticed a second time. Migration 010 re-scoped that
 // index to in-flight rows only.
 test('a reinstated policy can receive a second notice', async () => {
+  await archiveFixtureContracts(); // the earlier sections' contracts: see the note after archiveFixtureContracts
   const ph = await createPolicyholder();
   const policy = await createPolicy(ph.id);
   await activateAndServeNotice(policy.id, '2026-08-01T09:00:00.000Z');
@@ -998,6 +1140,7 @@ async function coveragesOf(policyId) {
 }
 
 test('raising a sum insured raises the remaining limit by the same delta', async () => {
+  await archiveFixtureContracts(); // the earlier sections' contracts: see the note after archiveFixtureContracts
   const ph = await createPolicyholder();
   const policy = await createPolicy(ph.id);
   await activate(policy.id);
@@ -1027,6 +1170,7 @@ test('raising a sum insured raises the remaining limit by the same delta', async
   assert.equal(rows[0].last_amendment_reason, 'sum_insured_increase', 'the reason is recorded');
 });
 
+const ADDED_SALT = newTextSalt();
 test('an endorsement can add and remove coverages', async () => {
   const ph = await createPolicyholder();
   const policy = await createPolicy(ph.id);
@@ -1046,9 +1190,14 @@ test('an endorsement can add and remove coverages', async () => {
         cellIds: ['cell-test-3'],
         sumInsured: 8000,
         payoutTiers: [
-          { tierOrder: 1, label: 'test tier', minValue: '-2.0', maxValue: '0.0', payoutPct: '25.0' },
+          { tierOrder: 1, label: 'test tier', minValue: '-2.0', maxValue: '0.0', payoutPct: '25.0', shape: 'TS_Step', pctAtMin: null, pctAtMax: null },
         ],
-        payoutDestination: ['PDR_Insured'],
+        // v22: the coverage's terms, and the salt the route draws when it
+        // queues the row (routes/policies.js); this payload is written
+        // directly, so it carries its own.
+        metric: 'TEMPERATURE_C',
+        payoutBasis: 'PB_SumInsured',
+        cellCommitmentSalt: ADDED_SALT,
       },
     ],
   });
@@ -1062,6 +1211,100 @@ test('an endorsement can add and remove coverages', async () => {
   assert.equal(Number(added.remaining_limit), 8000, 'a new coverage starts with its full limit');
   assert.equal(added.product_code, 'TEST-PRODUCT', 'SQL-side metadata comes from the endorsement input');
   assert.deepEqual(added.cell_ids, ['cell-test-3']);
+  // v22: the terms and the salt are on the row, and the token commits to the
+  // added coverage's cell with that salt.
+  assert.equal(added.metric, 'TEMPERATURE_C');
+  assert.equal(added.payout_basis, 'PB_SumInsured');
+  assert.equal(added.cell_commitment_salt, ADDED_SALT);
+  const { rows: [row] } = await pool.query('SELECT daml_contract_id FROM policies WHERE id = $1', [policy.id]);
+  const token = (await ledgerContracts('Insurance.PolicyToken', 'PolicyToken')).find((c) => c.contractId === row.daml_contract_id);
+  const onToken = token.createArgument.coverages.find((c) => c.coverageCode === 'TEST-COVERAGE-3');
+  assert.equal(onToken.cellCommitment, saltedDigest(ADDED_SALT, 'cell-test-3'));
+  assert.equal(onToken.payoutBasis, 'PB_SumInsured');
+});
+
+// Add-and-remove rules: a code both removed and added, and the removal of a
+// coverage attached now (m. 1457), fail before the ledger; the added coverage
+// would carry no attachment. A removal under a new code with no attachment
+// still runs, and a trigger on the added coverage passes its commitment check.
+const replacementCoverage = (coverageCode, cellCommitmentSalt) => ({
+  coverageCode,
+  productCode: 'TEST-PRODUCT',
+  perilType: 'TEST-PERIL',
+  cellIds: ['cell-test-3'],
+  sumInsured: 8000,
+  payoutTiers: [
+    { tierOrder: 1, label: 'test tier', minValue: '-2.0', maxValue: '0.0', payoutPct: '25.0', shape: 'TS_Step', pctAtMin: null, pctAtMax: null },
+  ],
+  metric: 'TEMPERATURE_C',
+  payoutBasis: 'PB_SumInsured',
+  cellCommitmentSalt,
+});
+
+async function assertReplacementRefused(addedCode, message, arrange = async () => {}) {
+  const ph = await createPolicyholder();
+  const policy = await createPolicy(ph.id);
+  await activate(policy.id);
+  await runOnce();
+  await arrange(policy.id);
+  const { rows: [before] } = await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id]);
+
+  const event = await endorse(policy.id, {
+    reason: 'ER_TierChange',
+    coverageCodesToRemove: ['TEST-COVERAGE'],
+    coveragesToAdd: [replacementCoverage(addedCode, newTextSalt())],
+  });
+  assert.equal(event.status, 'failed', 'the row is refused');
+  assert.match(event.error, message);
+  assert.ok(event.error.includes('TEST-COVERAGE'), `names the coverage: ${event.error}`);
+
+  const { rows: [after] } = await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id]);
+  assert.equal(after.daml_contract_id, before.daml_contract_id, 'nothing reached the ledger');
+  assert.equal(after.current_version, before.current_version);
+}
+
+test('an endorsement row removing and adding the same coverage code fails before the ledger', async () => {
+  await assertReplacementRefused('TEST-COVERAGE', /different code/);
+});
+
+test('an endorsement row removing a coverage that is attached now fails before the ledger, even with a new code added', async () => {
+  await assertReplacementRefused('TEST-COVERAGE-3', /attach/, async (policyId) => {
+    await pool.query(
+      `UPDATE policy_coverages SET attached_at = now() - interval '1 day'
+        WHERE policy_id = $1 AND coverage_code = 'TEST-COVERAGE'`,
+      [policyId]
+    );
+  });
+});
+
+test('an endorsement row removing a coverage with no attachment and adding one under a new code runs, and a trigger on the added coverage pays', async () => {
+  const ph = await createPolicyholder();
+  const policy = await createPolicy(ph.id);
+  await activate(policy.id);
+  await runOnce();
+
+  const salt = newTextSalt();
+  const event = await endorse(policy.id, {
+    reason: 'ER_TierChange',
+    coverageCodesToRemove: ['TEST-COVERAGE'],
+    coveragesToAdd: [replacementCoverage('TEST-COVERAGE-3', salt)],
+  });
+  assert.equal(event.status, 'done', event.error ?? '');
+
+  const covs = await coveragesOf(policy.id);
+  assert.deepEqual(covs.map((c) => c.coverage_code), ['TEST-COVERAGE-3'], 'removed one, added one');
+  assert.equal(covs[0].cell_commitment_salt, salt);
+  const { rows: [row] } = await pool.query('SELECT current_version FROM policies WHERE id = $1', [policy.id]);
+  assert.equal(row.current_version, 2, 'activation, then the endorsement');
+
+  const end = new Date(Date.now() - 60 * 1000);
+  const { eventId } = await insertWindowedTrigger(pool, {
+    policyId: policy.id, coverageCode: 'TEST-COVERAGE-3', cellId: 'cell-test-3', value: -1,
+    eventStart: new Date(end.getTime() - 60 * 60 * 1000), eventEnd: end, expectedVersion: row.current_version,
+  });
+  await runOnce();
+  const { rows: [trigger] } = await pool.query('SELECT status, error FROM policy_events WHERE id = $1', [eventId]);
+  assert.equal(trigger.status, 'done', trigger.error ?? '');
 });
 
 test('removing a coverage that has already paid out is rejected', async () => {
@@ -1156,6 +1399,99 @@ test('an endorsement without a newDocumentHash keeps the document hash, in SQL a
   assert.equal(token.createArgument.documentHash, DOCUMENT_HASH, 'on the token too');
 });
 
+// The route refuses a sumInsured outside
+// policy_coverages.sum_insured's NUMERIC(14,2); a row queued past it fails
+// here, before the ledger. The ledger alone would take 1000.005.
+test('an endorsement row whose sumInsured has more than 2 decimals fails before the ledger', async () => {
+  const ph = await createPolicyholder();
+  const policy = await createPolicy(ph.id);
+  await activate(policy.id);
+  await runOnce();
+  const { rows: [before] } = await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id]);
+  const tokenBefore = (await ledgerContracts('Insurance.PolicyToken', 'PolicyToken'))
+    .find((c) => c.contractId === before.daml_contract_id);
+  const sumInsuredBefore = tokenBefore.createArgument.coverages
+    .find((c) => c.coverageCode === 'TEST-COVERAGE').sumInsured;
+
+  const event = await endorse(policy.id, {
+    reason: 'ER_SumInsuredIncrease',
+    sumInsuredChanges: [{ coverageCode: 'TEST-COVERAGE', sumInsured: 1000.005 }],
+  });
+  assert.equal(event.status, 'failed', 'the row is refused');
+  assert.match(event.error, /NUMERIC\(14,2\)/);
+  assert.match(event.error, /2 decimals/);
+
+  const { rows: [after] } = await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id]);
+  assert.equal(after.daml_contract_id, before.daml_contract_id, 'nothing reached the ledger');
+  assert.equal(after.current_version, before.current_version);
+  const token = (await ledgerContracts('Insurance.PolicyToken', 'PolicyToken'))
+    .find((c) => c.contractId === after.daml_contract_id);
+  assert.ok(token, 'the token the policy row names is still active');
+  assert.equal(
+    token.createArgument.coverages.find((c) => c.coverageCode === 'TEST-COVERAGE').sumInsured,
+    sumInsuredBefore,
+    'the coverage\'s sumInsured on the token is unchanged'
+  );
+});
+
+// An added coverage's payoutDestination and
+// remainingLimit are derived here, under the lock, so a row carrying either
+// key fails before the ledger, and the re-minted token holds the derived ones.
+const addedCoverageRow = (coverageCode, extra = {}) => ({
+  coverageCode,
+  productCode: 'TEST-PRODUCT',
+  perilType: 'TEST-PERIL',
+  cellIds: ['cell-test-3'],
+  sumInsured: 8000,
+  payoutTiers: [
+    { tierOrder: 1, label: 'test tier', minValue: '-2.0', maxValue: '0.0', payoutPct: '25.0', shape: 'TS_Step', pctAtMin: null, pctAtMax: null },
+  ],
+  metric: 'TEMPERATURE_C',
+  payoutBasis: 'PB_SumInsured',
+  cellCommitmentSalt: newTextSalt(),
+  ...extra,
+});
+
+test('an endorsement row carrying remainingLimit fails before the ledger; on a mortgaged policy an added coverage with a claim routes to the mortgagee too, one without to the insured, each at its sum insured', async () => {
+  const ph = await createPolicyholder();
+  const bank = await createPerson('bank-added-claim');
+  const policy = await createPolicyWithRoles(ph.id, { mortgageeId: bank.id });
+  await activate(policy.id);
+  await runOnce();
+  const { rows: [before] } = await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id]);
+
+  const refused = await endorse(policy.id, {
+    reason: 'ER_InsuredObjectChange',
+    coveragesToAdd: [addedCoverageRow('TEST-COVERAGE-3', { remainingLimit: 1 })],
+  });
+  assert.equal(refused.status, 'failed', 'the row is refused');
+  assert.match(refused.error, /remainingLimit/);
+  assert.match(refused.error, /derived/);
+  const { rows: [after] } = await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id]);
+  assert.equal(after.daml_contract_id, before.daml_contract_id, 'nothing reached the ledger');
+  assert.equal(after.current_version, before.current_version);
+
+  const event = await endorse(policy.id, {
+    reason: 'ER_InsuredObjectChange',
+    coveragesToAdd: [
+      addedCoverageRow('TEST-COVERAGE-CLAIM', { mortgageeClaimAmount: 100 }),
+      addedCoverageRow('TEST-COVERAGE-NOCLAIM', { cellIds: ['cell-test-4'] }),
+    ],
+  });
+  assert.equal(event.status, 'done', event.error ?? '');
+
+  const { row, token } = await policyAndToken(policy.id);
+  assert.equal(row.current_version, before.current_version + 1, 'the endorsement re-minted');
+  const claim = token.createArgument.coverages.find((c) => c.coverageCode === 'TEST-COVERAGE-CLAIM');
+  const noClaim = token.createArgument.coverages.find((c) => c.coverageCode === 'TEST-COVERAGE-NOCLAIM');
+  assert.deepEqual(claim.payoutDestination, ['PDR_Insured', 'PDR_Mortgagee']);
+  assert.deepEqual(noClaim.payoutDestination, ['PDR_Insured']);
+  for (const c of [claim, noClaim]) {
+    assert.equal(Number(c.remainingLimit), Number(c.sumInsured), `${c.coverageCode}: remainingLimit == sumInsured`);
+    assert.equal(Number(c.sumInsured), 8000);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Stage 3 Part 4 -- renewal
 // ---------------------------------------------------------------------------
@@ -1179,10 +1515,10 @@ async function queueRenewal(predecessorId, { sumInsured = 10000 } = {}) {
   await pool.query(
     `INSERT INTO policy_coverages
        (policy_id, coverage_code, product_code, peril_type, cell_ids,
-        sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination)
+        sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination, metric, payout_basis)
      VALUES ($1,'TEST-COVERAGE','TEST-PRODUCT','TEST-PERIL','["cell-test"]',$2,$2,
-       '[{"tierOrder":1,"label":"test tier","minValue":"-2.0","maxValue":"0.0","payoutPct":"25.0"},{"tierOrder":2,"label":"test total loss","minValue":null,"maxValue":"-4.0","payoutPct":"100.0"}]',
-       '["PDR_Insured"]')`,
+       '[{"tierOrder":1,"label":"test tier","minValue":"-2.0","maxValue":"0.0","payoutPct":"25.0","shape":"TS_Step","pctAtMin":null,"pctAtMax":null},{"tierOrder":2,"label":"test total loss","minValue":null,"maxValue":"-4.0","payoutPct":"100.0","shape":"TS_Step","pctAtMin":null,"pctAtMax":null}]',
+       '["PDR_Insured"]','TEMPERATURE_C','PB_RemainingLimit')`,
     [successor.id, sumInsured]
   );
   await pool.query(
@@ -1202,6 +1538,7 @@ async function lastRenewalEvent(predecessorId) {
 }
 
 test('renewal resets limits to the new sums insured regardless of what the predecessor consumed', async () => {
+  await archiveFixtureContracts(); // the earlier sections' contracts: see the note after archiveFixtureContracts
   const ph = await createPolicyholder();
   const predecessor = await createPolicy(ph.id);
   await activate(predecessor.id);
@@ -1276,7 +1613,7 @@ test('renewal reuses the policyholder party rather than allocating a new one', a
 
 test('renewal from an expired predecessor works -- the normal renewal case', async () => {
   const ph = await createPolicyholder();
-  const predecessor = await createPolicy(ph.id);
+  const predecessor = await createPolicy(ph.id, { endDate: PAST_END_DATE });
   await activate(predecessor.id);
   await runOnce();
   await insertExpiryEvent(predecessor.id);
@@ -1354,6 +1691,71 @@ test('renewing twice is rejected -- a period is succeeded exactly once', async (
   assert.equal(pred.renewed_by_policy_id, firstSuccessor, 'the first renewal still stands');
 });
 
+// A renewal whose successor reached the ledger while its row
+// ended 'failed' -- a create that timed out after the participant took it, or
+// a write-back that failed -- leaves renewed_by_policy_id NULL, so /renew
+// accepts a second one. Produced here by running the handler without its
+// write-back, then moving the row pending -> processing -> failed (the
+// transition trigger allows no done -> failed). Returns the first successor's
+// contract id and the first renewal row's id.
+async function renewOnLedgerOnly(predecessorId, { resultingContractId }) {
+  await queueRenewal(predecessorId);
+  const r1 = await lastRenewalEvent(predecessorId);
+  const pred = (await pool.query('SELECT * FROM policies WHERE id = $1', [predecessorId])).rows[0];
+  const { contractId } = await EVENT_HANDLERS.renewal(r1, pred);
+  await pool.query(`UPDATE policy_events SET status = 'processing' WHERE id = $1`, [r1.id]);
+  await pool.query(
+    `UPDATE policy_events SET status = 'failed', error = 'test: no write-back', processed_at = now(),
+       resulting_contract_id = $2 WHERE id = $1`,
+    [r1.id, resultingContractId ? contractId : null]
+  );
+  const after = (await pool.query('SELECT renewed_by_policy_id FROM policies WHERE id = $1', [predecessorId])).rows[0];
+  assert.equal(after.renewed_by_policy_id, null, 'the first renewal is not recorded in SQL');
+  return { contractId, r1Id: r1.id };
+}
+
+async function successorTokensOf(predecessorId) {
+  return (await ledgerContracts('Insurance.PolicyToken', 'PolicyToken')).filter(
+    (c) => c.createArgument.predecessorRef === predecessorId
+  );
+}
+
+test('a renewal after one that reached the ledger unrecorded is refused, and no second successor is minted', async () => {
+  const ph = await createPolicyholder();
+  const predecessor = await createPolicy(ph.id);
+  await activate(predecessor.id);
+  await runOnce();
+  const { contractId } = await renewOnLedgerOnly(predecessor.id, { resultingContractId: false });
+
+  const secondSuccessor = await queueRenewal(predecessor.id);
+  await runOnce();
+
+  const second = await lastRenewalEvent(predecessor.id);
+  assert.equal(second.payload.newPolicyId, secondSuccessor);
+  assert.equal(second.status, 'failed', 'the second renewal must not mint');
+  assert.match(second.error, /already on the ledger/);
+  assert.ok(second.error.includes(contractId), 'the message names the live successor token');
+  assert.equal((await successorTokensOf(predecessor.id)).length, 1, 'exactly one live successor on the ledger');
+});
+
+test('a renewal after one whose write-back failed is refused from SQL, and no second successor is minted', async () => {
+  const ph = await createPolicyholder();
+  const predecessor = await createPolicy(ph.id);
+  await activate(predecessor.id);
+  await runOnce();
+  const { contractId, r1Id } = await renewOnLedgerOnly(predecessor.id, { resultingContractId: true });
+
+  await queueRenewal(predecessor.id);
+  await runOnce();
+
+  const second = await lastRenewalEvent(predecessor.id);
+  assert.equal(second.status, 'failed', 'the second renewal must not mint');
+  assert.match(second.error, /write-back failed/);
+  assert.ok(second.error.includes(r1Id), 'the message names the earlier renewal row');
+  assert.ok(second.error.includes(contractId), 'the message names the contract that row put on the ledger');
+  assert.equal((await successorTokensOf(predecessor.id)).length, 1, 'exactly one live successor on the ledger');
+});
+
 test('renewing a claimed_and_closed policy is rejected', async () => {
   const ph = await createPolicyholder();
   const predecessor = await createPolicy(ph.id);
@@ -1376,7 +1778,7 @@ test('renewing a claimed_and_closed policy is rejected', async () => {
 
 test('the expiry sweeper closes a renewed predecessor without touching its successor', async () => {
   const ph = await createPolicyholder();
-  const predecessor = await createPolicy(ph.id);
+  const predecessor = await createPolicy(ph.id, { endDate: PAST_END_DATE });
   await activate(predecessor.id);
   await runOnce();
   const successorId = await queueRenewal(predecessor.id);
@@ -1403,6 +1805,133 @@ test('the expiry sweeper closes a renewed predecessor without touching its succe
   assert.ok(succ.daml_contract_id);
 });
 
+// Migration 037: the mortgagee continuation days and
+// the first-premium withdrawal days are frozen onto the policy at activation.
+// The tests that move the fixture insurer's two values run inside this, which
+// puts them back, so the tests after them read only what they set themselves.
+// The day counts these tests use are fixture values, not statutory figures.
+async function restoringInsurerWindows(fn) {
+  const { rows: [row] } = await pool.query(
+    'SELECT mortgagee_continuation_days, first_premium_withdrawal_days FROM insurers WHERE id = $1',
+    [insurerId]
+  );
+  try {
+    await fn();
+  } finally {
+    await pool.query(
+      'UPDATE insurers SET mortgagee_continuation_days = $1, first_premium_withdrawal_days = $2 WHERE id = $3',
+      [row.mortgagee_continuation_days, row.first_premium_withdrawal_days, insurerId]
+    );
+  }
+}
+
+test('activation freezes the insurer windows onto the policy, and a renewal freezes the values of its own moment', async () => {
+  await restoringInsurerWindows(async () => {
+    await pool.query(
+      'UPDATE insurers SET mortgagee_continuation_days = 15, first_premium_withdrawal_days = 60 WHERE id = $1',
+      [insurerId]
+    );
+    const ph = await createPolicyholder();
+    const predecessor = await createPolicy(ph.id);
+    await activate(predecessor.id);
+    await runOnce();
+    let pred = (await pool.query('SELECT * FROM policies WHERE id = $1', [predecessor.id])).rows[0];
+    assert.equal(pred.status, 'active');
+    assert.equal(pred.mortgagee_continuation_days, 15);
+    assert.equal(pred.first_premium_withdrawal_days, 60);
+
+    await pool.query(
+      'UPDATE insurers SET mortgagee_continuation_days = 20, first_premium_withdrawal_days = 45 WHERE id = $1',
+      [insurerId]
+    );
+    const successorId = await queueRenewal(predecessor.id);
+    await runOnce();
+    const event = await lastRenewalEvent(predecessor.id);
+    assert.equal(event.status, 'done', event.error ?? '');
+    const succ = (await pool.query('SELECT * FROM policies WHERE id = $1', [successorId])).rows[0];
+    assert.equal(succ.mortgagee_continuation_days, 20, "the successor takes the insurer's value at its activation");
+    assert.equal(succ.first_premium_withdrawal_days, 45);
+    pred = (await pool.query('SELECT * FROM policies WHERE id = $1', [predecessor.id])).rows[0];
+    assert.equal(pred.mortgagee_continuation_days, 15, 'the predecessor keeps what it froze');
+    assert.equal(pred.first_premium_withdrawal_days, 60);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// No mint without a distinct oracle party
+// ---------------------------------------------------------------------------
+
+// Runs fn with this file's own insurer row carrying the given
+// oracle_operator_party, then puts the real one back, so the tests after
+// these keep minting. The two misconfigurations are the ones a mint must
+// refuse: no oracle party at all, and the insurer named as its own oracle.
+async function withOracleParty(value, fn) {
+  const { rows: [row] } = await pool.query('SELECT oracle_operator_party FROM insurers WHERE id = $1', [insurerId]);
+  await pool.query('UPDATE insurers SET oracle_operator_party = $1 WHERE id = $2', [value, insurerId]);
+  try {
+    await fn();
+  } finally {
+    await pool.query('UPDATE insurers SET oracle_operator_party = $1 WHERE id = $2', [row.oracle_operator_party, insurerId]);
+  }
+}
+
+async function tokensFor(policyId) {
+  return (await ledgerContracts('Insurance.PolicyToken', 'PolicyToken')).filter(
+    (c) => c.createArgument.policyNo === policyId
+  );
+}
+
+for (const [label, oracleValue] of [
+  ['no oracle party', () => null],
+  ["the insurer's own party as oracle", () => insurerParty],
+]) {
+  test(`activation with ${label} fails the row and mints nothing`, async () => {
+    const ph = await createPolicyholder();
+    const policy = await createPolicy(ph.id);
+    await withOracleParty(oracleValue(), async () => {
+      await activate(policy.id);
+      await runOnce();
+    });
+
+    const event = (
+      await pool.query(`SELECT * FROM policy_events WHERE policy_no = $1 AND event_type = 'activation'`, [policy.id])
+    ).rows[0];
+    assert.equal(event.status, 'failed', event.error ?? '');
+    assert.match(event.error, /oracle_operator_party/, 'the message must name the missing column');
+    assert.match(event.error, new RegExp(insurerId), 'the message must name which insurer row');
+    assert.match(event.error, /onboardInsurer/, 'the message must say how it is normally set');
+
+    const row = (await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id])).rows[0];
+    assert.equal(row.daml_contract_id, null, 'nothing is minted');
+    assert.equal(row.status, 'pending_mint');
+    assert.equal((await tokensFor(policy.id)).length, 0, 'no PolicyToken for this policy on the ledger');
+  });
+
+  test(`renewal with ${label} fails the row and mints no successor`, async () => {
+    const ph = await createPolicyholder();
+    const predecessor = await createPolicy(ph.id);
+    await activate(predecessor.id);
+    await runOnce();
+    assert.ok((await pool.query('SELECT daml_contract_id FROM policies WHERE id = $1', [predecessor.id])).rows[0].daml_contract_id);
+
+    let successorId;
+    await withOracleParty(oracleValue(), async () => {
+      successorId = await queueRenewal(predecessor.id);
+      await runOnce();
+    });
+
+    const event = await lastRenewalEvent(predecessor.id);
+    assert.equal(event.status, 'failed', event.error ?? '');
+    assert.match(event.error, /oracle_operator_party/, 'the message must name the missing column');
+    assert.match(event.error, new RegExp(insurerId), 'the message must name which insurer row');
+    assert.match(event.error, /onboardInsurer/, 'the message must say how it is normally set');
+
+    const succ = (await pool.query('SELECT * FROM policies WHERE id = $1', [successorId])).rows[0];
+    assert.equal(succ.daml_contract_id, null, 'nothing is minted for a rejected renewal');
+    assert.equal((await tokensFor(successorId)).length, 0, 'no PolicyToken for the successor on the ledger');
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Stage 4 -- closing the payout loop
 // ---------------------------------------------------------------------------
@@ -1424,6 +1953,7 @@ async function payoutFor(policyId) {
 // whichever contract is currently live for this payout.
 async function reportOnPayout(payout, payload) {
   const target = payout.review_contract_id ?? payout.daml_contract_id;
+  payload = { ...payload, textSalt: newTextSalt() };
   // Same ON CONFLICT the route uses. Migration 012 re-scoped the settlement
   // index to IN-FLIGHT rows, so this must carry the status predicate too --
   // an inference predicate that does not imply the index predicate does not
@@ -1451,6 +1981,7 @@ async function reloadPayout(id) {
 }
 
 test('a trigger no longer routes its payout to manual_review automatically', async () => {
+  await archiveFixtureContracts(); // the earlier sections' contracts: see the note after archiveFixtureContracts
   const ph = await createPolicyholder();
   const policy = await createPolicy(ph.id);
   await activate(policy.id);
@@ -1481,10 +2012,12 @@ test('a reported settlement closes the payout and it cannot be settled twice', a
   await runOnce();
   const payout = await payoutFor(policy.id);
 
+  // After the approval and not in the future: the only instants a report may carry.
+  const settledAt = new Date().toISOString();
   const event = await reportOnPayout(payout, {
     action: 'settle',
     bankReference: 'BANK-REF-NODE-1',
-    settledAt: '2026-08-26T10:00:00.000Z',
+    settledAt,
     paidRole: 'PDR_Insured',
   });
   assert.equal(event.status, 'done', event.error ?? '');
@@ -1493,9 +2026,15 @@ test('a reported settlement closes the payout and it cannot be settled twice', a
   assert.equal(after.status, 'settled');
   assert.equal(after.bank_reference, 'BANK-REF-NODE-1');
   assert.equal(after.paid_role, 'PDR_Insured');
+  // v22: the PayoutSettled the settlement left, by the id stored.
+  const record = (await ledgerContracts('Insurance.PayoutBridge', 'PayoutSettled'))
+    .find((c) => c.contractId === after.resolution_record_contract_id);
+  assert.ok(record, 'the stored id names a PayoutSettled on the ledger');
+  assert.equal(record.createArgument.recipient, 'PDR_Insured');
+  assert.equal(new Date(record.createArgument.settledAt).toISOString(), settledAt);
   assert.equal(
     new Date(after.settled_at).toISOString(),
-    '2026-08-26T10:00:00.000Z',
+    settledAt,
     'the settlement date is the insurer\'s reported fact, not a clock reading'
   );
   assert.ok(after.resolved_at, 'resolved_at stamps when the payout reached a terminal state');
@@ -1510,7 +2049,7 @@ test('a reported settlement closes the payout and it cannot be settled twice', a
   const second = await reportOnPayout(payout, {
     action: 'settle',
     bankReference: 'BANK-REF-NODE-2',
-    settledAt: '2026-08-27T10:00:00.000Z',
+    settledAt: new Date().toISOString(),
     paidRole: 'PDR_Insured',
   });
   assert.equal(second.status, 'failed');
@@ -1530,7 +2069,7 @@ test('a settlement naming a role the coverage does not allow is rejected', async
   const event = await reportOnPayout(payout, {
     action: 'settle',
     bankReference: 'BANK-REF-WRONG',
-    settledAt: '2026-08-26T10:00:00.000Z',
+    settledAt: new Date().toISOString(),
     paidRole: 'PDR_Mortgagee',
   });
   assert.equal(event.status, 'failed');
@@ -1580,7 +2119,7 @@ test('a review item can be closed as settled after all', async () => {
   const event = await reportOnPayout(payout, {
     action: 'resolve_settled',
     bankReference: 'BANK-REF-LATE',
-    settledAt: '2026-08-27T09:30:00.000Z',
+    settledAt: new Date().toISOString(),
     paidRole: 'PDR_Insured',
   });
   assert.equal(event.status, 'done', event.error ?? '');
@@ -1589,6 +2128,10 @@ test('a review item can be closed as settled after all', async () => {
   assert.equal(after.status, 'settled');
   assert.equal(after.bank_reference, 'BANK-REF-LATE');
   assert.ok(after.resolved_at);
+  // v22: the review exit leaves the same kind of record.
+  const record = (await ledgerContracts('Insurance.PayoutBridge', 'PayoutSettled'))
+    .find((c) => c.contractId === after.resolution_record_contract_id);
+  assert.ok(record, 'the stored id names a PayoutSettled on the ledger');
 });
 
 test('a review item can be closed unpaid with an enumerated reason and a note', async () => {
@@ -1618,10 +2161,12 @@ test('a review item can be closed unpaid with an enumerated reason and a note', 
   assert.equal(noNote.status, 'failed');
   assert.match(noNote.error, /note is required/i);
 
+  const closedAt = new Date().toISOString();
   const event = await reportOnPayout(payout, {
     action: 'resolve_unpaid',
     unpaidReason: 'UR_Litigation',
     note: 'referred to arbitration, file 2026/114',
+    closedAt,
   });
   assert.equal(event.status, 'done', event.error ?? '');
 
@@ -1631,6 +2176,302 @@ test('a review item can be closed unpaid with an enumerated reason and a note', 
   assert.equal(after.resolution_note, 'referred to arbitration, file 2026/114');
   assert.ok(after.resolved_at);
   assert.equal(after.bank_reference, null, 'nothing was paid, so no bank reference is recorded');
+  // v22: the insurer's declared closing instant, and the record the
+  // closure left on the ledger, carrying that same instant.
+  assert.equal(new Date(after.closed_at).toISOString(), closedAt);
+  const record = (await ledgerContracts('Insurance.PayoutBridge', 'PayoutClosedUnpaid'))
+    .find((c) => c.contractId === after.resolution_record_contract_id);
+  assert.ok(record, 'the stored id names a PayoutClosedUnpaid on the ledger');
+  assert.equal(new Date(record.createArgument.closedAt).getTime(), new Date(after.closed_at).getTime());
+  assert.equal(record.createArgument.unpaidReason, 'UR_Litigation');
+});
+
+test('a close-unpaid report with no closedAt fails loudly instead of taking a clock reading', async () => {
+  const ph = await createPolicyholder();
+  const policy = await createPolicy(ph.id);
+  await activate(policy.id);
+  await runOnce();
+  let payout = await payoutFor(policy.id);
+  await reportOnPayout(payout, { action: 'fail', failureReason: 'contested' });
+  payout = await reloadPayout(payout.id);
+  const event = await reportOnPayout(payout, { action: 'resolve_unpaid', unpaidReason: 'UR_Other', note: 'no date given' });
+  assert.equal(event.status, 'failed');
+  assert.match(event.error, /closedAt is required/);
+  assert.equal((await reloadPayout(payout.id)).status, 'manual_review', 'nothing changed');
+});
+
+// The route refuses these first; a row queued by any other path meets the
+// same refusal here, before the ledger.
+test('a settlement row whose settledAt is in the future or before approved_at fails loudly, and the payout stays open', async () => {
+  const ph = await createPolicyholder();
+  const policy = await createPolicy(ph.id);
+  await activate(policy.id);
+  await runOnce();
+  const payout = await payoutFor(policy.id);
+  assert.ok(payout.approved_at, 'fixture: the trigger wrote the ledger\'s approval instant');
+
+  for (const [settledAt, message] of [
+    [new Date(Date.now() + 60000).toISOString(), /settledAt \S+ is in the future/],
+    [new Date(new Date(payout.approved_at).getTime() - 1000).toISOString(), /settledAt \S+ is before .*approved_at/],
+  ]) {
+    const event = await reportOnPayout(payout, {
+      action: 'settle', bankReference: 'BANK-REF-BOUNDS', settledAt, paidRole: 'PDR_Insured',
+    });
+    assert.equal(event.status, 'failed', settledAt);
+    assert.match(event.error, message);
+    const after = await reloadPayout(payout.id);
+    assert.equal(after.status, 'approved');
+    assert.equal(after.resolved_at, null);
+  }
+  const live = await ledgerContracts('Insurance.PayoutBridge', 'PayoutApproved');
+  assert.ok(live.some((c) => c.contractId === payout.daml_contract_id), 'the PayoutApproved was not exercised');
+});
+
+test('a close-unpaid row whose closedAt is in the future or before approved_at fails loudly, and the item stays open', async () => {
+  const ph = await createPolicyholder();
+  const policy = await createPolicy(ph.id);
+  await activate(policy.id);
+  await runOnce();
+  let payout = await payoutFor(policy.id);
+  await reportOnPayout(payout, { action: 'fail', failureReason: 'contested' });
+  payout = await reloadPayout(payout.id);
+
+  for (const [closedAt, message] of [
+    [new Date(Date.now() + 60000).toISOString(), /closedAt \S+ is in the future/],
+    [new Date(new Date(payout.approved_at).getTime() - 1000).toISOString(), /closedAt \S+ is before .*approved_at/],
+  ]) {
+    const event = await reportOnPayout(payout, {
+      action: 'resolve_unpaid', unpaidReason: 'UR_Other', note: 'bounds', closedAt,
+    });
+    assert.equal(event.status, 'failed', closedAt);
+    assert.match(event.error, message);
+    assert.equal((await reloadPayout(payout.id)).status, 'manual_review');
+  }
+  const live = await ledgerContracts('Insurance.PayoutBridge', 'ManualReviewRequired');
+  assert.ok(live.some((c) => c.contractId === payout.review_contract_id), 'the review item was not exercised');
+});
+
+test('a settlement row on a payout with no approved_at fails closed', async () => {
+  const ph = await createPolicyholder();
+  const policy = await createPolicy(ph.id);
+  await activate(policy.id);
+  await runOnce();
+  const payout = await payoutFor(policy.id);
+  // A row written before the column existed has no approved_at; this stands in for one.
+  await pool.query('UPDATE payout_events SET approved_at = NULL WHERE id = $1', [payout.id]);
+  const event = await reportOnPayout(payout, {
+    action: 'settle', bankReference: 'BANK-REF-NULL', settledAt: new Date().toISOString(), paidRole: 'PDR_Insured',
+  });
+  assert.equal(event.status, 'failed');
+  assert.match(event.error, /has no approved_at/);
+  assert.equal((await reloadPayout(payout.id)).status, 'approved');
+});
+
+// ---------------------------------------------------------------------------
+// The insurer's free text stays in SQL
+// ---------------------------------------------------------------------------
+//
+// A bank reference, a failure reason and a closure note go through the API,
+// are dispatched, and are read back from the ledger. The ledger must carry
+// only "sha256:" over the row's salt and the text, never the text itself.
+
+test('saltedDigest matches a vector computed outside node:crypto, and rejects a malformed salt', () => {
+  // Computed with .NET's SHA256 over bytes 0x00..0x1f followed by the UTF-8
+  // text, so it checks the formula rather than restating the implementation.
+  const salt = '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f';
+  const expected = 'sha256:ce26bc65b7633c0eab6acc81d333238850d2dcba0a251264ff18c18aad23d85f';
+  assert.equal(saltedDigest(salt, 'İade: TR00 ödeme'), expected);
+  assert.ok(matchesSaltedDigest(salt, 'İade: TR00 ödeme', expected));
+  assert.ok(!matchesSaltedDigest(salt, 'İade: TR00 ödeme.', expected), 'one character more is another value');
+  assert.notEqual(saltedDigest(newTextSalt(), 'x'), saltedDigest(newTextSalt(), 'x'), 'the salt is per row');
+  assert.throws(() => saltedDigest('00', 'x'), /64 lowercase hex/);
+  assert.throws(() => saltedDigest(undefined, 'x'), /64 lowercase hex/);
+  assert.throws(() => saltedDigest(salt, ''), /non-empty/);
+});
+
+// A recognisable free text: an IBAN-shaped fake and a name. Neither is real.
+const FREE_TEXT = (label) => `${label}: TR33 0006 1005 1978 6457 8413 26, Ayse Yilmaz`;
+
+let freeTextServer;
+let freeTextBase;
+let freeTextKey;
+
+async function freeTextApi(method, path, body) {
+  if (!freeTextServer) {
+    // The fixture insurer's key hash is random; this block needs a key it
+    // knows, so it sets one. No other test here goes through /api/v1; the
+    // roles block further down goes through /debug, which takes no key.
+    freeTextKey = crypto.randomBytes(16).toString('hex');
+    await pool.query('UPDATE insurers SET api_key_hash = $1 WHERE id = $2', [
+      crypto.createHash('sha256').update(freeTextKey).digest('hex'),
+      insurerId,
+    ]);
+    const app = createApp({
+      probeDatabase: async () => true,
+      probeLedger: async () => true,
+      processDegraded: () => null,
+    });
+    freeTextServer = app.listen(0, '127.0.0.1');
+    await new Promise((resolve) => freeTextServer.once('listening', resolve));
+    freeTextBase = `http://127.0.0.1:${freeTextServer.address().port}/api/v1`;
+  }
+  const res = await fetch(`${freeTextBase}${path}`, {
+    method,
+    headers: { 'Content-Type': 'application/json', 'x-api-key': freeTextKey },
+    body: JSON.stringify(body),
+  });
+  return { status: res.status, body: await res.json() };
+}
+
+after(() => freeTextServer?.close());
+
+// The choice argument the LEDGER recorded for `choice` on `contractId`, read
+// back from /v2/updates as the insurer sees it. Same request as
+// oracleWindow.test.mjs makes, for the same reason: damlClient.js has no
+// updates reader and does not export its HTTP client.
+async function ledgerChoiceArgument(afterOffset, choice, contractId) {
+  let token = config.daml.ledgerToken;
+  if (!token) {
+    const part = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+    const unsigned = `${part({ alg: 'HS256', typ: 'JWT' })}.${part({
+      sub: config.daml.unsafeJwtSub,
+      aud: 'https://canton.network.global',
+      exp: Math.floor(Date.now() / 1000) + 600,
+    })}`;
+    token = `${unsigned}.${crypto.createHmac('sha256', config.daml.unsafeJwtSecret).update(unsigned).digest('base64url')}`;
+  }
+  const res = await fetch(`${config.daml.jsonApiUrl}/v2/updates`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({
+      beginExclusive: afterOffset,
+      endInclusive: await getLedgerEnd(),
+      updateFormat: {
+        includeTransactions: {
+          eventFormat: { filtersByParty: { [insurerParty]: { cumulative: [] } }, verbose: false },
+          transactionShape: 'TRANSACTION_SHAPE_LEDGER_EFFECTS',
+        },
+      },
+    }),
+  });
+  assert.equal(res.status, 200, await res.clone().text());
+  const exercised = (await res.json())
+    .map((u) => u.update?.Transaction?.value)
+    .filter(Boolean)
+    .flatMap((t) => t.events)
+    .map((e) => e.ExercisedEvent)
+    .filter((e) => e?.choice === choice && e.contractId === contractId);
+  assert.equal(exercised.length, 1, `exactly one ${choice} on ${contractId} in the range`);
+  return exercised[0].choiceArgument;
+}
+
+// Reports through the API, dispatches, and returns the outbox row.
+async function reportThroughApi(payout, route, body) {
+  const { status, body: res } = await freeTextApi('POST', `/payouts/${payout.id}/${route}`, body);
+  assert.equal(status, 202, JSON.stringify(res));
+  await runOnce();
+  const { rows } = await pool.query('SELECT * FROM policy_events WHERE id = $1', [res.event.id]);
+  assert.equal(rows[0].status, 'done', rows[0].error ?? '');
+  return rows[0];
+}
+
+// The value on the ledger is not the text, is a salted digest, and is the one
+// the SQL row's (salt, text) recomputes to.
+function assertOpaque(onLedger, event, text) {
+  assert.ok(!String(onLedger).includes('TR33'), `the IBAN-shaped text reached the ledger: ${onLedger}`);
+  assert.ok(!String(onLedger).includes('Yilmaz'), `the name reached the ledger: ${onLedger}`);
+  assert.match(onLedger, /^sha256:[0-9a-f]{64}$/);
+  assert.ok(
+    matchesSaltedDigest(event.payload.textSalt, text, onLedger),
+    'the ledger value is recomputable from the salt and text kept in SQL'
+  );
+}
+
+test('settle: the bank reference reaches the ledger only as a salted digest', async () => {
+  await archiveFixtureContracts(); // the earlier sections' contracts: see the note after archiveFixtureContracts
+  const ph = await createPolicyholder();
+  const policy = await createPolicy(ph.id);
+  await activate(policy.id);
+  await runOnce();
+  const payout = await payoutFor(policy.id);
+  const text = FREE_TEXT('settle');
+
+  const offset = await getLedgerEnd();
+  const event = await reportThroughApi(payout, 'settle', {
+    bankReference: text, settledAt: new Date().toISOString(), paidRole: 'PDR_Insured',
+  });
+  const arg = await ledgerChoiceArgument(offset, 'PayoutApproved_ConfirmSettlement', payout.daml_contract_id);
+  assertOpaque(arg.bankReference, event, text);
+  assert.equal((await reloadPayout(payout.id)).bank_reference, text, 'the raw text stays in SQL');
+});
+
+test('fail, then close unpaid: the failure reason and the note reach the ledger only as salted digests', async () => {
+  const ph = await createPolicyholder();
+  const policy = await createPolicy(ph.id);
+  await activate(policy.id);
+  await runOnce();
+  let payout = await payoutFor(policy.id);
+  const reason = FREE_TEXT('fail');
+  const note = FREE_TEXT('close');
+
+  let offset = await getLedgerEnd();
+  const failed = await reportThroughApi(payout, 'fail', { failureReason: reason });
+  const failArg = await ledgerChoiceArgument(offset, 'PayoutApproved_MarkFailed', payout.daml_contract_id);
+  assertOpaque(failArg.failureReason, failed, reason);
+  payout = await reloadPayout(payout.id);
+  const review = (await ledgerContracts('Insurance.PayoutBridge', 'ManualReviewRequired')).find(
+    (c) => c.contractId === payout.review_contract_id
+  );
+  assert.ok(review, 'the review item is on the ledger');
+  assertOpaque(review.createArgument.reason, failed, reason);
+
+  offset = await getLedgerEnd();
+  const closed = await reportThroughApi(payout, 'close-unpaid', { unpaidReason: 'UR_Other', note, closedAt: new Date().toISOString() });
+  const closeArg = await ledgerChoiceArgument(
+    offset, 'ManualReviewRequired_ResolveUnpaid', payout.review_contract_id
+  );
+  assertOpaque(closeArg.note, closed, note);
+  assert.equal((await reloadPayout(payout.id)).resolution_note, note, 'the raw note stays in SQL');
+});
+
+test('fail, then settle: the late bank reference reaches the ledger only as a salted digest', async () => {
+  const ph = await createPolicyholder();
+  const policy = await createPolicy(ph.id);
+  await activate(policy.id);
+  await runOnce();
+  let payout = await payoutFor(policy.id);
+  await reportThroughApi(payout, 'fail', { failureReason: 'payee not found' });
+  payout = await reloadPayout(payout.id);
+  const text = FREE_TEXT('resolve settled');
+
+  const offset = await getLedgerEnd();
+  const event = await reportThroughApi(payout, 'settle', {
+    bankReference: text, settledAt: new Date().toISOString(), paidRole: 'PDR_Insured',
+  });
+  const arg = await ledgerChoiceArgument(offset, 'ManualReviewRequired_ResolveSettled', payout.review_contract_id);
+  assertOpaque(arg.bankReference, event, text);
+});
+
+test('a retried settlement row sends the same digest: the salt is stored when the row is written', async () => {
+  const ph = await createPolicyholder();
+  const policy = await createPolicy(ph.id);
+  await activate(policy.id);
+  await runOnce();
+  const payout = await payoutFor(policy.id);
+  const text = FREE_TEXT('retry');
+
+  const { status, body } = await freeTextApi('POST', `/payouts/${payout.id}/settle`, {
+    bankReference: text, settledAt: new Date().toISOString(), paidRole: 'PDR_Insured',
+  });
+  assert.equal(status, 202, JSON.stringify(body));
+  const stored = (await pool.query('SELECT payload FROM policy_events WHERE id = $1', [body.event.id])).rows[0].payload;
+  assert.match(stored.textSalt ?? '', /^[0-9a-f]{64}$/, 'the salt is in the outbox row before any dispatch');
+  const expected = saltedDigest(stored.textSalt, text);
+
+  const offset = await getLedgerEnd();
+  await runOnce();
+  const arg = await ledgerChoiceArgument(offset, 'PayoutApproved_ConfirmSettlement', payout.daml_contract_id);
+  assert.equal(arg.bankReference, expected, 'dispatch computes from the stored salt, not a fresh one');
 });
 
 // ---------------------------------------------------------------------------
@@ -1678,10 +2519,10 @@ async function createPolicyWithRoles(policyholderId, opts = {}) {
     await pool.query(
       `INSERT INTO policy_coverages
          (policy_id, coverage_code, product_code, peril_type, cell_ids,
-          sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination, mortgagee_claim_amount)
+          sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination, mortgagee_claim_amount, metric, payout_basis)
        VALUES ($1,$2,'TEST-PRODUCT','TEST-PERIL','["cell-test"]',10000,10000,
-         '[{"tierOrder":1,"label":"test tier","minValue":"-2.0","maxValue":"0.0","payoutPct":"25.0"},{"tierOrder":2,"label":"test total loss","minValue":null,"maxValue":"-4.0","payoutPct":"100.0"}]',
-         $3, $4)`,
+         '[{"tierOrder":1,"label":"test tier","minValue":"-2.0","maxValue":"0.0","payoutPct":"25.0","shape":"TS_Step","pctAtMin":null,"pctAtMax":null},{"tierOrder":2,"label":"test total loss","minValue":null,"maxValue":"-4.0","payoutPct":"100.0","shape":"TS_Step","pctAtMin":null,"pctAtMax":null}]',
+         $3, $4, 'TEMPERATURE_C', 'PB_RemainingLimit')`,
       [
         policy.id,
         code,
@@ -1694,6 +2535,7 @@ async function createPolicyWithRoles(policyholderId, opts = {}) {
 }
 
 test('a policy with a mortgagee and per-coverage claim amounts mints with both on the token', async () => {
+  await archiveFixtureContracts(); // the earlier sections' contracts: see the note after archiveFixtureContracts
   const ph = await createPolicyholder();
   const bank = await createPerson('bank');
   const policy = await createPolicyWithRoles(ph.id, {
@@ -1995,6 +2837,189 @@ test('the m. 1456 flows run end to end on a policy that has a mortgagee', async 
   );
 });
 
+// Migration 037: the window termination opens is the one frozen at activation.
+// A later change to the insurer's value, or its removal, does not move it.
+test('termination opens the continuation window frozen at activation, whatever the insurer has since', async () => {
+  await restoringInsurerWindows(async () => {
+    for (const later of [30, null]) {
+      const ph = await createPolicyholder();
+      const bank = await createPerson(`bank-frozen-${later}`);
+      await pool.query('UPDATE insurers SET mortgagee_continuation_days = 15 WHERE id = $1', [insurerId]);
+      const policy = await createPolicyWithRoles(ph.id, {
+        mortgageeId: bank.id,
+        claimAmounts: { 'TEST-COVERAGE': 4000 },
+      });
+      await activateAndServeNotice(policy.id, new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString());
+      await pool.query('UPDATE insurers SET mortgagee_continuation_days = $1 WHERE id = $2', [later, insurerId]);
+
+      await insertLifecycleEvent(policy.id, 'termination');
+      await runOnce();
+      const ev = await eventRow(policy.id, 'termination');
+      assert.equal(ev.status, 'done', `insurer value moved to ${later}: ${ev.error ?? ''}`);
+      const row = (await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id])).rows[0];
+      assert.equal(row.default_state, 'terminated');
+      assert.equal(
+        new Date(row.mortgagee_continuation_ends_at).getTime(),
+        new Date(row.terminated_at).getTime() + 15 * 24 * 60 * 60 * 1000,
+        `the frozen 15 days, not the insurer's ${later}`
+      );
+    }
+  });
+});
+
+// An unset value is frozen as unset, and the refusal stays at use time.
+// The failed row's own error reaches GET /policies/:id as its reason code.
+test('a mortgaged policy activated with no continuation window fails termination, even after the insurer sets one', async () => {
+  await restoringInsurerWindows(async () => {
+    const ph = await createPolicyholder();
+    const bank = await createPerson('bank-unfrozen');
+    await pool.query('UPDATE insurers SET mortgagee_continuation_days = NULL WHERE id = $1', [insurerId]);
+    const policy = await createPolicyWithRoles(ph.id, {
+      mortgageeId: bank.id,
+      claimAmounts: { 'TEST-COVERAGE': 4000 },
+    });
+    let row = await activateAndServeNotice(policy.id, new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString());
+    assert.equal(row.default_state, 'grace_period');
+    assert.equal(row.mortgagee_continuation_days, null, 'NULL is frozen as NULL');
+    await pool.query('UPDATE insurers SET mortgagee_continuation_days = 15 WHERE id = $1', [insurerId]);
+
+    await insertLifecycleEvent(policy.id, 'termination');
+    await runOnce();
+    const ev = await eventRow(policy.id, 'termination');
+    assert.equal(ev.status, 'failed');
+    row = (await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id])).rows[0];
+    assert.equal(row.default_state, 'grace_period', 'nothing moved');
+    const { failure } = buildPolicyRecord(row, [], [ev], false).events[0];
+    assert.equal(failure.code, 'mortgagee_continuation_not_configured');
+    assert.equal(
+      failure.message,
+      'The policy names a mortgagee but no mortgagee continuation window was configured for the insurer when the policy was activated.'
+    );
+  });
+});
+
+// An endorsement can name, clear or leave the mortgagee. The token's mortgagee
+// is mirrored in policies.mortgagee_policyholder_id, which handleTermination
+// reads to open the continuation window and a renewal copies.
+
+// The party ensurePolicyholderParty would allocate for this registry row. The
+// row is named by an endorsement here, not by a mint, so nothing else does.
+async function allocateRegisteredParty(personId) {
+  const partyId = await allocateParty(`policyholder:${personId}`, `ph-${personId}`);
+  await pool.query(
+    `UPDATE policyholders SET canton_party_id = $1, canton_party_status = 'ALLOCATED' WHERE id = $2`,
+    [partyId, personId]
+  );
+  return partyId;
+}
+
+async function policyAndToken(policyId) {
+  const row = (await pool.query('SELECT * FROM policies WHERE id = $1', [policyId])).rows[0];
+  const token = (await ledgerContracts('Insurance.PolicyToken', 'PolicyToken'))
+    .find((c) => c.contractId === row.daml_contract_id);
+  return { row, token };
+}
+
+test('an endorsement naming a mortgagee writes mortgagee_policyholder_id, and termination then opens the continuation window', async () => {
+  const ph = await createPolicyholder();
+  const bank = await createPerson('bank-endorsed');
+  const bankParty = await allocateRegisteredParty(bank.id);
+  await pool.query('UPDATE insurers SET mortgagee_continuation_days = 15 WHERE id = $1', [insurerId]);
+  const policy = await createPolicy(ph.id);
+  const serviceDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  await activateAndServeNotice(policy.id, serviceDate);
+
+  const event = await endorse(policy.id, { reason: 'ER_Correction', newMortgagee: { value: bankParty } });
+  assert.equal(event.status, 'done', event.error ?? '');
+  let { row, token } = await policyAndToken(policy.id);
+  assert.equal(token.createArgument.mortgagee, bankParty, 'the re-minted token names the mortgagee');
+  assert.equal(row.mortgagee_policyholder_id, bank.id, 'and the SQL mirror names the same policyholder');
+
+  await insertLifecycleEvent(policy.id, 'termination');
+  await runOnce();
+  ({ row, token } = await policyAndToken(policy.id));
+  assert.equal(row.default_state, 'terminated');
+  assert.equal(
+    new Date(row.mortgagee_continuation_ends_at).getTime(),
+    new Date(row.terminated_at).getTime() + 15 * 24 * 60 * 60 * 1000,
+    'the window opens for the mortgagee the endorsement named'
+  );
+  assert.ok(token.createArgument.mortgageeContinuationEndsAt, 'on the ledger too');
+});
+
+test('an endorsement clearing the mortgagee writes NULL to mortgagee_policyholder_id', async () => {
+  const ph = await createPolicyholder();
+  const bank = await createPerson('bank-cleared');
+  const policy = await createPolicyWithRoles(ph.id, { mortgageeId: bank.id });
+  await activate(policy.id);
+  await runOnce();
+
+  const event = await endorse(policy.id, { reason: 'ER_Correction', newMortgagee: { value: null } });
+  assert.equal(event.status, 'done', event.error ?? '');
+  const { row, token } = await policyAndToken(policy.id);
+  assert.equal(token.createArgument.mortgagee, null, 'the re-minted token names no mortgagee');
+  assert.equal(row.mortgagee_policyholder_id, null, 'and neither does the SQL mirror');
+});
+
+test('an endorsement that does not name the mortgagee leaves mortgagee_policyholder_id alone', async () => {
+  const ph = await createPolicyholder();
+  const bank = await createPerson('bank-untouched');
+  const policy = await createPolicyWithRoles(ph.id, { mortgageeId: bank.id });
+  await activate(policy.id);
+  await runOnce();
+  const bankParty = (await pool.query('SELECT canton_party_id FROM policyholders WHERE id = $1', [bank.id]))
+    .rows[0].canton_party_id;
+
+  const event = await endorse(policy.id, {
+    reason: 'ER_Correction',
+    sumInsuredChanges: [{ coverageCode: 'TEST-COVERAGE', sumInsured: 12000 }],
+  });
+  assert.equal(event.status, 'done', event.error ?? '');
+  const { row, token } = await policyAndToken(policy.id);
+  assert.equal(row.current_version, 2, 'not vacuous: the endorsement re-minted');
+  assert.equal(token.createArgument.mortgagee, bankParty);
+  assert.equal(row.mortgagee_policyholder_id, bank.id);
+});
+
+test('an endorsement row naming a mortgagee that is not one of this insurer\'s policyholders fails before the ledger', async () => {
+  const ph = await createPolicyholder();
+  const policy = await createPolicy(ph.id);
+  await activate(policy.id);
+  await runOnce();
+  const { row: before } = await policyAndToken(policy.id);
+
+  // Both are real parties, so the ledger alone would accept either.
+  const unregistered = await allocateParty(
+    'Test unregistered mortgagee (dispatcher.test.mjs)',
+    `test-unregistered-${crypto.randomUUID()}`
+  );
+  const { rows: [otherInsurer] } = await pool.query(
+    `INSERT INTO insurers (legal_name, api_key_hash, canton_party_status)
+     VALUES ('Test Insurer Ltd (fixture, other tenant, fake)', $1, 'PENDING') RETURNING id`,
+    [crypto.randomBytes(16).toString('hex')]
+  );
+  try {
+    const { rows: [othersPerson] } = await pool.query(
+      `INSERT INTO policyholders (insurer_id, external_ref) VALUES ($1, $2) RETURNING id`,
+      [otherInsurer.id, `other-tenant-bank-${crypto.randomUUID()}`]
+    );
+    const othersParty = await allocateRegisteredParty(othersPerson.id);
+    for (const [label, party] of [['unregistered', unregistered], ['another insurer\'s', othersParty]]) {
+      const event = await endorse(policy.id, { reason: 'ER_Correction', newMortgagee: { value: party } });
+      assert.equal(event.status, 'failed', `${label}: the row is refused`);
+      assert.match(event.error, /not the party of one of this insurer's policyholders/);
+      const { row, token } = await policyAndToken(policy.id);
+      assert.equal(row.daml_contract_id, before.daml_contract_id, `${label}: nothing reached the ledger`);
+      assert.equal(row.current_version, before.current_version);
+      assert.equal(token.createArgument.mortgagee, null);
+      assert.equal(row.mortgagee_policyholder_id, null);
+    }
+  } finally {
+    await pool.query('DELETE FROM policyholders WHERE insurer_id = $1', [otherInsurer.id]);
+    await pool.query('DELETE FROM insurers WHERE id = $1', [otherInsurer.id]);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // m. 1434(2) -- first-premium default: cayma, not fesih
 // ---------------------------------------------------------------------------
@@ -2029,6 +3054,7 @@ async function inFirstPremiumDefault(policyId, dueDate) {
 const daysAgo = (n) => new Date(Date.now() - n * 24 * 60 * 60 * 1000).toISOString();
 
 test('reporting a first premium due and unpaid moves the policy into its own state', async () => {
+  await archiveFixtureContracts(); // the earlier sections' contracts: see the note after archiveFixtureContracts
   const ph = await createPolicyholder();
   const policy = await createPolicy(ph.id);
   await setFirstPremiumWindow(60);
@@ -2177,7 +3203,7 @@ test('a trigger against a policy in first-premium default is refused with its ow
   const readingId = await insertTriggerReading(policy.id, -1);
   await runOnce();
 
-  const ev = await pool.query('SELECT * FROM policy_events WHERE reading_id = $1', [readingId]);
+  const ev = await pool.query('SELECT * FROM policy_events WHERE id = $1', [readingId]);
   assert.equal(ev.rows[0].status, 'failed', 'never silently skipped');
   assert.equal(ev.rows[0].payload.observedValue, -1, 'the observed value stays on the row');
   assert.match(
@@ -2243,6 +3269,66 @@ test('a withdrawal on a policy with no reported due date is refused, not default
   assert.equal(queued.rows[0].n, 0);
 });
 
+// Migration 037: the sweeper reads the window frozen onto the policy, so
+// unsetting the insurer's value afterwards does not hide an elapsed window.
+test('the sweeper selects an elapsed policy on its frozen window after the insurer value is unset', async () => {
+  await restoringInsurerWindows(async () => {
+    const ph = await createPolicyholder();
+    const policy = await createPolicy(ph.id);
+    await setFirstPremiumWindow(60);
+    const dueDate = daysAgo(90);
+    await inFirstPremiumDefault(policy.id, dueDate);
+    await setFirstPremiumWindow(null);
+
+    await sweepFirstPremium({ insurerIds: [insurerId] });
+    const queued = await pool.query(
+      `SELECT count(*)::int n FROM policy_events
+       WHERE policy_no = $1 AND event_type = 'first_premium_deemed_withdrawal'`,
+      [policy.id]
+    );
+    assert.equal(queued.rows[0].n, 1, 'the frozen window has elapsed, so the policy is swept');
+    await runOnce();
+    const ev = await eventRow(policy.id, 'first_premium_deemed_withdrawal');
+    assert.equal(ev.status, 'done', ev.error ?? '');
+    const { rows } = await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id]);
+    assert.equal(rows[0].default_state, 'withdrawn_for_first_premium');
+    assert.equal(
+      new Date(rows[0].withdrawn_at).getTime(),
+      new Date(dueDate).getTime() + 60 * 24 * 60 * 60 * 1000,
+      'the deadline is the frozen window'
+    );
+  });
+});
+
+// An unset window is frozen as unset, and the refusal stays at use time.
+test('a policy activated with no first-premium window fails its withdrawal, even after the insurer sets one', async () => {
+  await restoringInsurerWindows(async () => {
+    const ph = await createPolicyholder();
+    const policy = await createPolicy(ph.id);
+    await setFirstPremiumWindow(null);
+    await inFirstPremiumDefault(policy.id, daysAgo(30));
+    let row = (await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id])).rows[0];
+    assert.equal(row.default_state, 'first_premium_unpaid');
+    assert.equal(row.first_premium_withdrawal_days, null, 'NULL is frozen as NULL');
+    await setFirstPremiumWindow(60);
+
+    await insertLifecycleEvent(policy.id, 'first_premium_withdrawal', {
+      withdrawnAt: new Date().toISOString(),
+    });
+    await runOnce();
+    const ev = await eventRow(policy.id, 'first_premium_withdrawal');
+    assert.equal(ev.status, 'failed');
+    row = (await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id])).rows[0];
+    assert.equal(row.default_state, 'first_premium_unpaid', 'nothing moved');
+    const { failure } = buildPolicyRecord(row, [], [ev], false).events[0];
+    assert.equal(failure.code, 'first_premium_withdrawal_window_not_configured');
+    assert.equal(
+      failure.message,
+      'No first-premium withdrawal window was configured for the insurer when the policy was activated.'
+    );
+  });
+});
+
 // The two mechanisms must not be conflatable, at the SQL layer as well as the
 // ledger's.
 test('the m. 1434(2) and m. 1434(3) mechanisms cannot both apply to one policy', async () => {
@@ -2283,16 +3369,17 @@ async function createPolicyWithoutCover(policyholderId, opts = {}) {
   await pool.query(
     `INSERT INTO policy_coverages
        (policy_id, coverage_code, product_code, peril_type, cell_ids,
-        sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination)
+        sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination, metric, payout_basis)
      VALUES ($1,'TEST-COVERAGE','TEST-PRODUCT','TEST-PERIL','["cell-test"]',10000,10000,
-       '[{"tierOrder":1,"label":"test tier","minValue":"-2.0","maxValue":"0.0","payoutPct":"25.0"},{"tierOrder":2,"label":"test total loss","minValue":null,"maxValue":"-4.0","payoutPct":"100.0"}]',
-       '["PDR_Insured"]')`,
+       '[{"tierOrder":1,"label":"test tier","minValue":"-2.0","maxValue":"0.0","payoutPct":"25.0","shape":"TS_Step","pctAtMin":null,"pctAtMax":null},{"tierOrder":2,"label":"test total loss","minValue":null,"maxValue":"-4.0","payoutPct":"100.0","shape":"TS_Step","pctAtMin":null,"pctAtMax":null}]',
+       '["PDR_Insured"]','TEMPERATURE_C','PB_RemainingLimit')`,
     [policy.id]
   );
   return policy;
 }
 
 test('a minted policy has no cover until it is reported', async () => {
+  await archiveFixtureContracts(); // the earlier sections' contracts: see the note after archiveFixtureContracts
   const ph = await createPolicyholder();
   const policy = await createPolicyWithoutCover(ph.id);
 
@@ -2320,7 +3407,7 @@ test('a trigger before cover begins is refused with its own reason', async () =>
   const readingId = await insertTriggerReading(policy.id, -1);
   await runOnce();
 
-  const ev = await pool.query('SELECT * FROM policy_events WHERE reading_id = $1', [readingId]);
+  const ev = await pool.query('SELECT * FROM policy_events WHERE id = $1', [readingId]);
   assert.equal(ev.rows[0].status, 'failed', 'never silently skipped');
   assert.equal(ev.rows[0].payload.observedValue, -1, 'the observed value stays on the row');
   assert.match(
@@ -2366,8 +3453,70 @@ test('reporting the first premium starts cover at the reported instant, and the 
   // And a trigger now works.
   const readingId = await insertTriggerReading(policy.id, -1);
   await runOnce();
-  const ev = await pool.query('SELECT * FROM policy_events WHERE reading_id = $1', [readingId]);
+  const ev = await pool.query('SELECT * FROM policy_events WHERE id = $1', [readingId]);
   assert.equal(ev.rows[0].status, 'done', ev.rows[0].error ?? '');
+});
+
+// The route answers 409; a row queued past it fails here,
+// before the ledger, and the first recorded date stands in SQL and on the token.
+test('a second first-premium-paid row fails before the ledger once the first premium is recorded', async () => {
+  const ph = await createPolicyholder();
+  const policy = await createPolicyWithoutCover(ph.id);
+  await activate(policy.id);
+  await runOnce();
+  const paidAt = '2026-09-20T09:00:00.000Z';
+  await insertLifecycleEvent(policy.id, 'first_premium_paid', { paidAt });
+  await runOnce();
+  const recorded = (await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id])).rows[0];
+  assert.equal(new Date(recorded.first_premium_paid_at).toISOString(), paidAt);
+
+  await insertLifecycleEvent(policy.id, 'first_premium_paid', { paidAt: '2026-09-21T09:00:00.000Z' });
+  await runOnce();
+  const { rows: events } = await pool.query(
+    `SELECT * FROM policy_events WHERE policy_no = $1 AND event_type = 'first_premium_paid' ORDER BY created_at`,
+    [policy.id]
+  );
+  assert.deepEqual(events.map((e) => e.status), ['done', 'failed']);
+  assert.match(events[1].error, /already has its first premium recorded as paid/);
+  const after = (await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id])).rows[0];
+  assert.equal(new Date(after.first_premium_paid_at).toISOString(), paidAt, 'the first date stands');
+  assert.equal(after.daml_contract_id, recorded.daml_contract_id, 'the token was not re-minted');
+  assert.equal(after.current_version, recorded.current_version);
+});
+
+// A due date reported after the payment would move a paid policy into
+// first-premium default. The route answers 409; a row queued past it fails
+// here, before the ledger, and the policy and its token stay as they were.
+test('a premium-due-date row fails before the ledger once the first premium is recorded paid', async () => {
+  const ph = await createPolicyholder();
+  const policy = await createPolicyWithoutCover(ph.id);
+  await activate(policy.id);
+  await runOnce();
+  const paidAt = '2026-09-20T09:00:00.000Z';
+  await insertLifecycleEvent(policy.id, 'first_premium_paid', { paidAt });
+  await runOnce();
+  const recorded = (await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id])).rows[0];
+  assert.equal(new Date(recorded.first_premium_paid_at).toISOString(), paidAt);
+  assert.equal(recorded.default_state, 'none');
+
+  await insertLifecycleEvent(policy.id, 'premium_due_date', { dueDate: '2026-09-10T09:00:00.000Z' });
+  await runOnce();
+  const ev = await pool.query(
+    `SELECT * FROM policy_events WHERE policy_no = $1 AND event_type = 'premium_due_date'`,
+    [policy.id]
+  );
+  assert.equal(ev.rows[0].status, 'failed');
+  assert.match(ev.rows[0].error, /already has its first premium recorded as paid/);
+  assert.ok(ev.rows[0].error.includes(paidAt), 'the recorded payment is named');
+  const after = (await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id])).rows[0];
+  assert.equal(after.default_state, 'none');
+  assert.equal(after.premium_due_date, null);
+  assert.equal(after.daml_contract_id, recorded.daml_contract_id, 'the token was not re-minted');
+  assert.equal(after.current_version, recorded.current_version);
+  const token = (await ledgerContracts('Insurance.PolicyToken', 'PolicyToken'))
+    .find((c) => c.contractId === recorded.daml_contract_id);
+  assert.ok(token, 'the recorded token is still the active one');
+  assert.equal(token.createArgument.defaultState, 'DS_None');
 });
 
 test('an agreed start earlier than payment stands, and payment does not overwrite it', async () => {
@@ -2379,8 +3528,10 @@ test('an agreed start earlier than payment stands, and payment does not overwrit
   const agreed = (await pool.query('SELECT * FROM policies WHERE id = $1', [policy.id])).rows[0];
   assert.equal(agreed.coverage_start_basis, 'CSB_AgreedWithoutPayment');
 
+  // After the agreed start (2026-09-01) and, since v22, not in the
+  // future: the ledger refuses a paidAt after its own time.
   await insertLifecycleEvent(policy.id, 'first_premium_paid', {
-    paidAt: '2026-10-01T09:00:00.000Z',
+    paidAt: '2026-09-15T09:00:00.000Z',
   });
   await runOnce();
 
@@ -2393,7 +3544,7 @@ test('an agreed start earlier than payment stands, and payment does not overwrit
   assert.equal(rows[0].coverage_start_basis, 'CSB_AgreedWithoutPayment', 'and why it began is unchanged');
   assert.equal(
     new Date(rows[0].first_premium_paid_at).toISOString(),
-    '2026-10-01T09:00:00.000Z',
+    '2026-09-15T09:00:00.000Z',
     'the payment date is still recorded, as its own fact'
   );
 });
@@ -2479,6 +3630,7 @@ test('cover start composes with the first-premium default flow', async () => {
 // ---------------------------------------------------------------------------
 
 test('a distinct insured is accepted and reaches the token', async () => {
+  await archiveFixtureContracts(); // the earlier sections' contracts: see the note after archiveFixtureContracts
   const ph = await createPolicyholder();
   const sigortali = await createPerson('insured');
   const policy = await createPolicyWithoutCover(ph.id, { insuredId: sigortali.id });
@@ -2565,10 +3717,10 @@ async function createBackdatedPolicy(policyholderId, opts = {}) {
   await pool.query(
     `INSERT INTO policy_coverages
        (policy_id, coverage_code, product_code, peril_type, cell_ids,
-        sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination)
+        sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination, metric, payout_basis)
      VALUES ($1,'TEST-COVERAGE','TEST-PRODUCT','TEST-PERIL',$2,10000,10000,
-       '[{"tierOrder":1,"label":"test tier","minValue":"-2.0","maxValue":"0.0","payoutPct":"25.0"},{"tierOrder":2,"label":"test total loss","minValue":null,"maxValue":"-4.0","payoutPct":"100.0"}]',
-       '["PDR_Insured"]')`,
+       '[{"tierOrder":1,"label":"test tier","minValue":"-2.0","maxValue":"0.0","payoutPct":"25.0","shape":"TS_Step","pctAtMin":null,"pctAtMax":null},{"tierOrder":2,"label":"test total loss","minValue":null,"maxValue":"-4.0","payoutPct":"100.0","shape":"TS_Step","pctAtMin":null,"pctAtMax":null}]',
+       '["PDR_Insured"]','TEMPERATURE_C','PB_RemainingLimit')`,
     [policy.id, JSON.stringify(cellIds)]
   );
   return policy;
@@ -2587,6 +3739,7 @@ async function readingOnCell(cellId, value, measuredAt, owningPolicyId) {
 }
 
 test('a backdated policy with no matching reading mints, and records that the check ran', async () => {
+  await archiveFixtureContracts(); // the earlier sections' contracts: see the note after archiveFixtureContracts
   const ph = await createPolicyholder();
   const cell = `cell-clean-${crypto.randomUUID()}`;
   const neighbour = await createPolicy(ph.id);
@@ -2673,6 +3826,64 @@ test('a reading matching no tier does not refuse', async () => {
   assert.equal(rows[0].retroactive_cover_check_result.readingsExamined, 1);
 });
 
+// v22: the check evaluates a reading exactly as the ledger would
+// (tiers.js), so on a linear tier a reading whose computed amount is 0.00 is
+// no match -- it pays nothing on the trigger path -- and does not refuse the
+// mint, while one that computes to a positive amount does. The tier runs from
+// 50% at -2.0 to 0% at 0.0.
+test('m. 1458 on a linear tier: a reading that computes to 0.00 passes, one that pays refuses', async () => {
+  const LINEAR = JSON.stringify([{
+    tierOrder: 1, label: 'linear test tier', minValue: '-2.0', maxValue: '0.0', payoutPct: '50.0',
+    shape: 'TS_Linear', pctAtMin: '50.0', pctAtMax: '0.0',
+  }]);
+  const ph = await createPolicyholder();
+  const neighbour = await createPolicy(ph.id);
+  for (const [value, refused] of [[0.0, false], [-1.0, true]]) {
+    const cell = `cell-linear-${crypto.randomUUID()}`;
+    await readingOnCell(cell, value, '2026-06-15T00:00:00.000Z', neighbour.id);
+    const policy = await createBackdatedPolicy(ph.id, { cellIds: [cell] });
+    await pool.query('UPDATE policy_coverages SET payout_tiers_snapshot = $2 WHERE policy_id = $1', [policy.id, LINEAR]);
+    await activate(policy.id);
+    await runOnce();
+    const ev = (await pool.query(
+      `SELECT * FROM policy_events WHERE policy_no = $1 AND event_type = 'activation'`, [policy.id]
+    )).rows[0];
+    if (refused) {
+      assert.equal(ev.status, 'failed', `${value}: 25% of the limit would pay`);
+      assert.match(ev.error, /1458/);
+      assert.match(ev.error, /would pay 2500 on/, 'the amount the trigger path would pay is named');
+    } else {
+      assert.equal(ev.status, 'done', `${value}: 0% computes to 0.00, no match -- ${ev.error ?? ''}`);
+    }
+  }
+});
+
+// v22: a trigger row that names no window -- what fixtures wrote before v22 --
+// has no event interval, cell or evidence digest to send, and is refused with
+// that reason before anything reaches the ledger.
+test('a trigger row with no window fails with its reason and sends nothing', async () => {
+  const ph = await createPolicyholder();
+  const policy = await createPolicy(ph.id);
+  await activate(policy.id);
+  await runOnce();
+  const reading = (await pool.query(
+    `INSERT INTO oracle_readings (policy_id, coverage_code, cell_id, metric, value, measured_at, source)
+     VALUES ($1,'TEST-COVERAGE','cell-test','TEMPERATURE_C',-1,now(),'test-fixture') RETURNING id`,
+    [policy.id]
+  )).rows[0];
+  const { rows: [row] } = await pool.query(
+    `INSERT INTO policy_events (policy_no, event_type, expected_version, reading_id, payload)
+     VALUES ($1, 'trigger', 1, $2, $3) RETURNING id`,
+    [policy.id, reading.id, JSON.stringify({ observedValue: -1, metric: 'TEMPERATURE_C', coverageCode: 'TEST-COVERAGE' })]
+  );
+  await runOnce();
+  const ev = (await pool.query('SELECT * FROM policy_events WHERE id = $1', [row.id])).rows[0];
+  assert.equal(ev.status, 'failed');
+  assert.match(ev.error, /names no trigger window/);
+  assert.match(ev.error, /nothing was sent/);
+  assert.equal((await pool.query('SELECT count(*)::int n FROM payout_events WHERE policy_id = $1', [policy.id])).rows[0].n, 0);
+});
+
 // A pass over a cell the platform has never observed verified NOTHING, and
 // must never be read later as "we confirmed there was no frost".
 test('a pass over a cell with no readings is recorded as vacuous, not as verified', async () => {
@@ -2704,7 +3915,18 @@ test('one unobserved cell among several makes the whole pass vacuous', async () 
   const unseen = `cell-unseen-${crypto.randomUUID()}`;
   const neighbour = await createPolicy(ph.id);
   await readingOnCell(seen, 5.0, '2026-06-10T00:00:00.000Z', neighbour.id);
-  const policy = await createBackdatedPolicy(ph.id, { cellIds: [seen, unseen] });
+  // Two coverages, one cell each: since v22 a coverage commits to exactly one
+  // cell, and a mint of a coverage naming two is refused.
+  const policy = await createBackdatedPolicy(ph.id, { cellIds: [seen] });
+  await pool.query(
+    `INSERT INTO policy_coverages
+       (policy_id, coverage_code, product_code, peril_type, cell_ids,
+        sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination, metric, payout_basis)
+     SELECT policy_id, 'TEST-COVERAGE-2', product_code, peril_type, $2, sum_insured, remaining_limit,
+            payout_tiers_snapshot, payout_destination, metric, payout_basis
+       FROM policy_coverages WHERE policy_id = $1 AND coverage_code = 'TEST-COVERAGE'`,
+    [policy.id, JSON.stringify([unseen])]
+  );
 
   await activate(policy.id);
   await runOnce();
@@ -2778,7 +4000,7 @@ test('a backdated policy that passes has cover begun, and triggers normally', as
 
   const readingId = await insertTriggerReading(policy.id, -1);
   await runOnce();
-  const ev = await pool.query('SELECT * FROM policy_events WHERE reading_id = $1', [readingId]);
+  const ev = await pool.query('SELECT * FROM policy_events WHERE id = $1', [readingId]);
   assert.equal(ev.rows[0].status, 'done', 'cover has begun, so the trigger evaluates normally');
 });
 
@@ -2844,6 +4066,7 @@ async function trigger(policyId) {
 }
 
 test('a payout below the mortgagee claim goes wholly to the mortgagee', async () => {
+  await archiveFixtureContracts(); // the earlier sections' contracts: see the note after archiveFixtureContracts
   const ph = await createPolicyholder();
   const bank = await createPerson('bank');
   const policy = await createChargedPolicy(ph.id, bank.id, 5000);
@@ -2989,7 +4212,7 @@ test('the two records from one split settle and resolve independently', async ()
   const settlement = await reportOnPayout(leg, {
     action: 'settle',
     bankReference: 'REF-BANK-1',
-    settledAt: '2026-09-10T00:00:00.000Z',
+    settledAt: new Date().toISOString(),
     paidRole: 'PDR_Mortgagee',
   });
   assert.equal(settlement.status, 'done');
@@ -3015,7 +4238,7 @@ test('a settlement claiming to have paid the wrong recipient is rejected', async
   const settlement = await reportOnPayout(leg, {
     action: 'settle',
     bankReference: 'REF-WRONG',
-    settledAt: '2026-09-10T00:00:00.000Z',
+    settledAt: new Date().toISOString(),
     paidRole: 'PDR_Insured',
   });
   assert.equal(settlement.status, 'failed');
@@ -3094,10 +4317,10 @@ async function createForAnothersAccount(policyholderId, insuredId) {
   await pool.query(
     `INSERT INTO policy_coverages
        (policy_id, coverage_code, product_code, peril_type, cell_ids,
-        sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination)
+        sum_insured, remaining_limit, payout_tiers_snapshot, payout_destination, metric, payout_basis)
      VALUES ($1,'TEST-COVERAGE','TEST-PRODUCT','TEST-PERIL','["cell-test"]',10000,10000,
-       '[{"tierOrder":1,"label":"test tier","minValue":"-2.0","maxValue":"0.0","payoutPct":"25.0"}]',
-       '["PDR_Insured"]')`,
+       '[{"tierOrder":1,"label":"test tier","minValue":"-2.0","maxValue":"0.0","payoutPct":"25.0","shape":"TS_Step","pctAtMin":null,"pctAtMax":null}]',
+       '["PDR_Insured"]','TEMPERATURE_C','PB_RemainingLimit')`,
     [policy.id]
   );
   return policy;
@@ -3126,6 +4349,7 @@ async function substitute(policyId, at = daysAgoIso(1)) {
 }
 
 test('the three m. 1431(4) facts are recorded in order, and only in order', async () => {
+  await archiveFixtureContracts(); // the earlier sections' contracts: see the note after archiveFixtureContracts
   const ettiren = await createPolicyholder();
   const sigortali = await createPerson('sigortali');
   const policy = await createForAnothersAccount(ettiren.id, sigortali.id);
@@ -3332,6 +4556,7 @@ async function infoProvided(policyId, providedAt) {
 }
 
 test('a m. 1456(6) request and response are recorded as two dated facts', async () => {
+  await archiveFixtureContracts(); // the earlier sections' contracts: see the note after archiveFixtureContracts
   const ph = await createPolicyholder();
   const bank = await createPerson('bank');
   const policy = await createPolicyWithRoles(ph.id, { mortgageeId: bank.id });
@@ -3497,6 +4722,7 @@ async function elect(policyId, { electedAt, start, end }) {
 }
 
 test('two notices in one period make the m. 1434(4) right available; one does not', async () => {
+  await archiveFixtureContracts(); // the earlier sections' contracts: see the note after archiveFixtureContracts
   const ph = await createPolicyholder();
   const policy = await createPolicy(ph.id);
   await activate(policy.id);
@@ -3518,7 +4744,6 @@ test('two notices in one period make the m. 1434(4) right available; one does no
   assert.equal(row.notice_count, 2);
   assert.equal(row.notice_service_dates.length, 2);
 
-  const beforeElection = await policyRow(policy.id);
   const elected = await elect(policy.id, { electedAt: tnDays(0), start: tnDays(-60), end: tnDays(30) });
   assert.equal(elected.status, 'done', elected.error ?? '');
 
@@ -3532,6 +4757,11 @@ test('two notices in one period make the m. 1434(4) right available; one does no
     .find((c) => c.contractId === row.daml_contract_id);
   assert.equal(token.createArgument.defaultState, 'DS_TwoNoticeElected');
   assert.equal(token.createArgument.noticeServiceDates.length, 2);
+  assert.equal(
+    new Date(token.createArgument.coverageValidThrough).getTime(),
+    new Date(token.createArgument.expiry).getTime(),
+    'the election does not shorten cover: coverageValidThrough is still the term expiry'
+  );
 });
 
 test('two notices outside the named period do not count -- the dates decide, not the count', async () => {
@@ -3579,7 +4809,7 @@ test('the effect lands only at the period end, and the sweeper is a state test',
   const readingId = await insertTriggerReading(pending.id, -1);
   await runOnce();
   assert.equal(
-    (await pool.query('SELECT * FROM policy_events WHERE reading_id = $1', [readingId])).rows[0].status,
+    (await pool.query('SELECT * FROM policy_events WHERE id = $1', [readingId])).rows[0].status,
     'done'
   );
   assert.equal((await policyRow(pending.id)).default_state, 'two_notice_elected');
@@ -3615,9 +4845,103 @@ test('the effect lands only at the period end, and the sweeper is a state test',
   // After it lands, a loss is outside cover, with its own message.
   const lateReading = await insertTriggerReading(landed.id, -1);
   await runOnce();
-  const late = (await pool.query('SELECT * FROM policy_events WHERE reading_id = $1', [lateReading])).rows[0];
+  const late = (await pool.query('SELECT * FROM policy_events WHERE id = $1', [lateReading])).rows[0];
   assert.equal(late.status, 'failed');
   assert.match(late.error, /1434\(4\)/);
+});
+
+// v22. Once the elected termination has landed, the token is archived by
+// the non-payment route -- queued by the two-notice sweeper's phase two, with
+// the treatment a terminated token gets: not while a payout raised on it is
+// open, and not before the last window before the effective instant has been
+// evaluated. Before this, nothing archived such a token.
+test('a two-notice-terminated token is archived once its payouts are resolved and its last window is evaluated', async () => {
+  const archiveRows = async (policyId) => (await pool.query(
+    `SELECT * FROM policy_events WHERE policy_no = $1 AND event_type = 'termination_archive'`, [policyId]
+  )).rows;
+  const ph = await createPolicyholder();
+  const policy = await createPolicy(ph.id);
+  await activate(policy.id);
+  await runOnce();
+  await noticeThenPay(policy.id, tnDays(-50));
+  await noticeThenPay(policy.id, tnDays(-20));
+  await elect(policy.id, { electedAt: tnDays(-10), start: tnDays(-60), end: tnDays(-1) });
+
+  // A loss before the effective instant is payable; its payout is still open
+  // when the termination lands. Its window ends two days before that instant,
+  // so its reading is outside the last window checked below.
+  await insertTriggerReading(policy.id, -1, { eventEnd: tnDays(-3) });
+  await runOnce();
+  const payout = (await pool.query('SELECT * FROM payout_events WHERE policy_id = $1', [policy.id])).rows[0];
+  assert.ok(payout, 'a loss before the elected termination takes effect must pay');
+
+  // Phase one queues the landing; phase two finds nothing while it is elected.
+  await sweepTwoNotice({ insurerIds: [insurerId] });
+  assert.equal((await archiveRows(policy.id)).length, 0, 'elected, not yet terminated: no archive');
+  await runOnce();
+  assert.equal((await policyRow(policy.id)).default_state, 'two_notice_terminated');
+
+  // An open payout keeps the token live.
+  await sweepTwoNotice({ insurerIds: [insurerId] });
+  assert.equal((await archiveRows(policy.id)).length, 0, 'the token must stay live while a payout on it is open');
+
+  const settled = await reportOnPayout(payout, {
+    action: 'settle',
+    bankReference: 'TEST-REF-TWO-NOTICE',
+    settledAt: new Date().toISOString(),
+    paidRole: 'PDR_Insured',
+  });
+  assert.equal(settled.status, 'done', settled.error ?? '');
+
+  // An in-cover reading in the last window before the effective instant, with
+  // no trigger_windows row, holds the archive -- the expiry sweeper's own test,
+  // with two_notice_effective_at as the end. The rule is written onto the row
+  // here only so the sweeper has a window to look at.
+  const rule = { timezone: 'UTC', startHour: 0, aggregation: 'min' };
+  await pool.query(
+    `UPDATE policies SET event_window_timezone = $2, event_window_start_hour = $3, event_aggregation = $4 WHERE id = $1`,
+    [policy.id, rule.timezone, rule.startHour, rule.aggregation]
+  );
+  const effective = new Date((await policyRow(policy.id)).two_notice_effective_at);
+  const lastWindow = windowFor(new Date(effective.getTime() - 1), rule);
+  const measuredAt = new Date(lastWindow.start.getTime() + Math.floor((effective.getTime() - lastWindow.start.getTime()) / 2));
+  await pool.query(
+    `INSERT INTO oracle_readings (policy_id, coverage_code, cell_id, metric, value, measured_at, source)
+     VALUES ($1,'TEST-COVERAGE','cell-test','TEMPERATURE_C',-1.0,$2,'dispatcher-fixture')`,
+    [policy.id, measuredAt.toISOString()]
+  );
+  await sweepTwoNotice({ insurerIds: [insurerId] });
+  assert.equal(
+    (await archiveRows(policy.id)).length, 0,
+    'the last window before the effective instant holds an in-cover reading it has not been evaluated on'
+  );
+
+  // Once nothing is left unevaluated there, it is queued, and the archive lands.
+  await pool.query(`DELETE FROM oracle_readings WHERE policy_id = $1 AND source = 'dispatcher-fixture'`, [policy.id]);
+  const liveCid = (await policyRow(policy.id)).daml_contract_id;
+  await sweepTwoNotice({ insurerIds: [insurerId] });
+  assert.equal((await archiveRows(policy.id)).length, 1);
+  await runOnce();
+
+  const [archive] = await archiveRows(policy.id);
+  assert.equal(archive.status, 'done', archive.error ?? '');
+  const row = await policyRow(policy.id);
+  assert.equal(row.status, 'cancelled');
+  assert.equal(row.daml_contract_id, null, 'the token is burned');
+  assert.equal(row.default_state, 'two_notice_terminated', 'its own state stays on the record, not "terminated"');
+  // v22: the contract ended at the frozen effective instant; the record
+  // closed at the archive's ledger time, later.
+  assert.equal(new Date(row.contract_ended_at).getTime(), effective.getTime());
+  assert.ok(new Date(row.record_closed_at) > new Date(row.contract_ended_at));
+  assert.ok(
+    !(await ledgerContracts('Insurance.PolicyToken', 'PolicyToken')).some((c) => c.contractId === liveCid),
+    'the token is no longer active on the ledger'
+  );
+  const history = await pool.query(
+    `SELECT * FROM policy_status_history WHERE policy_id = $1 AND event_type = 'termination_archive'`, [policy.id]
+  );
+  assert.equal(history.rows.length, 1);
+  assert.match(history.rows[0].reason, /elected termination took effect/);
 });
 
 test('the election is refused while a notice period is running', async () => {
@@ -3652,7 +4976,7 @@ test('a policy already terminated under m. 1434(3) cannot be elected under (4)',
   await runOnce();
   await noticeThenPay(policy.id, tnDays(-50));
 
-  // The second notice runs its ten days unpaid, so (3) ends the contract.
+  // The second notice runs its 14 fixture days unpaid, so (3) ends the contract.
   await insertLifecycleEvent(policy.id, 'notice', { serviceDate: tnDays(-30) });
   await runOnce();
   await insertLifecycleEvent(policy.id, 'termination', {});
@@ -3715,7 +5039,10 @@ test('substitution does not reset the notice count', async () => {
 
 test('the sweeper leaves an expired policy alone -- both facts stay recorded', async () => {
   const ph = await createPolicyholder();
-  const policy = await createPolicy(ph.id);
+  // v22: the TOKEN's term has to have ended for the expiry archive to
+  // be accepted, so the policy is minted with an end date already past; the
+  // UPDATE below still aligns the SQL row as before.
+  const policy = await createPolicy(ph.id, { endDate: tnDays(-1).slice(0, 10) });
   await activate(policy.id);
   await runOnce();
   await noticeThenPay(policy.id, tnDays(-50));
@@ -3790,6 +5117,7 @@ async function payoutRowsFor(policyId) {
 }
 
 test('an attachment routes a later payout to the enforcement office', async () => {
+  await archiveFixtureContracts(); // the earlier sections' contracts: see the note after archiveFixtureContracts
   const ph = await createPolicyholder();
   const policy = await createPolicy(ph.id);
   await activate(policy.id);
@@ -3917,7 +5245,7 @@ test('a settlement to the original recipient on an attached coverage is refused'
   const refused = await reportOnPayout(payout, {
     action: 'settle',
     bankReference: 'REF-TO-INSURED',
-    settledAt: attDays(0),
+    settledAt: new Date().toISOString(),
     paidRole: 'PDR_Insured',
   });
   assert.equal(refused.status, 'failed');
@@ -3933,7 +5261,7 @@ test('a settlement to the original recipient on an attached coverage is refused'
   const accepted = await reportOnPayout(payout, {
     action: 'settle',
     bankReference: 'REF-TO-INSURED',
-    settledAt: attDays(0),
+    settledAt: new Date().toISOString(),
     paidRole: 'PDR_Insured',
   });
   assert.equal(accepted.status, 'done', accepted.error ?? '');
@@ -3955,7 +5283,7 @@ test('an enforcement-office payout settles as its own recipient', async () => {
   const wrong = await reportOnPayout(payout, {
     action: 'settle',
     bankReference: 'REF-WRONG',
-    settledAt: attDays(0),
+    settledAt: new Date().toISOString(),
     paidRole: 'PDR_Insured',
   });
   assert.equal(wrong.status, 'failed');
@@ -3963,7 +5291,7 @@ test('an enforcement-office payout settles as its own recipient', async () => {
   const ok = await reportOnPayout(payout, {
     action: 'settle',
     bankReference: 'REF-ICRA-1',
-    settledAt: attDays(0),
+    settledAt: new Date().toISOString(),
     paidRole: 'PDR_EnforcementOffice',
   });
   assert.equal(ok.status, 'done', ok.error ?? '');
@@ -4037,11 +5365,12 @@ async function approvedThenAttached() {
 }
 
 test('m. 1457 refuses a SETTLE report on an attached coverage', async () => {
+  await archiveFixtureContracts(); // the earlier sections' contracts: see the note after archiveFixtureContracts
   const { payout } = await approvedThenAttached();
   const ev = await reportOnPayout(payout, {
     action: 'settle',
     bankReference: 'REF-1',
-    settledAt: attDays(0),
+    settledAt: new Date().toISOString(),
     paidRole: 'PDR_Insured',
   });
   assert.equal(ev.status, 'failed');
@@ -4073,6 +5402,7 @@ test('m. 1457 PERMITS closing a review item unpaid on an attached coverage', asy
     action: 'resolve_unpaid',
     unpaidReason: 'UR_Other',
     note: 'the icra file is unresolved; nothing was paid to anyone',
+    closedAt: new Date().toISOString(),
   });
   assert.equal(ev.status, 'done', ev.error ?? '');
   const after = await reloadPayout(payout.id);
@@ -4092,7 +5422,7 @@ test('m. 1457 refuses RESOLVE-SETTLED on an attached coverage -- the same discha
   const ev = await reportOnPayout(inReview, {
     action: 'resolve_settled',
     bankReference: 'REF-VIA-REVIEW',
-    settledAt: attDays(0),
+    settledAt: new Date().toISOString(),
     paidRole: 'PDR_Insured',
   });
   assert.equal(ev.status, 'failed');
@@ -4109,7 +5439,7 @@ test('lifting the attachment reopens both discharge paths', async () => {
     (await reportOnPayout(inReview, {
       action: 'resolve_settled',
       bankReference: 'REF-BEFORE-LIFT',
-      settledAt: attDays(0),
+      settledAt: new Date().toISOString(),
       paidRole: 'PDR_Insured',
     })).status,
     'failed'
@@ -4119,7 +5449,7 @@ test('lifting the attachment reopens both discharge paths', async () => {
   const ev = await reportOnPayout(inReview, {
     action: 'resolve_settled',
     bankReference: 'REF-AFTER-LIFT',
-    settledAt: attDays(0),
+    settledAt: new Date().toISOString(),
     paidRole: 'PDR_Insured',
   });
   assert.equal(ev.status, 'done', ev.error ?? '');
@@ -4147,7 +5477,8 @@ test('a term date in year 0026 becomes an instant in year 0026, not 1926', () =>
 // pointed DATABASE_URL at. In this file rather than one of its own because
 // FOUND needs a real mint by an insurer the participant has granted, and this
 // file already allocates one; a file of its own would grant a second
-// insurer/oracle pair on every run, and nothing revokes those.
+// insurer/oracle pair on every run. Its grants could be revoked the way this
+// file's are (after() calls revokeFixtureRights), but its parties would stay.
 
 const FIND_OUTBOX_COMMAND = fileURLToPath(new URL('../../scripts/findOutboxCommand.mjs', import.meta.url));
 
@@ -4190,6 +5521,7 @@ async function claimedWithoutSubmitting(policyId, eventType) {
 }
 
 test('findOutboxCommand: a mint that landed while its row is still processing is FOUND, with the token\'s contract id', async () => {
+  await archiveFixtureContracts(); // the earlier sections' contracts: see the note after archiveFixtureContracts
   const offsetBefore = await getLedgerEnd();
   const policy = await createPolicy((await createPolicyholder()).id);
   await activate(policy.id);
@@ -4298,4 +5630,193 @@ test('findOutboxCommand: CANNOT SEARCH for a release row, which submits nothing,
     await pool.query('SELECT status FROM policy_events WHERE id = ANY($1)', [[releaseId, activationId]])
   ).rows.map((r) => r.status);
   assert.deepEqual(statuses, ['processing', 'processing'], 'the script wrote nothing');
+});
+
+// --- the roles page (debug, loopback-only) -------------------
+//
+// One minted policy with a mortgagee, read through /debug/roles-data as each
+// party. The page shows what the LEDGER returns to each party, so these read the
+// ledger too: a column is only right if the participant said so.
+
+let rolesServer;
+let rolesBase;
+
+async function rolesApi(method, path, body) {
+  if (!rolesServer) {
+    const app = createApp({
+      probeDatabase: async () => true,
+      probeLedger: async () => true,
+      processDegraded: () => null,
+      debugRoutes: 'true',
+    });
+    rolesServer = app.listen(0, '127.0.0.1');
+    await new Promise((resolve) => rolesServer.once('listening', resolve));
+    rolesBase = `http://127.0.0.1:${rolesServer.address().port}/debug`;
+  }
+  const res = await fetch(`${rolesBase}${path}`, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  return { status: res.status, text, body: JSON.parse(text) };
+}
+
+after(() => rolesServer?.close());
+
+const rightsHeld = async () => (await listUserRights(config.daml.unsafeJwtSub)).length;
+
+// A second onboarded insurer, the outsider: allocated and granted a CanActAs as
+// onboardInsurer.js would, so reading as it needs no temporary right. Its row is
+// removed by the test that made it; its party stays, like every party a run
+// allocates.
+async function createOutsiderInsurer() {
+  const party = await allocateParty(
+    'Test Outsider Insurer (dispatcher.test.mjs)',
+    `test-outsider-insurer-${crypto.randomUUID()}`,
+    { grantActAs: true }
+  );
+  grantedActAs.push(party);
+  const { rows } = await pool.query(
+    `INSERT INTO insurers (legal_name, api_key_hash, canton_party_id, canton_party_status)
+     VALUES ('Test Outsider Insurer Ltd (fixture, fake)', $1, $2, 'ALLOCATED') RETURNING id`,
+    [crypto.randomBytes(16).toString('hex'), party]
+  );
+  return { id: rows[0].id, party };
+}
+
+async function mintedWithMortgagee() {
+  const ph = await createPolicyholder();
+  const bank = await createPerson('roles-bank');
+  const policy = await createPolicyWithRoles(ph.id, { mortgageeId: bank.id });
+  await activate(policy.id);
+  await runOnce();
+  const { rows: [row] } = await pool.query('SELECT status FROM policies WHERE id = $1', [policy.id]);
+  assert.equal(row.status, 'active', 'the fixture minted');
+  const parties = (
+    await pool.query(
+      `SELECT canton_party_id AS p FROM policyholders WHERE id = ANY($1)
+       UNION SELECT canton_party_id FROM insurers WHERE id = $2
+       UNION SELECT oracle_operator_party FROM insurers WHERE id = $2`,
+      [[ph.id, bank.id], insurerId]
+    )
+  ).rows.map((r) => r.p);
+  assert.equal(parties.filter(Boolean).length, 4, 'policyholder, mortgagee, insurer and oracle operator each hold a party');
+  return { policy, parties };
+}
+
+test('roles-data: four roles, each as the ledger returns it; holder and observer see the token, the outsider sees nothing, and no full party id leaves', async () => {
+  await archiveFixtureContracts(); // the earlier sections' contracts: see the note after archiveFixtureContracts
+  const outsider = await createOutsiderInsurer();
+  try {
+    const { policy, parties } = await mintedWithMortgagee();
+    const before = await rightsHeld();
+    const { status, text, body } = await rolesApi('GET', `/roles-data?policyId=${policy.id}`);
+    const after = await rightsHeld();
+    console.log(`[roles-data] rights held by ${config.daml.unsafeJwtSub}: ${before} before, ${after} after; response rightsBefore=${body.rightsBefore} rightsAfter=${body.rightsAfter}`);
+
+    assert.equal(status, 200, text);
+    assert.deepEqual(body.roles.map((r) => r.role), ['issuer', 'holder', 'observer', 'outsider']);
+    const role = (name) => body.roles.find((r) => r.role === name);
+    for (const name of ['issuer', 'holder', 'observer']) {
+      assert.equal(role(name).error ?? null, null, `${name}: ${role(name).error}`);
+      assert.ok(role(name).contracts.some((c) => c.template === 'PolicyToken'), `${name} sees the PolicyToken`);
+    }
+    assert.equal(role('outsider').error ?? null, null, role('outsider').error);
+    assert.equal(role('outsider').contracts.length, 0, 'the outsider was asked and the ledger returned nothing');
+    assert.ok(role('outsider').queries.length > 0, 'the outsider count is a query result, not an assumption');
+
+    assert.equal(body.rightsBefore, body.rightsAfter, 'every temporary read right was taken back');
+    assert.equal(after, before, 'the ledger user holds as many rights as before the request');
+    assert.equal(role('holder').readAccess.granted, true, 'the holder was read through a temporary right');
+    assert.equal(role('outsider').readAccess.granted, false, 'the outsider insurer already holds a CanActAs');
+
+    for (const party of [...parties, outsider.party]) {
+      assert.ok(!text.includes(party), `${party.split('::')[0]} appears in full in the response`);
+    }
+
+    const list = await rolesApi('GET', '/roles-data');
+    assert.equal(list.status, 200);
+    assert.ok(list.body.policies.some((p) => p.policyId === policy.id), 'the minted policy is offered for selection');
+  } finally {
+    await pool.query('DELETE FROM insurers WHERE id = $1', [outsider.id]);
+  }
+});
+
+test('roles-data: a read that fails after its right was granted still takes the right back', async () => {
+  const { policy } = await mintedWithMortgagee();
+  const { rows: [ph] } = await pool.query(
+    'SELECT canton_party_id FROM policyholders WHERE id = (SELECT policyholder_id FROM policies WHERE id = $1)',
+    [policy.id]
+  );
+  const before = await rightsHeld();
+  const result = await readPolicyAsRoles(policy.id, {
+    query: async (args) => {
+      if (args.parties.includes(ph.canton_party_id)) throw new Error('injected read failure (test)');
+      return queryActiveContracts(args);
+    },
+  });
+  const after = await rightsHeld();
+  console.log(`[roles-data, injected failure] rights held by ${config.daml.unsafeJwtSub}: ${before} before, ${after} after; result rightsBefore=${result.rightsBefore} rightsAfter=${result.rightsAfter}`);
+
+  const holder = result.roles.find((r) => r.role === 'holder');
+  assert.equal(holder.readAccess.granted, true, 'the right was granted before the read failed, so there was something to take back');
+  assert.match(holder.error, /injected read failure/);
+  assert.equal(after, before);
+  assert.equal(result.rightsAfter, result.rightsBefore);
+});
+
+test('roles-data: of two requests at once, the second is turned away by the lock', async () => {
+  const { policy } = await mintedWithMortgagee();
+  const before = await rightsHeld();
+  const answers = await Promise.all([
+    rolesApi('GET', `/roles-data?policyId=${policy.id}`),
+    rolesApi('GET', `/roles-data?policyId=${policy.id}`),
+  ]);
+  const after = await rightsHeld();
+  console.log(`[roles-data, two at once] statuses ${answers.map((a) => a.status).join(', ')}; rights held ${before} before, ${after} after`);
+  assert.deepEqual(answers.map((a) => a.status).sort(), [200, 409]);
+  assert.equal(answers.find((a) => a.status === 409).body.error, 'another roles read is in progress');
+  assert.equal(after, before);
+});
+
+test('try-insurer-trigger: the ledger refuses the insurer, and nothing changes on the ledger or in SQL', async () => {
+  const { policy, parties } = await mintedWithMortgagee();
+  const tables = ['policy_events', 'attested_evidence', 'oracle_readings'];
+  const counts = async () => {
+    const out = {};
+    for (const t of tables) out[t] = (await pool.query(`SELECT count(*)::int AS n FROM ${t}`)).rows[0].n;
+    return out;
+  };
+  const contractSet = async () => {
+    const ids = [];
+    for (const [moduleName, entityName, field] of [
+      ['Insurance.PolicyToken', 'PolicyToken', 'policyNo'],
+      ['Insurance.PayoutBridge', 'PayoutApproved', 'policyId'],
+      ['Insurance.PayoutBridge', 'ManualReviewRequired', 'policyId'],
+    ]) {
+      for (const c of await ledgerContracts(moduleName, entityName)) {
+        if (c.createArgument[field] === policy.id) ids.push(c.contractId);
+      }
+    }
+    return ids.sort();
+  };
+
+  const countsBefore = await counts();
+  const setBefore = await contractSet();
+  const { status, text, body } = await rolesApi('POST', '/roles/try-insurer-trigger', { policyId: policy.id });
+  const countsAfter = await counts();
+  const setAfter = await contractSet();
+  console.log(`[try-insurer-trigger] ${status} ${text}`);
+
+  assert.equal(status, 200, text);
+  assert.equal(body.refused, true);
+  assert.ok(body.ledgerStatus, 'the ledger\'s own status is passed on');
+  assert.equal(body.oracleOperatorDistinctFromInsurer, true);
+  assert.equal(setBefore.length, 1, 'the fixture holds one token');
+  assert.deepEqual(setAfter, setBefore, 'the same contracts, the same ids');
+  assert.deepEqual(countsAfter, countsBefore, 'no outbox row, no evidence row, no reading');
+  for (const party of parties) {
+    assert.ok(!text.includes(party), `${party.split('::')[0]} appears in full in the response`);
+  }
 });

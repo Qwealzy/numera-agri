@@ -26,10 +26,20 @@ const EXEMPT = new Map([
   ['errorHandler.test.mjs', 'imports only express and src/errorHandler.js, which imports nothing; touches no database'],
   ['health.test.mjs', 'imports only express and src/health.js, which imports nothing; both probes are faked'],
   ['processHandlers.test.mjs', 'runs test-support/processHandlersFixture.mjs in child processes, which imports only express, src/health.js and src/processHandlers.js, neither of which imports anything; both probes are faked; touches no database'],
+  ['dbErrorListeners.test.mjs', 'runs test-support/dbErrorListenersFixture.mjs in child processes, which loads the guard as its first import and so runs against TEST_DATABASE_URL, writing nothing; this file imports only node builtins and touches no database'],
   ['commandId.test.mjs', 'imports only src/damlClient.js and runs against a stub ledger on loopback; touches no database'],
   ['eventWindow.test.mjs', 'imports only src/oracle/eventWindow.js, which is pure; touches no database and no ledger'],
   ['evidenceLock.test.mjs', 'runs against a throwaway database it builds from schema.sql and drops; never connects to the working or test database'],
   ['eventHandlers.test.mjs', 'reads the working database through its own read-only connection; imports dispatcher.js only for EVENT_HANDLERS, whose db.js pool it never queries'],
+  ['webhookSignature.test.mjs', 'imports only src/notifications/envelope.js and signature.js, which are pure and import only node:crypto; touches no database'],
+  ['notificationsContract.test.mjs', 'reads the working database through its own read-only connection, for enum values only, and writes nothing; imports src/notifications/envelope.js, payoutRecord.js and policyRecord.js, which are pure, and neither config.js nor they build a pool'],
+  ['recordProviderResponses.test.mjs', "imports only scripts/recordProviderResponses.mjs's file functions; the script's own imports are node builtins, and config.js, oracleBot.js and axios load lazily only when it records or forecasts; touches no database and no network; the file also runs the script in child processes with placeholder config that the script refuses before any request or write (in the child, config.js loads and db.js builds its pool, which is never queried; no database and no network is touched)"],
+  ['oracleParse.test.mjs', 'imports src/oracle/oracleBot.js for readingFromResponse, which is pure; config.js loads and db.js builds its pool, which is never queried; touches no database and no network'],
+  ['oracleEndpoint.test.mjs', 'imports config.js, damlClient.js and dispatcher.js and runs against two stub ledgers on loopback; db.js builds its pool, which is never queried, and no database is touched'],
+  ['firstPremiumPaidAt.test.mjs', 'imports only scripts/lib/firstPremiumPaidAt.mjs, which is pure and imports nothing; every instant is passed in, so it touches no database, no ledger, no network and no clock'],
+  ['tiers.test.mjs', 'imports only src/dispatch/tiers.js, which is pure and imports nothing; touches no database, no ledger, no network and no clock'],
+  ['withTransaction.test.mjs', 'imports src/db.js, which loads config.js and builds its pool; pool.connect is replaced by a stub returning a fake client, so the pool is never queried and no database is touched'],
+  ['termsContract.test.mjs', 'imports src/routes/policies.js for its exported terms field map, and src/dispatch/tiers.js (imports nothing). policies.js imports express, node:crypto, db.js (pg and config.js, which loads dotenv/config; the pool is built, never queried), notifications/payoutRecord.js and notifications/policyRecord.js (import nothing), oracle/oracleBot.js (node:url, node:crypto, node-cron, axios, db.js, config.js, oracle/eventWindow.js, damlClient.js; its main is guarded), dispatch/ledgerText.js (node:crypto only), dispatch/tiers.js, oracle/eventWindow.js (imports nothing) and dispatch/dispatcher.js (node:url, db.js, config.js, damlClient.js (axios, node:crypto, config.js), notifications/enqueue.js (imports nothing), dispatch/ledgerText.js, dispatch/tiers.js; its main is guarded). It reads docs/api/terms-v1.openapi.json and node/test-support/frostStandardGapSetFixture.json; it touches no database, no ledger and no network'],
 ]);
 
 // The first line that is not blank and not part of a comment.
@@ -82,7 +92,7 @@ test('every other test file loads the guard as its first import', () => {
     );
     checked.push(rel);
   }
-  // Not vacuous: the files that write today are among those checked.
+  // Not vacuous: three of the files that write, as a sample, are among those checked.
   for (const writer of ['dispatcher.test.mjs', 'expirySweeper.test.mjs', 'graceSweeper.test.mjs']) {
     assert.ok(checked.includes(writer), `${writer} was not checked`);
   }

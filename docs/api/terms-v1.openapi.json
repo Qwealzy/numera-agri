@@ -1,0 +1,386 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Insurer terms and payout tier sets",
+    "version": "1",
+    "description": "How an insurer reads and sets its own terms: the periods and the event-window rule (/api/v1/terms), and a payout tier set per product and peril (/api/v1/terms/payout-tiers/{productCode}/{perilType}). Every route acts on the authenticated insurer's own row and rows, never another's.\n\nThese routes write SQL only and answer 200. None of them calls the ledger.\n\nWhat a terms PUT reaches: the grace period and the event-window rule are frozen onto a policy at its activation, so a change to either affects later activations only. The mortgagee continuation days and the first-premium withdrawal days are frozen onto a policy at its activation too, so a PUT of either also affects later activations only.\n\nWhat a tier-set PUT or DELETE reaches: issued policies are untouched. Each coverage carries its own snapshot of its tier set, taken at policy creation and at the renewal request. After a DELETE, creating a policy for that product and peril is refused with 422, as for a set never configured, unless the coverage sends its own payoutTiers.\n\nNUMERIC values (the tier bounds and percentages) are JSON strings in an answer, exactly as stored. Parse them as decimals, not as floating point. A request may send them as strings or as JSON numbers."
+  },
+  "servers": [
+    { "url": "/" }
+  ],
+  "security": [
+    { "ApiKeyAuth": [] }
+  ],
+  "paths": {
+    "/api/v1/terms": {
+      "get": {
+        "operationId": "getTerms",
+        "summary": "The caller's terms",
+        "description": "Every key, null where a value is unset. Reads only.",
+        "security": [
+          { "ApiKeyAuth": [] }
+        ],
+        "responses": {
+          "200": {
+            "description": "The terms.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Terms" }
+              }
+            }
+          },
+          "401": {
+            "description": "No x-api-key header, or a key that names no active insurer.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "operationId": "putTerms",
+        "summary": "Replace the caller's terms",
+        "description": "The whole document: every key must be present. null unsets a value; a missing key is refused, never read as unchanged. One UPDATE; the answer is the stored document.",
+        "security": [
+          { "ApiKeyAuth": [] }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/Terms" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The terms as stored.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Terms" }
+              }
+            }
+          },
+          "400": {
+            "description": "A missing key, or a value its rule refuses; the message names the key. Nothing is written.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "401": {
+            "description": "No x-api-key header, or a key that names no active insurer.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/terms/payout-tiers/{productCode}/{perilType}": {
+      "parameters": [
+        {
+          "name": "productCode",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        },
+        {
+          "name": "perilType",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        }
+      ],
+      "get": {
+        "operationId": "getTierSet",
+        "summary": "One of the caller's tier sets",
+        "description": "The set for this product and peril, ordered by tierOrder. Reads only.",
+        "security": [
+          { "ApiKeyAuth": [] }
+        ],
+        "responses": {
+          "200": {
+            "description": "The set.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TierSet" }
+              }
+            }
+          },
+          "401": {
+            "description": "No x-api-key header, or a key that names no active insurer.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "404": {
+            "description": "No set for this product and peril among the caller's own. Another insurer's set gets this same answer.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "operationId": "putTierSet",
+        "summary": "Replace one of the caller's tier sets",
+        "description": "The whole set. It is checked as a whole first; then, in one transaction, it replaces the set this product and peril had, if any. The answer lists the gaps between tiers: a gap is accepted, and an observed value inside one matches no tier and pays nothing.",
+        "security": [
+          { "ApiKeyAuth": [] }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/TierSetBody" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The set as stored, ordered by tierOrder, and its gaps.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TierSetWritten" }
+              }
+            }
+          },
+          "400": {
+            "description": "A set the rules refuse: not a non-empty array, a tier that breaks its own rules, a repeated tierOrder, or two tiers that overlap. The message names the tier by its tierOrder and never echoes a label. Nothing is written.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "401": {
+            "description": "No x-api-key header, or a key that names no active insurer.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteTierSet",
+        "summary": "Remove one of the caller's tier sets",
+        "description": "Removes the set for this product and peril. Issued policies keep their own snapshots.",
+        "security": [
+          { "ApiKeyAuth": [] }
+        ],
+        "responses": {
+          "200": {
+            "description": "The set was removed.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TierSetDeleted" }
+              }
+            }
+          },
+          "401": {
+            "description": "No x-api-key header, or a key that names no active insurer.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "404": {
+            "description": "No set for this product and peril among the caller's own. Another insurer's set gets this same answer.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "ApiKeyAuth": { "type": "apiKey", "in": "header", "name": "x-api-key" }
+    },
+    "schemas": {
+      "Terms": {
+        "type": "object",
+        "description": "The insurer's terms. The three event-window keys are all set or all null.",
+        "required": [
+          "defaultGracePeriodDays",
+          "mortgageeContinuationDays",
+          "firstPremiumWithdrawalDays",
+          "defaultEventWindowTimezone",
+          "defaultEventWindowStartHour",
+          "defaultEventAggregation"
+        ],
+        "properties": {
+          "defaultGracePeriodDays": {
+            "type": "integer",
+            "nullable": true,
+            "maximum": 2147483647,
+            "description": "At least the statutory floor the server holds, the notice period of TTK 6102 m. 1434(3); a value below it is 400 and the message names the floor. Frozen onto a policy at its activation."
+          },
+          "mortgageeContinuationDays": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 2147483647,
+            "description": "Frozen onto a policy at its activation, so a change affects later activations only."
+          },
+          "firstPremiumWithdrawalDays": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 2147483647,
+            "description": "Frozen onto a policy at its activation, so a change affects later activations only. No ceiling is checked here: the three months of TTK 6102 m. 1434(2) are checked where the withdrawal window is computed."
+          },
+          "defaultEventWindowTimezone": {
+            "type": "string",
+            "nullable": true,
+            "description": "An IANA time zone, such as Europe/Istanbul. Frozen onto a policy at its activation."
+          },
+          "defaultEventWindowStartHour": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 0,
+            "maximum": 23,
+            "description": "The hour the daily event window starts, in that zone. Frozen onto a policy at its activation."
+          },
+          "defaultEventAggregation": {
+            "type": "string",
+            "nullable": true,
+            "description": "How the window's readings are combined: min, max or mean; any other value is 400 and the message lists the accepted ones. Frozen onto a policy at its activation."
+          }
+        }
+      },
+      "Tier": {
+        "type": "object",
+        "description": "One tier, in the snapshot shape a coverage carries. Both bounds are inclusive; a null bound is unbounded. An answer carries every key. In a request, minValue, maxValue, pctAtMin and pctAtMax may be omitted, which means null.",
+        "required": ["tierOrder", "label", "payoutPct", "shape"],
+        "properties": {
+          "tierOrder": {
+            "type": "integer",
+            "minimum": -2147483648,
+            "maximum": 2147483647,
+            "description": "Unique within the set. The first tier in this order whose range holds an observed value is the one that pays."
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 80,
+            "description": "Not empty or only spaces. Letters (Latin and Turkish), digits, space and ( ) - . , % ° / : only, and no run of 11 or more digits. Never echoed in an error."
+          },
+          "minValue": {
+            "type": "string",
+            "nullable": true,
+            "description": "A decimal of at most 8 integer digits and 4 decimal places (NUMERIC(12,4)); more is refused, never rounded."
+          },
+          "maxValue": {
+            "type": "string",
+            "nullable": true,
+            "description": "As minValue. Not below minValue; on a TS_Linear tier, above it."
+          },
+          "payoutPct": {
+            "type": "string",
+            "description": "A decimal of at most 3 integer digits and 2 decimal places (NUMERIC(5,2)). A TS_Step tier pays it, and it is above 0 and at most 100. On a TS_Linear tier it equals the larger of pctAtMin and pctAtMax."
+          },
+          "shape": {
+            "type": "string",
+            "enum": ["TS_Step", "TS_Linear"]
+          },
+          "pctAtMin": {
+            "type": "string",
+            "nullable": true,
+            "description": "null on a TS_Step tier. On a TS_Linear tier, the percentage paid at minValue, from 0 to 100, in the form of payoutPct; both bounds must then be set."
+          },
+          "pctAtMax": {
+            "type": "string",
+            "nullable": true,
+            "description": "null on a TS_Step tier. On a TS_Linear tier, the percentage paid at maxValue, from 0 to 100, in the form of payoutPct."
+          }
+        }
+      },
+      "TierGap": {
+        "type": "object",
+        "description": "The open interval between two neighbouring tiers, which no tier holds. Only a gap between two tiers is listed, never an open end.",
+        "required": ["from", "to", "betweenTiers"],
+        "properties": {
+          "from": { "type": "string", "description": "The lower tier's maxValue, as the request sent it." },
+          "to": { "type": "string", "description": "The upper tier's minValue, as the request sent it." },
+          "betweenTiers": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": { "type": "integer" },
+            "description": "The tierOrder of the lower tier, then of the upper one."
+          }
+        }
+      },
+      "TierSetBody": {
+        "type": "object",
+        "required": ["tiers"],
+        "properties": {
+          "tiers": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "$ref": "#/components/schemas/Tier" }
+          }
+        }
+      },
+      "TierSet": {
+        "type": "object",
+        "required": ["productCode", "perilType", "tiers"],
+        "properties": {
+          "productCode": { "type": "string" },
+          "perilType": { "type": "string" },
+          "tiers": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Tier" }
+          }
+        }
+      },
+      "TierSetWritten": {
+        "type": "object",
+        "required": ["productCode", "perilType", "tiers", "gaps"],
+        "properties": {
+          "productCode": { "type": "string" },
+          "perilType": { "type": "string" },
+          "tiers": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Tier" }
+          },
+          "gaps": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/TierGap" }
+          }
+        }
+      },
+      "TierSetDeleted": {
+        "type": "object",
+        "required": ["productCode", "perilType"],
+        "properties": {
+          "productCode": { "type": "string" },
+          "perilType": { "type": "string" }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": { "type": "string" }
+        }
+      }
+    }
+  }
+}

@@ -2,7 +2,7 @@ module InsuranceTests where
 
 import Daml.Script
 import DA.Date
-import DA.Time (time, addRelTime, days)
+import DA.Time (time, addRelTime, days, hours, seconds)
 import DA.Optional (isNone, isSome)
 import Insurance.Types
 import Insurance.PolicyToken
@@ -20,12 +20,18 @@ frostTiers =
       minValue = Some (-2.0)
       maxValue = Some 0.0
       payoutPct = 25.0
+      shape = TS_Step
+      pctAtMin = None
+      pctAtMax = None
   , PayoutTier with
       tierOrder = 2
       label = "Severe frost (below -4C)"
       minValue = None
       maxValue = Some (-4.0)
       payoutPct = 100.0
+      shape = TS_Step
+      pctAtMin = None
+      pctAtMax = None
   ]
 
 -- Stage 2 Part 2's default single-coverage fixture -- today's frost
@@ -41,6 +47,18 @@ frostCoverage = Coverage with
   mortgageeClaimAmount = None
   attachedAt = None
   attachmentLiftedAt = None
+  metric = "TEMPERATURE_C"
+  payoutBasis = PB_RemainingLimit
+  cellCommitment = testCellCommitment
+
+-- v22: stand-ins in the "sha256:" + 64 lowercase hex form the ledger checks.
+-- Their content means nothing; the salted commitment and the evidence digest
+-- are computed off-ledger, and the ledger checks only form and equality.
+testCellCommitment : Text
+testCellCommitment = "sha256:" <> "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+testEvidenceDigest : Text
+testEvidenceDigest = "sha256:" <> "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
 setupParties : Script (Party, Party, Party, Party)
 setupParties = do
@@ -134,6 +152,7 @@ test_mintAndFullLifecycle = script do
 
   -- -3C: strictly between the two bands. Neither tier's inclusive bounds
   -- cover it, so nothing should match, archive, or re-mint.
+  reachEventEnd (addRelTime now (days 1))
   noMatchResult <- submit oracleOperator do
     exerciseCmd policyCid1 PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid1
@@ -142,7 +161,10 @@ test_mintAndFullLifecycle = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-gap"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   assert (not noMatchResult.trigger.matched)
   assert (isNone noMatchResult.newPolicyCid)
   assert (null noMatchResult.payouts)
@@ -151,6 +173,7 @@ test_mintAndFullLifecycle = script do
   assert (covStillThere.remainingLimit == 100000.0)
 
   -- -2C: the inclusive boundary of the mild-frost tier -> 25% of 100000.
+  reachEventEnd (addRelTime now (days 1))
   mildResult <- submit oracleOperator do
     exerciseCmd policyCid1 PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid1
@@ -159,7 +182,10 @@ test_mintAndFullLifecycle = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-mild"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   assert mildResult.trigger.matched
   assert (mildResult.trigger.payoutPct == 25.0)
   assert (mildResult.trigger.payoutAmount == 25000.0)
@@ -182,6 +208,7 @@ test_mintAndFullLifecycle = script do
 
   -- -5C on what's left: 100% of the *remaining* 75000, not the original
   -- 100000 -- proves a second claim never re-bases off sumInsured.
+  reachEventEnd (addRelTime now (days 1))
   severeResult <- submit oracleOperator do
     exerciseCmd policyCid2 PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid2
@@ -190,7 +217,10 @@ test_mintAndFullLifecycle = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-severe"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   assert severeResult.trigger.matched
   assert (severeResult.trigger.payoutAmount == 75000.0)
   assert (isNone severeResult.newPolicyCid)   -- fully settled: nothing left to re-mint
@@ -205,10 +235,11 @@ test_mintAndFullLifecycle = script do
   -- Stage 4: the insurer closes the loop by REPORTING a settlement it made
   -- through its own banking systems. settledAt is its reported date, not a
   -- clock reading, and paidRole must be one the coverage allows.
+  settleTime <- getTime
   submit insurer do
     exerciseCmd payoutCid2 PayoutApproved_ConfirmSettlement with
-      bankReference = "TEST-BANK-REF-1"
-      settledAt = now
+      bankReference = testTextDigest
+      settledAt = settleTime
       paidRole = PDR_Insured
 
   pure ()
@@ -237,6 +268,7 @@ test_mintWithNoneOptionalRoles = script do
   assert (isNone policy.beneficiary)
   assert (isNone policy.mortgagee)
 
+  reachEventEnd (addRelTime now (days 1))
   result <- submit oracleOperator do
     exerciseCmd policyCid PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid
@@ -245,7 +277,10 @@ test_mintWithNoneOptionalRoles = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-no-optional-roles"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   assert result.trigger.matched
   assert (result.trigger.payoutAmount == 25000.0)
 
@@ -264,6 +299,9 @@ test_multiCoveragePayoutLeavesOtherCoverageUntouched = script do
         mortgageeClaimAmount = None
         attachedAt = None
         attachmentLiftedAt = None
+        metric = "TEMPERATURE_C"
+        payoutBasis = PB_RemainingLimit
+        cellCommitment = testCellCommitment
       glassCoverage = Coverage with
         coverageCode = "GLASS"
         sumInsured = 20000.0
@@ -273,9 +311,13 @@ test_multiCoveragePayoutLeavesOtherCoverageUntouched = script do
         mortgageeClaimAmount = None
         attachedAt = None
         attachmentLiftedAt = None
+        metric = "TEMPERATURE_C"
+        payoutBasis = PB_RemainingLimit
+        cellCommitment = testCellCommitment
   policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [fireCoverage, glassCoverage]
   now <- getTime
 
+  reachEventEnd (addRelTime now (days 1))
   result <- submit oracleOperator do
     exerciseCmd policyCid PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid
@@ -284,7 +326,10 @@ test_multiCoveragePayoutLeavesOtherCoverageUntouched = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-fire"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   assert result.trigger.matched
   assert (result.trigger.payoutAmount == 25000.0)
   Some newPolicyCid <- pure result.newPolicyCid
@@ -304,6 +349,7 @@ test_triggerRejectsUnknownCoverage = script do
   (insurer, policyholder, insured, oracleOperator) <- setupParties
   policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
   now <- getTime
+  reachEventEnd (addRelTime now (days 1))
   submitMustFail oracleOperator do
     exerciseCmd policyCid PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid
@@ -312,7 +358,10 @@ test_triggerRejectsUnknownCoverage = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-unknown-coverage"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
 
 -- A policy with two coverages must stay open and re-mint when only one
 -- coverage is exhausted, and close (no new token) only once every
@@ -327,6 +376,9 @@ test_policyClosesOnlyWhenLastCoverageExhausted = script do
             minValue = None
             maxValue = Some (-4.0)
             payoutPct = 100.0
+            shape = TS_Step
+            pctAtMin = None
+            pctAtMax = None
         ]
       fireCoverage = Coverage with
         coverageCode = "FIRE"
@@ -337,6 +389,9 @@ test_policyClosesOnlyWhenLastCoverageExhausted = script do
         mortgageeClaimAmount = None
         attachedAt = None
         attachmentLiftedAt = None
+        metric = "TEMPERATURE_C"
+        payoutBasis = PB_RemainingLimit
+        cellCommitment = testCellCommitment
       glassCoverage = Coverage with
         coverageCode = "GLASS"
         sumInsured = 5000.0
@@ -346,11 +401,15 @@ test_policyClosesOnlyWhenLastCoverageExhausted = script do
         mortgageeClaimAmount = None
         attachedAt = None
         attachmentLiftedAt = None
+        metric = "TEMPERATURE_C"
+        payoutBasis = PB_RemainingLimit
+        cellCommitment = testCellCommitment
   policyCid1 <- mintTestPolicy insurer policyholder insured oracleOperator None None [fireCoverage, glassCoverage]
   now <- getTime
 
   -- Exhausts FIRE fully -- GLASS still has limit, so the policy stays
   -- open and re-mints rather than closing.
+  reachEventEnd (addRelTime now (days 1))
   fireResult <- submit oracleOperator do
     exerciseCmd policyCid1 PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid1
@@ -359,7 +418,10 @@ test_policyClosesOnlyWhenLastCoverageExhausted = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-fire-total"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   assert fireResult.trigger.matched
   assert (fireResult.trigger.payoutAmount == 10000.0)
   Some policyCid2 <- pure fireResult.newPolicyCid  -- policy still open
@@ -370,6 +432,7 @@ test_policyClosesOnlyWhenLastCoverageExhausted = script do
 
   -- Exhausts GLASS too -- every coverage is now at zero, so the policy
   -- must close: no new token.
+  reachEventEnd (addRelTime now (days 1))
   glassResult <- submit oracleOperator do
     exerciseCmd policyCid2 PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid2
@@ -378,7 +441,10 @@ test_policyClosesOnlyWhenLastCoverageExhausted = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-glass-total"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   assert glassResult.trigger.matched
   assert (isNone glassResult.newPolicyCid)
   [payoutCid2Leg] <- pure glassResult.payouts
@@ -660,6 +726,7 @@ test_insurerCannotSelfTrigger = script do
   now <- getTime
   policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
 
+  reachEventEnd (addRelTime now (days 1))
   submitMustFail insurer do
     exerciseCmd policyCid PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid
@@ -668,8 +735,12 @@ test_insurerCannotSelfTrigger = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-attack-insurer"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
 
+  reachEventEnd (addRelTime now (days 1))
   submitMustFail policyholder do
     exerciseCmd policyCid PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid
@@ -678,10 +749,14 @@ test_insurerCannotSelfTrigger = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-attack-policyholder"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
 
   -- oracleOperator, the correct controller, still works -- proves the
   -- failures above are an authorization boundary, not a broken fixture.
+  reachEventEnd (addRelTime now (days 1))
   result <- submit oracleOperator do
     exerciseCmd policyCid PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid
@@ -690,7 +765,10 @@ test_insurerCannotSelfTrigger = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-control"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   assert result.trigger.matched
 
   pure ()
@@ -716,6 +794,7 @@ test_observerRolesCannotExerciseAnyChoice = script do
     (Some beneficiary) (Some mortgagee) [coverageWithClaim]
   now <- getTime
 
+  reachEventEnd (addRelTime now (days 1))
   submitMustFail policyholder do
     exerciseCmd policyCid PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid
@@ -724,7 +803,11 @@ test_observerRolesCannotExerciseAnyChoice = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-attack-policyholder"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
+  reachEventEnd (addRelTime now (days 1))
   submitMustFail insured do
     exerciseCmd policyCid PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid
@@ -733,7 +816,11 @@ test_observerRolesCannotExerciseAnyChoice = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-attack-insured"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
+  reachEventEnd (addRelTime now (days 1))
   submitMustFail beneficiary do
     exerciseCmd policyCid PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid
@@ -742,7 +829,11 @@ test_observerRolesCannotExerciseAnyChoice = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-attack-beneficiary"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
+  reachEventEnd (addRelTime now (days 1))
   submitMustFail mortgagee do
     exerciseCmd policyCid PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid
@@ -751,23 +842,22 @@ test_observerRolesCannotExerciseAnyChoice = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-attack-mortgagee"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
 
   submitMustFail policyholder do
     exerciseCmd policyCid PolicyToken_ArchiveForNonPayment with
-      archivedAt = now
       reason = "premium not paid"
   submitMustFail insured do
     exerciseCmd policyCid PolicyToken_ArchiveForNonPayment with
-      archivedAt = now
       reason = "premium not paid"
   submitMustFail beneficiary do
     exerciseCmd policyCid PolicyToken_ArchiveForNonPayment with
-      archivedAt = now
       reason = "premium not paid"
   submitMustFail mortgagee do
     exerciseCmd policyCid PolicyToken_ArchiveForNonPayment with
-      archivedAt = now
       reason = "premium not paid"
 
   pure ()
@@ -798,17 +888,14 @@ test_archiveForNonPayment = script do
 
   submitMustFail oracleOperator do
     exerciseCmd terminatedCid PolicyToken_ArchiveForNonPayment with
-      archivedAt = now
       reason = "premium not paid"
 
   submitMustFail policyholder do
     exerciseCmd terminatedCid PolicyToken_ArchiveForNonPayment with
-      archivedAt = now
       reason = "premium not paid"
 
   submit insurer do
     exerciseCmd terminatedCid PolicyToken_ArchiveForNonPayment with
-      archivedAt = now
       reason = "premium not paid"
 
   remaining <- queryContractId insurer terminatedCid
@@ -816,28 +903,27 @@ test_archiveForNonPayment = script do
 
 -- Module 3's natural-expiry burn path (endDate/expiry reached, no
 -- outstanding claim). Same controller = insurer reasoning as non-payment
--- above. archivedAt/reason (Stage 3 Part 1) are just carried through here --
--- their content isn't asserted on, only that the choice still requires
+-- above. reason (Stage 3 Part 1) is just carried through here --
+-- its content isn't asserted on, only that the choice still requires
 -- `insurer` alone with the new arguments in place.
 test_archiveForExpiry : Script ()
 test_archiveForExpiry = script do
   (insurer, policyholder, insured, oracleOperator) <- setupParties
   policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
-  now <- getTime
+  -- v22: the archive waits for expiry on the ledger clock.
+  Some tok <- queryContractId insurer policyCid
+  setTime tok.expiry
 
   submitMustFail oracleOperator do
     exerciseCmd policyCid PolicyToken_ArchiveForExpiry with
-      archivedAt = now
       reason = "policy term expired"
 
   submitMustFail policyholder do
     exerciseCmd policyCid PolicyToken_ArchiveForExpiry with
-      archivedAt = now
       reason = "policy term expired"
 
   submit insurer do
     exerciseCmd policyCid PolicyToken_ArchiveForExpiry with
-      archivedAt = now
       reason = "policy term expired"
 
   remaining <- queryContractId insurer policyCid
@@ -860,6 +946,9 @@ test_archiveForExpiryArchivesMultiCoveragePolicy = script do
         mortgageeClaimAmount = None
         attachedAt = None
         attachmentLiftedAt = None
+        metric = "TEMPERATURE_C"
+        payoutBasis = PB_RemainingLimit
+        cellCommitment = testCellCommitment
       glassCoverage = Coverage with
         coverageCode = "GLASS"
         sumInsured = 20000.0
@@ -869,12 +958,16 @@ test_archiveForExpiryArchivesMultiCoveragePolicy = script do
         mortgageeClaimAmount = None
         attachedAt = None
         attachmentLiftedAt = None
+        metric = "TEMPERATURE_C"
+        payoutBasis = PB_RemainingLimit
+        cellCommitment = testCellCommitment
   policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [fireCoverage, glassCoverage]
-  now <- getTime
+  -- v22: the archive waits for expiry on the ledger clock.
+  Some tok <- queryContractId insurer policyCid
+  setTime tok.expiry
 
   submit insurer do
     exerciseCmd policyCid PolicyToken_ArchiveForExpiry with
-      archivedAt = now
       reason = "policy term expired"
 
   remaining <- queryContractId insurer policyCid
@@ -896,6 +989,9 @@ test_archiveForExpiryArchivesPartiallyPaidPolicy = script do
         mortgageeClaimAmount = None
         attachedAt = None
         attachmentLiftedAt = None
+        metric = "TEMPERATURE_C"
+        payoutBasis = PB_RemainingLimit
+        cellCommitment = testCellCommitment
       glassCoverage = Coverage with
         coverageCode = "GLASS"
         sumInsured = 20000.0
@@ -905,12 +1001,16 @@ test_archiveForExpiryArchivesPartiallyPaidPolicy = script do
         mortgageeClaimAmount = None
         attachedAt = None
         attachmentLiftedAt = None
+        metric = "TEMPERATURE_C"
+        payoutBasis = PB_RemainingLimit
+        cellCommitment = testCellCommitment
   policyCid1 <- mintTestPolicy insurer policyholder insured oracleOperator None None [fireCoverage, glassCoverage]
   now <- getTime
 
   -- Mild frost on FIRE: 25% payout, re-mints with FIRE.remainingLimit
   -- reduced and GLASS untouched at its full 20000 -- this is the "still
   -- has limit left on GLASS" partially-paid state the task asks for.
+  reachEventEnd (addRelTime now (days 1))
   triggerResult <- submit oracleOperator do
     exerciseCmd policyCid1 PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid1
@@ -919,15 +1019,19 @@ test_archiveForExpiryArchivesPartiallyPaidPolicy = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-partial-fire"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   assert triggerResult.trigger.matched
   Some policyCid2 <- pure triggerResult.newPolicyCid
   Some partiallyPaid <- queryContractId insurer policyCid2
   assert (partiallyPaid.status == PS_PartiallyPaid)
 
+  -- v22: the archive waits for expiry on the ledger clock.
+  setTime partiallyPaid.expiry
   submit insurer do
     exerciseCmd policyCid2 PolicyToken_ArchiveForExpiry with
-      archivedAt = now
       reason = "policy term expired"
 
   remaining <- queryContractId insurer policyCid2
@@ -1001,6 +1105,7 @@ test_triggerPaysDuringGracePeriod = script do
       noticeServiceDate = now
       noticeRecordedAt = now
 
+  reachEventEnd (addRelTime now (days 1))
   result <- submit oracleOperator do
     exerciseCmd inGraceCid PolicyToken_EvaluateTrigger with
       selfContractId = show inGraceCid
@@ -1009,7 +1114,10 @@ test_triggerPaysDuringGracePeriod = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-during-grace"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   assert result.trigger.matched
   assert (result.trigger.payoutAmount == 25000.0)
   Some newPolicyCid <- pure result.newPolicyCid
@@ -1062,6 +1170,8 @@ test_terminateObserverRolesCannotExerciseInsurerCan = script do
 
   terminatedCid <- submit insurer do exerciseCmd inNoticeCid terminate
 
+  -- The token is still LIVE: termination ends the contract, it does not
+  -- burn the token (phase two does, once payouts are resolved).
   Some terminated <- queryContractId insurer terminatedCid
   assert (terminated.defaultState == DS_Terminated)
   assert (terminated.status == PS_Active)                 -- claim axis untouched
@@ -1070,8 +1180,8 @@ test_terminateObserverRolesCannotExerciseInsurerCan = script do
   assert (terminated.unrunDays == Some 107)
   assert (terminated.expiry == time (date 2026 Dec 31) 12 0 0)  -- expiry never moves
   assert (terminated.coverages == [frostCoverage])
-  -- The token is still LIVE: termination ends the contract, it does not
-  -- burn the token (phase two does, once payouts are resolved).
+  -- The in-notice version is archived: Terminate is consuming, and the
+  -- live token is the new version at terminatedCid.
   gone <- queryContractId insurer inNoticeCid
   assert (isNone gone)
 
@@ -1095,6 +1205,7 @@ test_triggerRejectedAfterTermination = script do
       unrunDays = 107
       mortgageeContinuationEndsAt = None
 
+  reachEventEnd (addRelTime termInstant (days 1))
   submitMustFail oracleOperator do
     exerciseCmd terminatedCid PolicyToken_EvaluateTrigger with
       selfContractId = show terminatedCid
@@ -1103,7 +1214,60 @@ test_triggerRejectedAfterTermination = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-after-termination"
       currency = "TRY"
-      now
+      eventStart = termInstant
+      eventEnd = addRelTime termInstant (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
+
+-- v22: termination is judged by the EVENT'S time, not by the state.
+-- The token's coverageValidThrough is the termination instant, and the rule
+-- is eventEnd <= coverageValidThrough: an event that ended before the
+-- termination instant is evaluated although the evaluation comes after it;
+-- one that runs past it is refused, even when it started inside cover.
+test_triggerEvaluatedForEventBeforeTermination : Script ()
+test_triggerEvaluatedForEventBeforeTermination = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  now <- getTime
+  let termInstant = time (date 2026 Sep 15) 12 0 0
+
+  inNoticeCid <- submit insurer do
+    exerciseCmd policyCid PolicyToken_ServeNotice with
+      noticeServiceDate = now
+      noticeRecordedAt = now
+  terminatedCid <- submit insurer do
+    exerciseCmd inNoticeCid PolicyToken_Terminate with
+      terminationInstant = termInstant
+      unrunDays = 107
+      mortgageeContinuationEndsAt = None
+  let trig evStart evEnd = PolicyToken_EvaluateTrigger with
+        selfContractId = show terminatedCid
+        coverageCode = "FROST"
+        observedValue = -2.0
+        metric = "TEMPERATURE_C"
+        attestationRef = "reading-around-termination"
+        currency = "TRY"
+        eventStart = evStart
+        eventEnd = evEnd
+        cellCommitment = testCellCommitment
+        evidenceDigest = testEvidenceDigest
+  -- v22: every window below has ended on the ledger clock.
+  reachEventEnd (addRelTime termInstant (hours 1))
+
+  -- Straddles the termination instant: refused.
+  submitMustFail oracleOperator do
+    exerciseCmd terminatedCid (trig (addRelTime termInstant (hours (-1))) (addRelTime termInstant (hours 1)))
+
+  -- Ends exactly at the termination instant (the end is exclusive): evaluated
+  -- and paid, on a DS_Terminated token.
+  result <- submit oracleOperator do
+    exerciseCmd terminatedCid (trig (addRelTime termInstant (days (-1))) termInstant)
+  assert result.trigger.matched
+  assert (result.trigger.payoutAmount == 25000.0)
+  Some newCid <- pure result.newPolicyCid
+  Some after <- queryContractId insurer newCid
+  assert (after.defaultState == DS_Terminated)   -- the default axis is untouched
+  assert (after.coverageValidThrough == termInstant)
 
 -- Stage 4, the two-phase shape. A loss during the NOTICE period is payable,
 -- the payout survives termination untouched, and the token cannot be
@@ -1121,6 +1285,7 @@ test_payoutDuringNoticePeriodSurvivesTermination = script do
       noticeRecordedAt = now
 
   -- A loss inside the notice period: cover is in full force, so it pays.
+  reachEventEnd (addRelTime now (days 1))
   result <- submit oracleOperator do
     exerciseCmd inNoticeCid PolicyToken_EvaluateTrigger with
       selfContractId = show inNoticeCid
@@ -1129,7 +1294,10 @@ test_payoutDuringNoticePeriodSurvivesTermination = script do
       metric = "TEMPERATURE_C"
       attestationRef = "loss-during-notice"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   assert result.trigger.matched
   [payoutCidLeg] <- pure result.payouts
   let payoutCid = payoutCidLeg.cid
@@ -1152,9 +1320,10 @@ test_payoutDuringNoticePeriodSurvivesTermination = script do
   -- Phase two: the token is archived for non-payment only once terminated.
   -- (Whether the payouts are resolved is checked off-ledger -- separate
   -- contracts this template cannot see.)
+  -- v22: and not before the termination instant on the ledger clock.
+  setTime termInstant
   submit insurer do
     exerciseCmd terminatedCid PolicyToken_ArchiveForNonPayment with
-      archivedAt = now
       reason = "premium unpaid; notice period elapsed"
   burned <- queryContractId insurer terminatedCid
   assert (isNone burned)
@@ -1173,7 +1342,6 @@ test_archiveForNonPaymentRequiresTermination = script do
 
   submitMustFail insurer do
     exerciseCmd policyCid PolicyToken_ArchiveForNonPayment with
-      archivedAt = now
       reason = "premium not paid"
 
   -- In the notice period is still not enough: the contract has not ended.
@@ -1183,7 +1351,6 @@ test_archiveForNonPaymentRequiresTermination = script do
       noticeRecordedAt = now
   submitMustFail insurer do
     exerciseCmd inNoticeCid PolicyToken_ArchiveForNonPayment with
-      archivedAt = now
       reason = "premium not paid"
 
 -- Stage 4: reinstatement is NARROWED to the notice period. Payment inside
@@ -1281,18 +1448,109 @@ test_terminationArgumentGuards = script do
       unrunDays = 10
       mortgageeContinuationEndsAt = Some now   -- no mortgagee on this policy
 
--- Stage 3 Part 2: inferActiveStatus (Types.daml) must return
--- PS_PartiallyPaid, not PS_Active, when the coverage list itself already
--- shows a reduced remainingLimit from before notice was ever served --
--- reinstatement must not silently erase a real payout history.
+-- ensure: a coverage's amounts, and the termination facts, cannot be written
+-- onto a token directly in a shape no choice would produce.
+test_coverageAmountAndTerminationEnsureGuards : Script ()
+test_coverageAmountAndTerminationEnsureGuards = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  now <- getTime
+  let base = PolicyToken with
+        policyNo = "TEST-AMOUNT-TERMINATION-ENSURE"
+        version = 1
+        predecessorRef = None
+        insurer
+        policyholder
+        insured
+        beneficiary = None
+        beneficiaryDescriptorHash = None
+        mortgagee = None
+        oracleOperator
+        coverages = [frostCoverage]
+        termStart = time (date 2026 Jan 1) 12 0 0
+        expiry = time (date 2026 Dec 31) 12 0 0
+        coverageValidThrough = time (date 2026 Dec 31) 12 0 0
+        noticeServiceDate = None
+        noticeRecordedAt = None
+        noticeCount = 0
+        noticeServiceDates = []
+        twoNoticeElectionAt = None
+        twoNoticeEffectiveAt = None
+        coverageBeganAt = None
+        coverageStartBasis = None
+        retroactiveCoverCheckedAt = None
+        enforcementFruitlessAt = None
+        enforcementRoute = None
+        substitutionNotifiedAt = None
+        substitutedAt = None
+        supersededPolicyholder = None
+        premiumDueDate = None
+        enforcementCommencedAt = None
+        withdrawnAt = None
+        withdrawalPath = None
+        terminationInstant = None
+        unrunDays = None
+        mortgageeNotifiedAt = None
+        mortgageeContinuationEndsAt = None
+        mortgageeElection = None
+        mortgageeInfoRequestedAt = None
+        mortgageeInfoProvidedAt = None
+        status = PS_Active
+        defaultState = DS_None
+        documentHash = None
+        amendmentReason = None
+
+  -- a coverage with nothing insured
+  submitMustFail insurer do
+    createCmd base with
+      coverages = [frostCoverage with sumInsured = 0.0, remainingLimit = 0.0]
+  -- a remaining limit above the sum insured
+  submitMustFail insurer do
+    createCmd base with
+      coverages = [frostCoverage with remainingLimit = 100001.0]
+
+  -- a termination instant without unrun days, and unrun days without one
+  submitMustFail insurer do
+    createCmd base with
+      terminationInstant = Some now
+      defaultState = DS_Terminated
+  submitMustFail insurer do
+    createCmd base with unrunDays = Some 30
+  -- the terminated state without the termination facts, and the facts
+  -- without the state
+  submitMustFail insurer do
+    createCmd base with defaultState = DS_Terminated
+  submitMustFail insurer do
+    createCmd base with
+      terminationInstant = Some now
+      unrunDays = Some 30
+
+  -- control: consistent amounts and consistent termination facts create
+  _ <- submit insurer do
+    createCmd base with
+      coverages = [frostCoverage with remainingLimit = 40000.0]
+  ok <- submit insurer do
+    createCmd base with
+      terminationInstant = Some now
+      unrunDays = Some 30
+      defaultState = DS_Terminated
+  Some created <- queryContractId insurer ok
+  assert (created.defaultState == DS_Terminated)
+
+-- Stage 3 Part 2: a PS_PartiallyPaid policy must stay PS_PartiallyPaid
+-- through reinstatement, not come back PS_Active -- here the coverage list
+-- itself already shows a reduced remainingLimit from before notice was ever
+-- served, and reinstatement must not silently erase a real payout history.
+-- Since Part 3 split the status axes, PolicyToken_Reinstate never touches
+-- status (the inferActiveStatus helper this test first exercised was
+-- deleted; see Types.daml).
 test_reinstateRestoresPartiallyPaidStatus : Script ()
 test_reinstateRestoresPartiallyPaidStatus = script do
   (insurer, policyholder, insured, oracleOperator) <- setupParties
   policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
   now <- getTime
-  let deadline = time (date 2026 Sep 15) 12 0 0
 
   -- Mild frost first: 25% payout, re-mints at PS_PartiallyPaid.
+  reachEventEnd (addRelTime now (days 1))
   triggerResult <- submit oracleOperator do
     exerciseCmd policyCid PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid
@@ -1301,7 +1559,10 @@ test_reinstateRestoresPartiallyPaidStatus = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-before-notice"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   Some partiallyPaidCid <- pure triggerResult.newPolicyCid
   Some partiallyPaid <- queryContractId insurer partiallyPaidCid
   assert (partiallyPaid.status == PS_PartiallyPaid)
@@ -1428,6 +1689,7 @@ test_payoutDuringGraceLeavesDefaultStateUntouched = script do
       noticeServiceDate = now
       noticeRecordedAt = now
 
+  reachEventEnd (addRelTime now (days 1))
   result <- submit oracleOperator do
     exerciseCmd inGraceCid PolicyToken_EvaluateTrigger with
       selfContractId = show inGraceCid
@@ -1436,7 +1698,10 @@ test_payoutDuringGraceLeavesDefaultStateUntouched = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-during-grace-axes"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   assert result.trigger.matched
   Some paidCid <- pure result.newPolicyCid
   Some paid <- queryContractId insurer paidCid
@@ -1484,6 +1749,7 @@ test_amendRaisingSumInsuredMovesRemainingByDelta = script do
   now <- getTime
 
   -- Pay 25% first: 100000 sum insured, 75000 remaining.
+  reachEventEnd (addRelTime now (days 1))
   triggerResult <- submit oracleOperator do
     exerciseCmd policyCid PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid
@@ -1492,7 +1758,10 @@ test_amendRaisingSumInsuredMovesRemainingByDelta = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-before-endorsement"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   Some paidCid <- pure triggerResult.newPolicyCid
 
   amendedCid <- submit insurer do
@@ -1517,6 +1786,7 @@ test_amendReducingSumInsuredBelowPaidOutIsRejected = script do
   policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
   now <- getTime
 
+  reachEventEnd (addRelTime now (days 1))
   triggerResult <- submit oracleOperator do
     exerciseCmd policyCid PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid
@@ -1525,7 +1795,10 @@ test_amendReducingSumInsuredBelowPaidOutIsRejected = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-before-reduction"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   Some paidCid <- pure triggerResult.newPolicyCid   -- 100000 insured, 75000 left
 
   -- Down to 10000 would mean 75000 + (10000 - 100000) = -15000 remaining.
@@ -1547,6 +1820,9 @@ test_amendAddsAndRemovesCoverages = script do
         mortgageeClaimAmount = None
         attachedAt = None
         attachmentLiftedAt = None
+        metric = "TEMPERATURE_C"
+        payoutBasis = PB_RemainingLimit
+        cellCommitment = testCellCommitment
       theftCoverage = Coverage with
         coverageCode = "THEFT"
         sumInsured = 30000.0
@@ -1556,6 +1832,9 @@ test_amendAddsAndRemovesCoverages = script do
         mortgageeClaimAmount = None
         attachedAt = None
         attachmentLiftedAt = None
+        metric = "TEMPERATURE_C"
+        payoutBasis = PB_RemainingLimit
+        cellCommitment = testCellCommitment
   policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None
     [frostCoverage, glassCoverage]
 
@@ -1579,6 +1858,7 @@ test_amendCannotRemoveAPaidOutCoverage = script do
   policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
   now <- getTime
 
+  reachEventEnd (addRelTime now (days 1))
   triggerResult <- submit oracleOperator do
     exerciseCmd policyCid PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid
@@ -1587,7 +1867,10 @@ test_amendCannotRemoveAPaidOutCoverage = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-before-removal"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   Some paidCid <- pure triggerResult.newPolicyCid
 
   submitMustFail insurer do
@@ -1610,6 +1893,41 @@ test_amendCannotEmptyOrDuplicateCoverages = script do
     exerciseCmd policyCid amendNothing with
       reason = ER_InsuredObjectChange
       coveragesToAdd = [frostCoverage]   -- FROST already present
+
+-- An endorsement names only coverages the policy has, and cannot add one
+-- whose remaining limit is above its sum insured.
+test_amendRefusesUnknownCodesAndAnOverfullCoverage : Script ()
+test_amendRefusesUnknownCodesAndAnOverfullCoverage = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+
+  submitMustFail insurer do
+    exerciseCmd policyCid amendNothing with
+      reason = ER_InsuredObjectChange
+      coverageCodesToRemove = ["NOT-A-COVERAGE"]
+  -- Refused rather than silently ignored: without the guard the change
+  -- would simply match nothing and the endorsement would go through.
+  submitMustFail insurer do
+    exerciseCmd policyCid amendNothing with
+      reason = ER_SumInsuredIncrease
+      sumInsuredChanges = [("NOT-A-COVERAGE", 150000.0)]
+  submitMustFail insurer do
+    exerciseCmd policyCid amendNothing with
+      reason = ER_InsuredObjectChange
+      coveragesToAdd = [frostCoverage with coverageCode = "GLASS", remainingLimit = 100001.0]
+
+  -- control: the same endorsements naming a real code, or adding a coherent
+  -- coverage, go through
+  amendedCid <- submit insurer do
+    exerciseCmd policyCid amendNothing with
+      reason = ER_SumInsuredIncrease
+      sumInsuredChanges = [("FROST", 150000.0)]
+      coveragesToAdd = [frostCoverage with coverageCode = "GLASS"]
+  _ <- submit insurer do
+    exerciseCmd amendedCid amendNothing with
+      reason = ER_InsuredObjectChange
+      coverageCodesToRemove = ["GLASS"]
+  pure ()
 
 -- A terminated contract has ended. There is nothing left to amend.
 test_amendRejectedWhileTerminated : Script ()
@@ -1640,7 +1958,8 @@ test_amendExtendsTermAndChangesRoles : Script ()
 test_amendExtendsTermAndChangesRoles = script do
   (insurer, policyholder, insured, oracleOperator) <- setupParties
   beneficiary <- allocateParty "NewBeneficiary"
-  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  bank <- allocateParty "Bank"
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None (Some bank) [frostCoverage]
   let extendedTo = time (date 2027 Jun 30) 12 0 0
 
   amendedCid <- submit insurer do
@@ -1654,7 +1973,7 @@ test_amendExtendsTermAndChangesRoles = script do
   assert (amended.expiry == extendedTo)
   assert (amended.coverageValidThrough == extendedTo)   -- moved together
   assert (amended.beneficiary == Some beneficiary)
-  assert (amended.mortgagee == None)                    -- untouched: None meant "leave alone"
+  assert (amended.mortgagee == Some bank)               -- untouched: changeMortgagee = False
 
 -- Only the insurer may amend. Every observer role must fail.
 test_amendObserverRolesCannotExercise : Script ()
@@ -1759,6 +2078,7 @@ test_renewalResetsLimitsRegardlessOfPredecessorConsumption = script do
   predecessorCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
 
   -- Consume 25% of the predecessor's limit, so it is genuinely drawn down.
+  reachEventEnd (addRelTime now (days 1))
   triggerResult <- submit oracleOperator do
     exerciseCmd predecessorCid PolicyToken_EvaluateTrigger with
       selfContractId = show predecessorCid
@@ -1767,7 +2087,10 @@ test_renewalResetsLimitsRegardlessOfPredecessorConsumption = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-before-renewal"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   Some drawnDownCid <- pure triggerResult.newPolicyCid
   Some drawnDown <- queryContractId insurer drawnDownCid
   let Some oldCov = find (\c -> c.coverageCode == "FROST") drawnDown.coverages
@@ -1819,6 +2142,7 @@ test_predecessorStillTriggerableAfterRenewal = script do
   _ <- mintRenewalPolicy insurer policyholder insured oracleOperator
     "TEST-POLICY-2" "TEST-POLICY-1" [frostCoverage]
 
+  reachEventEnd (addRelTime now (days 1))
   result <- submit oracleOperator do
     exerciseCmd predecessorCid PolicyToken_EvaluateTrigger with
       selfContractId = show predecessorCid
@@ -1827,7 +2151,10 @@ test_predecessorStillTriggerableAfterRenewal = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-on-predecessor-after-renewal"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   assert result.trigger.matched
   assert (result.trigger.payoutAmount == 25000.0)   -- off the predecessor's own limit
 
@@ -1913,6 +2240,7 @@ approvedPayout = do
   (insurer, policyholder, insured, oracleOperator) <- setupParties
   now <- getTime
   policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  reachEventEnd (addRelTime now (days 1))
   result <- submit oracleOperator do
     exerciseCmd policyCid PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid
@@ -1921,7 +2249,10 @@ approvedPayout = do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-stage4"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   [payoutCidLeg] <- pure result.payouts
   let payoutCid = payoutCidLeg.cid
   pure (insurer, policyholder, insured, oracleOperator, payoutCid)
@@ -1935,7 +2266,7 @@ test_settlementClosesPayoutAndCannotRepeat = script do
 
   submit insurer do
     exerciseCmd payoutCid PayoutApproved_ConfirmSettlement with
-      bankReference = "BANK-REF-1"
+      bankReference = testTextDigest
       settledAt = now
       paidRole = PDR_Insured
 
@@ -1944,7 +2275,7 @@ test_settlementClosesPayoutAndCannotRepeat = script do
 
   submitMustFail insurer do
     exerciseCmd payoutCid PayoutApproved_ConfirmSettlement with
-      bankReference = "BANK-REF-2"
+      bankReference = testTextDigest
       settledAt = now
       paidRole = PDR_Insured
 
@@ -1958,13 +2289,13 @@ test_settlementRejectsRoleNotInPayoutDestination = script do
 
   submitMustFail insurer do
     exerciseCmd payoutCid PayoutApproved_ConfirmSettlement with
-      bankReference = "BANK-REF-WRONG-ROLE"
+      bankReference = testTextDigest
       settledAt = now
       paidRole = PDR_Mortgagee
 
   submitMustFail insurer do
     exerciseCmd payoutCid PayoutApproved_ConfirmSettlement with
-      bankReference = "BANK-REF-WRONG-ROLE"
+      bankReference = testTextDigest
       settledAt = now
       paidRole = PDR_Beneficiary
 
@@ -1977,11 +2308,12 @@ test_settlementRejectsRoleNotInPayoutDestination = script do
 
   -- Positive control: the allowed role still works, so the failures above
   -- are the role check and not a broken fixture.
-  submit insurer do
+  _ <- submit insurer do
     exerciseCmd payoutCid PayoutApproved_ConfirmSettlement with
-      bankReference = "BANK-REF-OK"
+      bankReference = testTextDigest
       settledAt = now
       paidRole = PDR_Insured
+  pure ()
 
 -- A failed payout produces a review item that carries the link back to the
 -- payout it came from, and the coverage it came from. Before Stage 4 only
@@ -1989,22 +2321,24 @@ test_settlementRejectsRoleNotInPayoutDestination = script do
 test_markFailedCarriesSourceAndCoverage : Script ()
 test_markFailedCarriesSourceAndCoverage = script do
   (insurer, _, _, _, payoutCid) <- approvedPayout
-  now <- getTime
 
   reviewCid <- submit insurer do
     exerciseCmd payoutCid PayoutApproved_MarkFailed with
       failureReason = "payee account closed"
-      now
       sourcePayoutContractId = show payoutCid
 
   Some review <- queryContractId insurer reviewCid
-  -- Non-empty rather than equal to `show payoutCid`: inside the choice the
-  -- link is captured as `show self`, and Daml Script renders a ContractId
-  -- differently in script context than the choice body does, so an exact
-  -- string comparison fails on formatting rather than on substance. The
-  -- live run recorded during development shows the real recorded value
-  -- matching the archived payout's own contract id.
+  -- The Text link is stored exactly as the caller passed it (here
+  -- `show payoutCid`); the choice no longer captures it as `show self`,
+  -- because a ContractId renders differently inside a choice body than in
+  -- script context -- on the participant as the literal "<contract-id>".
+  -- An echo of the argument proves little, so the Text is only checked
+  -- non-empty and the exact link is asserted on the typed sourcePayoutCid,
+  -- which the choice sets from `self`. The live run in
+  -- development shows the real recorded value matching the
+  -- archived payout's own contract id.
   assert (review.sourcePayoutContractId /= "")
+  assert (review.sourcePayoutCid == Some payoutCid)
   assert (review.coverageCode == "FROST")
   assert (review.reason == "payee account closed")
   assert (review.amount == 100000.0)
@@ -2016,8 +2350,18 @@ test_markFailedCarriesSourceAndCoverage = script do
   submitMustFail insurer2 do
     exerciseCmd payoutCid2 PayoutApproved_MarkFailed with
       failureReason = ""
-      now
       sourcePayoutContractId = show payoutCid2
+  -- Nor is one with no link back to the payout.
+  submitMustFail insurer2 do
+    exerciseCmd payoutCid2 PayoutApproved_MarkFailed with
+      failureReason = "payee account closed"
+      sourcePayoutContractId = ""
+  -- control: the same payout with both fields given is marked failed
+  _ <- submit insurer2 do
+    exerciseCmd payoutCid2 PayoutApproved_MarkFailed with
+      failureReason = "payee account closed"
+      sourcePayoutContractId = show payoutCid2
+  pure ()
 
 -- Exit 1: the review item is closed as settled after all, recording the same
 -- evidence the normal path records.
@@ -2028,12 +2372,11 @@ test_reviewItemResolvesSettled = script do
   reviewCid <- submit insurer do
     exerciseCmd payoutCid PayoutApproved_MarkFailed with
       failureReason = "payee account closed"
-      now
       sourcePayoutContractId = show payoutCid
 
   submit insurer do
     exerciseCmd reviewCid ManualReviewRequired_ResolveSettled with
-      bankReference = "BANK-REF-LATE"
+      bankReference = testTextDigest
       settledAt = now
       paidRole = PDR_Insured
 
@@ -2045,7 +2388,6 @@ test_reviewItemResolvesSettled = script do
   reviewCid2 <- submit insurer2 do
     exerciseCmd payoutCid2 PayoutApproved_MarkFailed with
       failureReason = "dispute"
-      now
       sourcePayoutContractId = show payoutCid2
   submitMustFail insurer2 do
     exerciseCmd reviewCid2 ManualReviewRequired_ResolveSettled with
@@ -2063,7 +2405,6 @@ test_reviewItemResolvesUnpaid = script do
   reviewCid <- submit insurer do
     exerciseCmd payoutCid PayoutApproved_MarkFailed with
       failureReason = "claimant contests the amount"
-      now
       sourcePayoutContractId = show payoutCid
 
   -- A note is mandatory: the enum alone cannot carry the circumstances.
@@ -2071,11 +2412,13 @@ test_reviewItemResolvesUnpaid = script do
     exerciseCmd reviewCid ManualReviewRequired_ResolveUnpaid with
       unpaidReason = UR_Disputed
       note = ""
+      closedAt = now
 
   submit insurer do
     exerciseCmd reviewCid ManualReviewRequired_ResolveUnpaid with
       unpaidReason = UR_Litigation
-      note = "referred to arbitration, file 2026/114"
+      note = testTextDigest
+      closedAt = now
 
   gone <- queryContractId insurer reviewCid
   assert (isNone gone)
@@ -2090,23 +2433,21 @@ test_payoutChoicesAreInsurerOnly = script do
 
   submitMustFail policyholder do
     exerciseCmd payoutCid PayoutApproved_ConfirmSettlement with
-      bankReference = "ATTACK"
+      bankReference = testTextDigest
       settledAt = now
       paidRole = PDR_Insured
   submitMustFail oracleOperator do
     exerciseCmd payoutCid PayoutApproved_ConfirmSettlement with
-      bankReference = "ATTACK"
+      bankReference = testTextDigest
       settledAt = now
       paidRole = PDR_Insured
   submitMustFail policyholder do
     exerciseCmd payoutCid PayoutApproved_MarkFailed with
       failureReason = "ATTACK"
-      now
       sourcePayoutContractId = "x"
   submitMustFail oracleOperator do
     exerciseCmd payoutCid PayoutApproved_MarkFailed with
       failureReason = "ATTACK"
-      now
       sourcePayoutContractId = "x"
 
   -- Positive control for insurer on MarkFailed, which also gives us a
@@ -2114,34 +2455,37 @@ test_payoutChoicesAreInsurerOnly = script do
   reviewCid <- submit insurer do
     exerciseCmd payoutCid PayoutApproved_MarkFailed with
       failureReason = "payee not found"
-      now
       sourcePayoutContractId = show payoutCid
 
   submitMustFail policyholder do
     exerciseCmd reviewCid ManualReviewRequired_ResolveSettled with
-      bankReference = "ATTACK"
+      bankReference = testTextDigest
       settledAt = now
       paidRole = PDR_Insured
   submitMustFail oracleOperator do
     exerciseCmd reviewCid ManualReviewRequired_ResolveSettled with
-      bankReference = "ATTACK"
+      bankReference = testTextDigest
       settledAt = now
       paidRole = PDR_Insured
   submitMustFail policyholder do
     exerciseCmd reviewCid ManualReviewRequired_ResolveUnpaid with
       unpaidReason = UR_Waived
-      note = "ATTACK"
+      note = testTextDigest
+      closedAt = now
   submitMustFail oracleOperator do
     exerciseCmd reviewCid ManualReviewRequired_ResolveUnpaid with
       unpaidReason = UR_Waived
-      note = "ATTACK"
+      note = testTextDigest
+      closedAt = now
 
   -- Positive control: insurer can resolve, so the failures are an
   -- authorization boundary and not a broken fixture.
-  submit insurer do
+  _ <- submit insurer do
     exerciseCmd reviewCid ManualReviewRequired_ResolveUnpaid with
       unpaidReason = UR_Waived
-      note = "claimant withdrew"
+      note = testTextDigest
+      closedAt = now
+  pure ()
 
 -- ensure: a PayoutApproved cannot exist with no payout destination at all,
 -- which would make the role check in ConfirmSettlement unsatisfiable.
@@ -2149,24 +2493,40 @@ test_payoutApprovedRequiresADestination : Script ()
 test_payoutApprovedRequiresADestination = script do
   (insurer, policyholder, _, oracleOperator) <- setupParties
   now <- getTime
-  submitMustFail insurer do
-    createCmd PayoutApproved with
-      insurer
-      policyholder
-      oracleOperator
-      policyId = "TEST-POLICY-1"
-      coverageCode = "FROST"
-      sourcePolicyContractId = "n/a"
-      amount = 1000.0
-      recipient = PDR_Insured
-      mortgagee = None
-      currency = "TRY"
-      payoutPercentage = 25.0
-      tierLabel = "t"
-      isFullSettlement = False
-      payoutDestination = []
-      approvedAt = now
-      status = PA_Pending
+  -- PDR_EnforcementOffice is the one recipient exempt from the membership
+  -- check, so with it an empty payoutDestination breaks only the
+  -- `not (null payoutDestination)` clause.
+  let base = PayoutApproved with
+        insurer
+        policyholder
+        oracleOperator
+        policyId = "TEST-POLICY-1"
+        coverageCode = "FROST"
+        sourcePolicyContractId = "n/a"
+        amount = 1000.0
+        recipient = PDR_EnforcementOffice
+        mortgagee = None
+        currency = "TRY"
+        payoutPercentage = 25.0
+        tierLabel = "t"
+        isFullSettlement = False
+        payoutDestination = [PDR_Insured]
+        approvedAt = now
+        eventStart = now
+        eventEnd = addRelTime now (days 1)
+        evidenceDigest = testEvidenceDigest
+  -- Both signatories act, as in test_payoutRecipientAndMortgageeMustAgree:
+  -- a submit by the insurer alone fails on authorization before the ensure
+  -- clause is reached.
+  submitMustFail (actAs [insurer, oracleOperator]) do
+    createCmd base with payoutDestination = []
+  -- ...and a leg must carry a positive amount.
+  submitMustFail (actAs [insurer, oracleOperator]) do
+    createCmd base with amount = 0.0
+
+  -- control: the same record with a destination and an amount creates
+  _ <- submit (actAs [insurer, oracleOperator]) do createCmd base
+  pure ()
 
 -- ---------------------------------------------------------------------------
 -- Role intake: the three beneficiary states, and a mortgagee that is real
@@ -2353,6 +2713,9 @@ test_mortgageeWithPerCoverageClaimAmounts = script do
         mortgageeClaimAmount = None
         attachedAt = None
         attachmentLiftedAt = None
+        metric = "TEMPERATURE_C"
+        payoutBasis = PB_RemainingLimit
+        cellCommitment = testCellCommitment
   policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None (Some bank)
     [charged, uncharged]
 
@@ -2371,8 +2734,9 @@ test_mortgageeWithPerCoverageClaimAmounts = script do
   assert (asSeenByBank == policy)
   assert (length asSeenByBank.coverages == 2)
 
--- The invariant that already existed but could never fire, because no policy
--- could name a mortgagee: a claim amount without a mortgagee to claim it.
+-- The invariant that predates role intake, and the same ensure that
+-- test_mortgageeClaimEnsureRejectsClaimWithoutMortgagee exercises: a claim
+-- amount without a mortgagee to claim it.
 test_claimAmountWithoutMortgageeIsRejected : Script ()
 test_claimAmountWithoutMortgageeIsRejected = script do
   (insurer, policyholder, insured, oracleOperator) <- setupParties
@@ -2474,6 +2838,53 @@ test_mortgageeFlowsRunOnAPolicyThatHasOne = script do
   Some asSeenByBank <- queryContractId bank electedCid
   assert (asSeenByBank.mortgageeElection == Some ME_Continue)
 
+-- m. 1456(5): an election needs a mortgagee to make it and a terminated
+-- contract for it to arise on; ME_Decline records like ME_Continue does.
+test_mortgageeElectionGuards : Script ()
+test_mortgageeElectionGuards = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  bank <- allocateParty "MortgageeBank"
+  now <- getTime
+
+  -- No mortgagee: a terminated policy, but nobody to elect.
+  bareCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  bareNoticeCid <- submit insurer do
+    exerciseCmd bareCid PolicyToken_ServeNotice with
+      noticeServiceDate = now
+      noticeRecordedAt = now
+  bareTerminatedCid <- submit insurer do
+    exerciseCmd bareNoticeCid PolicyToken_Terminate with
+      terminationInstant = addRelTime now (days 10)
+      unrunDays = 60
+      mortgageeContinuationEndsAt = None
+  submitMustFail insurer do
+    exerciseCmd bareTerminatedCid PolicyToken_RecordMortgageeElection with
+      election = ME_Decline
+
+  -- A mortgagee, but the contract is still in its notice period.
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None (Some bank)
+    [frostCoverage with mortgageeClaimAmount = Some 40000.0]
+  inNoticeCid <- submit insurer do
+    exerciseCmd policyCid PolicyToken_ServeNotice with
+      noticeServiceDate = now
+      noticeRecordedAt = now
+  submitMustFail insurer do
+    exerciseCmd inNoticeCid PolicyToken_RecordMortgageeElection with
+      election = ME_Decline
+
+  -- control: the same policy once terminated records ME_Decline
+  terminatedCid <- submit insurer do
+    exerciseCmd inNoticeCid PolicyToken_Terminate with
+      terminationInstant = addRelTime now (days 10)
+      unrunDays = 60
+      mortgageeContinuationEndsAt = Some (addRelTime now (days 25))
+  declinedCid <- submit insurer do
+    exerciseCmd terminatedCid PolicyToken_RecordMortgageeElection with
+      election = ME_Decline
+  Some declined <- queryContractId insurer declinedCid
+  assert (declined.mortgageeElection == Some ME_Decline)
+  assert (declined.defaultState == DS_Terminated)
+
 -- ---------------------------------------------------------------------------
 -- m. 1434(2): first-premium default -- cayma, not fesih
 -- ---------------------------------------------------------------------------
@@ -2553,6 +2964,11 @@ test_enforcementForeclosesTheDeemedPath = script do
   assert (isSome pursued.enforcementCommencedAt)
   assert (pursued.defaultState == DS_FirstPremiumUnpaid)  -- still in default
 
+  -- Commencement is reported once; the report above is its control.
+  submitMustFail insurer do
+    exerciseCmd pursuedCid PolicyToken_RecordEnforcementCommenced with
+      commencedAt = addRelTime now (days (-20))
+
   -- The deemed path is refused...
   submitMustFail insurer do
     exerciseCmd pursuedCid PolicyToken_WithdrawForFirstPremium with
@@ -2591,6 +3007,11 @@ test_firstPremiumPaidBeforeEitherPathCompletes = script do
       withdrawnAt = now
       path = WP_InsurerWithdrew
 
+  -- Nor can a due date be reported again: the token is back in DS_None, but
+  -- the first report above stands and is not restated.
+  submitMustFail insurer do
+    exerciseCmd paidCid PolicyToken_RecordPremiumDueDate with dueDate = now
+
 -- A trigger in first-premium default is refused, with its own reason -- a
 -- policy whose first premium is reported unpaid is not a policy that lost
 -- cover.
@@ -2600,7 +3021,11 @@ test_triggerRejectedInFirstPremiumDefault = script do
   policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
   now <- getTime
 
+  -- Minted here, before the ledger clock moves to the event's end, so its
+  -- cover starts with the others' (v22).
+  controlCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
   unpaidCid <- inFirstPremiumDefault insurer policyCid (addRelTime now (days (-30)))
+  reachEventEnd (addRelTime now (days 1))
   submitMustFail oracleOperator do
     exerciseCmd unpaidCid PolicyToken_EvaluateTrigger with
       selfContractId = show unpaidCid
@@ -2609,12 +3034,16 @@ test_triggerRejectedInFirstPremiumDefault = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-first-premium-unpaid"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
 
   withdrawnCid <- submit insurer do
     exerciseCmd unpaidCid PolicyToken_WithdrawForFirstPremium with
       withdrawnAt = now
       path = WP_InsurerWithdrew
+  reachEventEnd (addRelTime now (days 1))
   submitMustFail oracleOperator do
     exerciseCmd withdrawnCid PolicyToken_EvaluateTrigger with
       selfContractId = show withdrawnCid
@@ -2623,11 +3052,14 @@ test_triggerRejectedInFirstPremiumDefault = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-after-withdrawal"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
 
   -- Control: the same reading on a policy in neither state DOES pay, so the
   -- refusals above are the state and not the reading.
-  controlCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  reachEventEnd (addRelTime now (days 1))
   result <- submit oracleOperator do
     exerciseCmd controlCid PolicyToken_EvaluateTrigger with
       selfContractId = show controlCid
@@ -2636,7 +3068,10 @@ test_triggerRejectedInFirstPremiumDefault = script do
       metric = "TEMPERATURE_C"
       attestationRef = "control-reading"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   assert result.trigger.matched
 
 -- The two mechanisms are mutually exclusive on one token. m. 1434(2) governs
@@ -2656,6 +3091,20 @@ test_firstPremiumAndNoticeMechanismsCannotCoexist = script do
       noticeRecordedAt = now
   submitMustFail insurer do
     exerciseCmd inNoticeCid PolicyToken_RecordPremiumDueDate with dueDate = now
+  -- ...nor be reported as having paid its first premium.
+  submitMustFail insurer do
+    exerciseCmd inNoticeCid PolicyToken_RecordFirstPremiumPaid with paidAt = now
+
+  -- The same holds once the notice has been paid off. The token is back in
+  -- DS_None, so this reaches the "already under notice" guard and not the
+  -- "already in default" one the refusal above stops at.
+  paidOffCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  reinstatedCid <- noticeThenPay insurer paidOffCid now
+  submitMustFail insurer do
+    exerciseCmd reinstatedCid PolicyToken_RecordPremiumDueDate with dueDate = now
+  -- control: in DS_None the first premium can be reported paid
+  _ <- submit insurer do
+    exerciseCmd reinstatedCid PolicyToken_RecordFirstPremiumPaid with paidAt = now
 
   -- And a policy in first-premium default cannot be served an ihtar.
   otherCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
@@ -2750,6 +3199,7 @@ test_firstPremiumEnsureGuards = script do
       noticeServiceDate = Some now
       noticeRecordedAt = Some now
       noticeCount = 1
+      noticeServiceDates = [now]
       defaultState = DS_FirstPremiumUnpaid
 
   -- control: the same record with the facts consistent DOES create
@@ -2839,7 +3289,11 @@ test_triggerRefusedBeforeCoverBegins = script do
   (insurer, policyholder, insured, oracleOperator) <- setupParties
   policyCid <- mintWithoutCover insurer policyholder insured oracleOperator
   now <- getTime
+  -- The control, minted before the ledger clock moves to the event's end
+  -- (v22).
+  liveCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
 
+  reachEventEnd (addRelTime now (days 1))
   submitMustFail oracleOperator do
     exerciseCmd policyCid PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid
@@ -2848,11 +3302,14 @@ test_triggerRefusedBeforeCoverBegins = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-before-cover"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
 
   -- Control: the SAME reading on a policy whose cover has begun pays. The
   -- refusal is the cover state, not the reading.
-  liveCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  reachEventEnd (addRelTime now (days 1))
   result <- submit oracleOperator do
     exerciseCmd liveCid PolicyToken_EvaluateTrigger with
       selfContractId = show liveCid
@@ -2861,7 +3318,10 @@ test_triggerRefusedBeforeCoverBegins = script do
       metric = "TEMPERATURE_C"
       attestationRef = "control-reading"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   assert result.trigger.matched
 
 -- Reporting payment starts cover at the reported instant, and records why.
@@ -2876,6 +3336,8 @@ test_reportingPaymentStartsCover = script do
   -- re-mints, so the original contract id no longer resolves afterwards.
   Some before <- queryContractId insurer policyCid
 
+  -- v22: a payment is reported at or after it was made.
+  setTime paidAt
   paidCid <- submit insurer do
     exerciseCmd policyCid PolicyToken_RecordFirstPremiumPaid with paidAt
   Some paid <- queryContractId insurer paidCid
@@ -2895,6 +3357,7 @@ test_reportingPaymentStartsCover = script do
   assert (paid.coverageBeganAt /= Some paid.termStart)
 
   -- And a trigger now works.
+  reachEventEnd (addRelTime paidAt (days 1))
   result <- submit oracleOperator do
     exerciseCmd paidCid PolicyToken_EvaluateTrigger with
       selfContractId = show paidCid
@@ -2903,7 +3366,10 @@ test_reportingPaymentStartsCover = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-after-payment"
       currency = "TRY"
-      now
+      eventStart = paidAt
+      eventEnd = addRelTime paidAt (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   assert result.trigger.matched
 
 -- "aksine sözleşme": cover agreed to start without payment. A later payment
@@ -2919,6 +3385,8 @@ test_agreedStartEarlierThanPaymentIsNotOverwritten = script do
   assert (agreed.coverageStartBasis == Some CSB_AgreedWithoutPayment)
   let agreedStart = agreed.coverageBeganAt
 
+  -- v22: a payment is reported at or after it was made.
+  setTime (addRelTime now (days 20))
   paidCid <- submit insurer do
     exerciseCmd policyCid PolicyToken_RecordFirstPremiumPaid with
       paidAt = addRelTime now (days 20)
@@ -2942,6 +3410,8 @@ test_agreedStartLaterThanPaymentIsRejected = script do
       paidAt = addRelTime now (days (-30))
 
   -- Control: payment on or after the agreed start is fine.
+  -- v22: a payment is reported at or after it was made.
+  setTime (addRelTime now (days 30))
   ok <- submit insurer do
     exerciseCmd policyCid PolicyToken_RecordFirstPremiumPaid with
       paidAt = addRelTime now (days 30)
@@ -3192,6 +3662,7 @@ test_retroactiveCheckSurvivesRemint = script do
       amendmentReason = None
 
   -- A partial payout re-mints the token.
+  reachEventEnd (addRelTime now (days 1))
   result <- submit oracleOperator do
     exerciseCmd policyCid PolicyToken_EvaluateTrigger with
       selfContractId = show policyCid
@@ -3200,7 +3671,10 @@ test_retroactiveCheckSurvivesRemint = script do
       metric = "TEMPERATURE_C"
       attestationRef = "reading-retro"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   assert result.trigger.matched
   Some paidCid <- pure result.newPolicyCid
   Some afterPayout <- queryContractId insurer paidCid
@@ -3244,6 +3718,7 @@ chargedCoverage claim = frostCoverage with
 mildTrigger : Party -> ContractId PolicyToken -> Text -> Script EvaluateTriggerResult
 mildTrigger oracleOperator cid ref = do
   now <- getTime
+  reachEventEnd (addRelTime now (days 1))
   submit oracleOperator do
     exerciseCmd cid PolicyToken_EvaluateTrigger with
       selfContractId = show cid
@@ -3252,7 +3727,10 @@ mildTrigger oracleOperator cid ref = do
       metric = "TEMPERATURE_C"
       attestationRef = ref
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
 
 claimOn : PolicyToken -> Optional Decimal
 claimOn p = case find (\c -> c.coverageCode == "FROST") p.coverages of
@@ -3400,15 +3878,16 @@ test_mortgageeLegSettlesAndOnlyAsItsOwnRecipient = script do
   -- this through. The recipient check is what stops it.
   submitMustFail insurer do
     exerciseCmd leg.cid PayoutApproved_ConfirmSettlement with
-      bankReference = "REF-1"
+      bankReference = testTextDigest
       settledAt = now
       paidRole = PDR_Insured
 
-  submit insurer do
+  _ <- submit insurer do
     exerciseCmd leg.cid PayoutApproved_ConfirmSettlement with
-      bankReference = "REF-1"
+      bankReference = testTextDigest
       settledAt = now
       paidRole = PDR_Mortgagee
+  pure ()
 
 -- A mortgagee leg can fail and be resolved on its own, independently of
 -- anything else the trigger produced.
@@ -3426,21 +3905,23 @@ test_mortgageeLegFailsAndResolvesIndependently = script do
   reviewCid <- submit insurer do
     exerciseCmd leg.cid PayoutApproved_MarkFailed with
       failureReason = "payee could not be reached"
-      now
       sourcePayoutContractId = "cid-placeholder"
   submit insurer do
     exerciseCmd reviewCid ManualReviewRequired_ResolveUnpaid with
       unpaidReason = UR_Other
-      note = "resolved in the test"
+      note = testTextDigest
+      closedAt = now
 
   -- The remainder's own review item is untouched by that, and resolves
   -- separately. Two obligations, two outcomes.
   Some stillOpen <- queryContractId insurer remainder.reviewCid
   assert (stillOpen.amount == 15000.0)
-  submit insurer do
+  _ <- submit insurer do
     exerciseCmd remainder.reviewCid ManualReviewRequired_ResolveUnpaid with
       unpaidReason = UR_Other
-      note = "the surplus question went to a lawyer"
+      note = testTextDigest
+      closedAt = now
+  pure ()
 
 -- The whole of the above is inert on a policy with no mortgagee at all.
 test_policyWithNoMortgageeIsUnchanged : Script ()
@@ -3480,7 +3961,9 @@ test_payoutRecipientAndMortgageeMustAgree = script do
         isFullSettlement = False
         payoutDestination = [PDR_Insured, PDR_Mortgagee]
         approvedAt = now
-        status = PA_Pending
+        eventStart = now
+        eventEnd = addRelTime now (days 1)
+        evidenceDigest = testEvidenceDigest
 
   -- a mortgagee leg with nobody to pay
   submitMustFail (actAs [insurer, oracleOperator]) do
@@ -3714,6 +4197,51 @@ test_substitutionAndTheFirstPremiumMechanism = script do
   submitMustFail insurer do
     exerciseCmd withdrawnCid PolicyToken_SubstitutePolicyholder with
       substitutedAtInstant = now
+
+-- The same for a contract terminated under m. 1434(3), and for reporting
+-- enforcement fruitless on a contract that has ended either way.
+test_endedContractRefusesFruitlessEnforcementAndSubstitution : Script ()
+test_endedContractRefusesFruitlessEnforcementAndSubstitution = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintForAnothersAccount insurer policyholder insured oracleOperator
+  now <- getTime
+
+  -- control: during the notice period the contract has not ended, so both
+  -- preceding facts can be reported on it
+  noticedCid <- submit insurer do
+    exerciseCmd policyCid PolicyToken_ServeNotice with
+      noticeServiceDate = addRelTime now (days (-30))
+      noticeRecordedAt = addRelTime now (days (-30))
+  notifiedCid <- reachNotified insurer noticedCid
+  terminatedCid <- submit insurer do
+    exerciseCmd notifiedCid PolicyToken_Terminate with
+      terminationInstant = now
+      unrunDays = 100
+      mortgageeContinuationEndsAt = None
+
+  -- Terminated: every fact the takeover needs is recorded, and it is still
+  -- refused -- there is no contract left to continue.
+  submitMustFail insurer do
+    exerciseCmd terminatedCid PolicyToken_SubstitutePolicyholder with
+      substitutedAtInstant = now
+  submitMustFail insurer do
+    exerciseCmd terminatedCid PolicyToken_RecordEnforcementFruitless with
+      fruitlessAt = now
+      route = ER_Dava
+
+  -- Withdrawn under m. 1434(2): enforcement cannot be reported fruitless.
+  policyCid2 <- mintForAnothersAccount insurer policyholder insured oracleOperator
+  dueCid2 <- submit insurer do
+    exerciseCmd policyCid2 PolicyToken_RecordPremiumDueDate with
+      dueDate = addRelTime now (days (-60))
+  withdrawnCid <- submit insurer do
+    exerciseCmd dueCid2 PolicyToken_WithdrawForFirstPremium with
+      withdrawnAt = now
+      path = WP_InsurerWithdrew
+  submitMustFail insurer do
+    exerciseCmd withdrawnCid PolicyToken_RecordEnforcementFruitless with
+      fruitlessAt = now
+      route = ER_Takip
 
 -- ensure: the three facts cannot be written onto a token out of order, so
 -- the sequence cannot be bypassed by creating one directly.
@@ -4140,6 +4668,7 @@ test_twoNoticeEffectLandsOnlyAtThePeriodEnd = script do
 
   -- A loss in the interval is PAYABLE: cover runs in full until the period
   -- end, exactly as during a notice period under (3).
+  reachEventEnd (addRelTime now (days 1))
   result <- submit oracleOperator do
     exerciseCmd electedCid PolicyToken_EvaluateTrigger with
       selfContractId = show electedCid
@@ -4148,7 +4677,10 @@ test_twoNoticeEffectLandsOnlyAtThePeriodEnd = script do
       metric = "TEMPERATURE_C"
       attestationRef = "in-the-interval"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   assert result.trigger.matched
   Some paidCid <- pure result.newPolicyCid
   Some paid <- queryContractId insurer paidCid
@@ -4162,7 +4694,9 @@ test_twoNoticeEffectLandsOnlyAtThePeriodEnd = script do
   assert (landed.defaultState == DS_TwoNoticeTerminated)
   assert (landed.coverageValidThrough == periodEnd)
 
-  -- After it lands, a loss is outside cover -- and the message is its own.
+  -- After it lands, a loss is outside cover. v22: judged by the event's time
+  -- against coverageValidThrough (the period end), not by the state.
+  reachEventEnd (addRelTime periodEnd (days 1))
   submitMustFail oracleOperator do
     exerciseCmd landedCid PolicyToken_EvaluateTrigger with
       selfContractId = show landedCid
@@ -4171,13 +4705,49 @@ test_twoNoticeEffectLandsOnlyAtThePeriodEnd = script do
       metric = "TEMPERATURE_C"
       attestationRef = "after-the-end"
       currency = "TRY"
-      now
+      eventStart = periodEnd
+      eventEnd = addRelTime periodEnd (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
+  -- Straddling the period end: refused as well.
+  reachEventEnd (addRelTime periodEnd (hours 1))
+  submitMustFail oracleOperator do
+    exerciseCmd landedCid PolicyToken_EvaluateTrigger with
+      selfContractId = show landedCid
+      coverageCode = "FROST"
+      observedValue = -2.0
+      metric = "TEMPERATURE_C"
+      attestationRef = "across-the-end"
+      currency = "TRY"
+      eventStart = addRelTime periodEnd (hours (-1))
+      eventEnd = addRelTime periodEnd (hours 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
+  -- v22: an event that ended before the period end is evaluated
+  -- although the token is already DS_TwoNoticeTerminated.
+  reachEventEnd (periodEnd)
+  lateResult <- submit oracleOperator do
+    exerciseCmd landedCid PolicyToken_EvaluateTrigger with
+      selfContractId = show landedCid
+      coverageCode = "FROST"
+      observedValue = -2.0
+      metric = "TEMPERATURE_C"
+      attestationRef = "before-the-end"
+      currency = "TRY"
+      eventStart = addRelTime periodEnd (days (-1))
+      eventEnd = periodEnd
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
+  assert lateResult.trigger.matched
+  Some lateCid <- pure lateResult.newPolicyCid
+  Some late <- queryContractId insurer lateCid
+  assert (late.defaultState == DS_TwoNoticeTerminated)
 
   -- And the token can finally burn by the shared archive route.
-  submit insurer do
-    exerciseCmd landedCid PolicyToken_ArchiveForNonPayment with
-      archivedAt = addRelTime now (days 40)
+  _ <- submit insurer do
+    exerciseCmd lateCid PolicyToken_ArchiveForNonPayment with
       reason = "m. 1434(4) termination at the end of the insurance period"
+  pure ()
 
 -- The interaction the single default axis forces, and the reason election is
 -- refused rather than allowed to overwrite.
@@ -4279,6 +4849,50 @@ test_substitutionDoesNotResetTheNoticeCount = script do
       insurancePeriodStart = addRelTime now (days (-60))
       insurancePeriodEnd = addRelTime now (days 30)
   pure ()
+
+-- The election needs a period that is a period and has not ended, and the
+-- effect needs an election pending to land.
+test_twoNoticeElectionAndApplicationArgumentGuards : Script ()
+test_twoNoticeElectionAndApplicationArgumentGuards = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  now <- getTime
+  -- Both notices on one instant, so a period that starts where it ends still
+  -- holds two of them and only the period's own shape is at fault.
+  let served = addRelTime now (days 10)
+  oneCid <- noticeThenPay insurer policyCid served
+  twoCid <- noticeThenPay insurer oneCid served
+
+  -- a period that does not start before it ends
+  submitMustFail insurer do
+    exerciseCmd twoCid PolicyToken_ElectTwoNoticeTermination with
+      electedAt = now
+      insurancePeriodStart = served
+      insurancePeriodEnd = served
+  -- a period that has already ended when the election is made
+  submitMustFail insurer do
+    exerciseCmd twoCid PolicyToken_ElectTwoNoticeTermination with
+      electedAt = served
+      insurancePeriodStart = now
+      insurancePeriodEnd = served
+  -- no election pending: nothing to apply
+  submitMustFail insurer do
+    exerciseCmd twoCid PolicyToken_ApplyTwoNoticeTermination with
+      appliedAt = addRelTime now (days 40)
+
+  -- control: a proper period elects and its effect lands once
+  electedCid <- submit insurer do
+    exerciseCmd twoCid PolicyToken_ElectTwoNoticeTermination with
+      electedAt = now
+      insurancePeriodStart = now
+      insurancePeriodEnd = addRelTime now (days 30)
+  landedCid <- submit insurer do
+    exerciseCmd electedCid PolicyToken_ApplyTwoNoticeTermination with
+      appliedAt = addRelTime now (days 40)
+  -- Landed, the election is no longer pending, so it cannot land twice.
+  submitMustFail insurer do
+    exerciseCmd landedCid PolicyToken_ApplyTwoNoticeTermination with
+      appliedAt = addRelTime now (days 41)
 
 test_twoNoticeEnsureGuards : Script ()
 test_twoNoticeEnsureGuards = script do
@@ -4385,6 +4999,7 @@ chargedCoverageFor claim = frostCoverage with
 attachTrigger : Party -> ContractId PolicyToken -> Text -> Script EvaluateTriggerResult
 attachTrigger oracleOperator cid ref = do
   now <- getTime
+  reachEventEnd (addRelTime now (days 1))
   submit oracleOperator do
     exerciseCmd cid PolicyToken_EvaluateTrigger with
       selfContractId = show cid
@@ -4393,7 +5008,10 @@ attachTrigger oracleOperator cid ref = do
       metric = "TEMPERATURE_C"
       attestationRef = ref
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
 
 test_attachmentRoutesToTheEnforcementOffice : Script ()
 test_attachmentRoutesToTheEnforcementOffice = script do
@@ -4464,6 +5082,61 @@ test_attachmentAndChargeTogetherRouteNothing = script do
   let Some cov = find (\c -> c.coverageCode == "FROST") reminted.coverages
   assert (cov.mortgageeClaimAmount == Some 40000.0)
 
+-- A charged coverage whose payoutDestination leaves out PDR_Mortgagee is
+-- refused at the trigger even when it is also attached. There nothing routes
+-- and no PayoutApproved is created, so PayoutBridge's recipient ensure is
+-- never reached: the trigger's own routing assertion is the only refusal.
+test_attachedChargedCoverageMustPermitTheMortgagee : Script ()
+test_attachedChargedCoverageMustPermitTheMortgagee = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  bank <- allocateParty "Bank"
+  now <- getTime
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None (Some bank)
+    [frostCoverage with mortgageeClaimAmount = Some 40000.0]
+  -- Minted here, before the ledger clock moves to the event's end, so its
+  -- cover starts with the other's (v22).
+  controlCid <- mintTestPolicy insurer policyholder insured oracleOperator None (Some bank)
+    [chargedCoverageFor 40000.0]
+
+  attachedCid <- submit insurer do
+    exerciseCmd policyCid PolicyToken_RecordAttachment with
+      coverageCode = "FROST"
+      attachedAt = addRelTime now (days (-5))
+  reachEventEnd (addRelTime now (days 1))
+  submitMustFail oracleOperator do
+    exerciseCmd attachedCid PolicyToken_EvaluateTrigger with
+      selfContractId = show attachedCid
+      coverageCode = "FROST"
+      observedValue = -2.0
+      metric = "TEMPERATURE_C"
+      attestationRef = "competing-without-mortgagee-destination"
+      currency = "TRY"
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
+
+  -- control: the same attachment and reading on a coverage that permits
+  -- PDR_Mortgagee goes through and routes nothing
+  controlAttachedCid <- submit insurer do
+    exerciseCmd controlCid PolicyToken_RecordAttachment with
+      coverageCode = "FROST"
+      attachedAt = addRelTime now (days (-5))
+  result <- submit oracleOperator do
+    exerciseCmd controlAttachedCid PolicyToken_EvaluateTrigger with
+      selfContractId = show controlAttachedCid
+      coverageCode = "FROST"
+      observedValue = -2.0
+      metric = "TEMPERATURE_C"
+      attestationRef = "competing-control"
+      currency = "TRY"
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
+  assert (null result.payouts)
+  assert (isSome result.unroutedRemainder)
+
 test_liftingRestoresNormalRoutingAndReattachmentWorks : Script ()
 test_liftingRestoresNormalRoutingAndReattachmentWorks = script do
   (insurer, policyholder, insured, oracleOperator) <- setupParties
@@ -4484,6 +5157,11 @@ test_liftingRestoresNormalRoutingAndReattachmentWorks = script do
     exerciseCmd attachedCid PolicyToken_RecordAttachmentLifted with
       coverageCode = "FROST"
       liftedAt = addRelTime now (days (-40))
+  -- Nor name a coverage the policy does not have.
+  submitMustFail insurer do
+    exerciseCmd attachedCid PolicyToken_RecordAttachmentLifted with
+      coverageCode = "NOT-A-COVERAGE"
+      liftedAt = addRelTime now (days (-20))
 
   liftedCid <- submit insurer do
     exerciseCmd attachedCid PolicyToken_RecordAttachmentLifted with
@@ -4538,6 +5216,7 @@ test_attachmentIsScopedToItsCoverage = script do
       coverageCode = "NOT-A-COVERAGE"
       attachedAt = now
 
+  reachEventEnd (addRelTime now (days 1))
   glassResult <- submit oracleOperator do
     exerciseCmd attachedCid PolicyToken_EvaluateTrigger with
       selfContractId = show attachedCid
@@ -4546,7 +5225,10 @@ test_attachmentIsScopedToItsCoverage = script do
       metric = "TEMPERATURE_C"
       attestationRef = "glass-unattached"
       currency = "TRY"
-      now
+      eventStart = now
+      eventEnd = addRelTime now (days 1)
+      cellCommitment = testCellCommitment
+      evidenceDigest = testEvidenceDigest
   [glassLeg] <- pure glassResult.payouts
   assert (glassLeg.recipient == PDR_Insured)
 
@@ -4566,15 +5248,16 @@ test_enforcementOfficeSettlesAsItsOwnRecipient = script do
   -- the insured does not close a payout owed to the enforcement office.
   submitMustFail insurer do
     exerciseCmd leg.cid PayoutApproved_ConfirmSettlement with
-      bankReference = "REF-WRONG"
+      bankReference = testTextDigest
       settledAt = now
       paidRole = PDR_Insured
 
-  submit insurer do
+  _ <- submit insurer do
     exerciseCmd leg.cid PayoutApproved_ConfirmSettlement with
-      bankReference = "REF-ICRA-1"
+      bankReference = testTextDigest
       settledAt = now
       paidRole = PDR_EnforcementOffice
+  pure ()
 
 -- ensure: the enforcement office is exempt from the payoutDestination check,
 -- and nothing else is.
@@ -4599,7 +5282,9 @@ test_enforcementOfficeExemptionIsNarrow = script do
         isFullSettlement = False
         payoutDestination = [PDR_Insured]
         approvedAt = now
-        status = PA_Pending
+        eventStart = now
+        eventEnd = addRelTime now (days 1)
+        evidenceDigest = testEvidenceDigest
 
   -- The exemption: owed to the enforcement office though the policy never
   -- designated it, because nobody designates one.
@@ -4610,4 +5295,1330 @@ test_enforcementOfficeExemptionIsNarrow = script do
     createCmd base with recipient = PDR_Beneficiary
   submitMustFail (actAs [insurer, oracleOperator]) do
     createCmd base with recipient = PDR_Mortgagee, mortgagee = Some bank
+  pure ()
+
+-- ---------------------------------------------------------------------------
+-- v22: the event interval, ledger time, metric, cell commitment,
+-- evidence digest, payout basis, linear tiers, oracleOperator /= insurer
+-- ---------------------------------------------------------------------------
+
+-- A trigger on the FROST coverage with every v22 argument explicit, so each
+-- test below changes only the one it is about.
+frostTrigger : ContractId PolicyToken -> Decimal -> Time -> Time -> PolicyToken_EvaluateTrigger
+frostTrigger cid observed evStart evEnd = PolicyToken_EvaluateTrigger with
+  selfContractId = show cid
+  coverageCode = "FROST"
+  observedValue = observed
+  metric = "TEMPERATURE_C"
+  attestationRef = "v22"
+  currency = "TRY"
+  eventStart = evStart
+  eventEnd = evEnd
+  cellCommitment = testCellCommitment
+  evidenceDigest = testEvidenceDigest
+
+-- The event interval [eventStart, eventEnd) must lie inside cover:
+-- cover start inclusive, coverageValidThrough exclusive (eventEnd may equal
+-- it), and the interval must not be empty or inverted.
+test_eventIntervalMustLieInsideCover : Script ()
+test_eventIntervalMustLieInsideCover = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  Some tok <- queryContractId insurer policyCid
+  Some coverStart <- pure tok.coverageBeganAt
+  let validThrough = tok.coverageValidThrough
+  -- v22: every window below has ended on the ledger clock.
+  reachEventEnd (addRelTime validThrough (hours 1))
+
+  -- starts before cover began
+  submitMustFail oracleOperator do
+    exerciseCmd policyCid (frostTrigger policyCid (-2.0) (addRelTime coverStart (hours (-1))) (addRelTime coverStart (hours 1)))
+  -- ends after coverageValidThrough
+  submitMustFail oracleOperator do
+    exerciseCmd policyCid (frostTrigger policyCid (-2.0) (addRelTime validThrough (hours (-1))) (addRelTime validThrough (hours 1)))
+  -- empty interval
+  submitMustFail oracleOperator do
+    exerciseCmd policyCid (frostTrigger policyCid (-2.0) coverStart coverStart)
+  -- inverted interval
+  submitMustFail oracleOperator do
+    exerciseCmd policyCid (frostTrigger policyCid (-2.0) (addRelTime coverStart (days 1)) coverStart)
+
+  -- Both edges exactly on the boundaries: the start is inclusive, the end
+  -- may equal coverageValidThrough.
+  result <- submit oracleOperator do
+    exerciseCmd policyCid (frostTrigger policyCid (-2.0) coverStart validThrough)
+  assert result.trigger.matched
+
+-- A policy whose cover has not begun is refused whatever the interval.
+test_eventIntervalRefusedWhenCoverNotBegun : Script ()
+test_eventIntervalRefusedWhenCoverNotBegun = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintWithoutCover insurer policyholder insured oracleOperator
+  now <- getTime
+  submitMustFail oracleOperator do
+    exerciseCmd policyCid (frostTrigger policyCid (-2.0) now (addRelTime now (days 1)))
+
+-- The trigger's metric must be the coverage's metric.
+test_metricMustMatchTheCoverage : Script ()
+test_metricMustMatchTheCoverage = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  now <- getTime
+  let trig = frostTrigger policyCid (-2.0) now (addRelTime now (days 1))
+  reachEventEnd (addRelTime now (days 1))
+  submitMustFail oracleOperator do
+    exerciseCmd policyCid trig with metric = "TEMPERATURE_F"
+  submitMustFail oracleOperator do
+    exerciseCmd policyCid trig with metric = ""
+  result <- submit oracleOperator do exerciseCmd policyCid trig
+  assert result.trigger.matched
+
+-- A coverage cannot be minted with an empty metric.
+test_emptyMetricRejectedAtMint : Script ()
+test_emptyMetricRejectedAtMint = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  Some tok <- queryContractId insurer policyCid
+  submitMustFail insurer do
+    createCmd tok with
+      policyNo = "V22-EMPTY-METRIC"
+      coverages = [frostCoverage with metric = ""]
+
+-- The trigger's cell commitment must be the coverage's, and the
+-- coverage's must be in the "sha256:" form.
+test_cellCommitmentMustMatchTheCoverage : Script ()
+test_cellCommitmentMustMatchTheCoverage = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  now <- getTime
+  let trig = frostTrigger policyCid (-2.0) now (addRelTime now (days 1))
+  reachEventEnd (addRelTime now (days 1))
+  submitMustFail oracleOperator do
+    exerciseCmd policyCid trig with cellCommitment = testEvidenceDigest
+  submitMustFail oracleOperator do
+    exerciseCmd policyCid trig with cellCommitment = ""
+
+  Some tok <- queryContractId insurer policyCid
+  submitMustFail insurer do
+    createCmd tok with
+      policyNo = "V22-BAD-CELL"
+      coverages = [frostCoverage with cellCommitment = "metno:39.9,32.8"]
+  submitMustFail insurer do
+    createCmd tok with
+      policyNo = "V22-EMPTY-CELL"
+      coverages = [frostCoverage with cellCommitment = ""]
+
+  result <- submit oracleOperator do exerciseCmd policyCid trig
+  assert result.trigger.matched
+
+-- The evidence digest must be "sha256:" + 64 lowercase hex characters.
+test_evidenceDigestMustBeWellFormed : Script ()
+test_evidenceDigestMustBeWellFormed = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  now <- getTime
+  let trig = frostTrigger policyCid (-2.0) now (addRelTime now (days 1))
+      hex64 = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+  reachEventEnd (addRelTime now (days 1))
+  -- empty
+  submitMustFail oracleOperator do
+    exerciseCmd policyCid trig with evidenceDigest = ""
+  -- no prefix
+  submitMustFail oracleOperator do
+    exerciseCmd policyCid trig with evidenceDigest = hex64
+  -- wrong prefix
+  submitMustFail oracleOperator do
+    exerciseCmd policyCid trig with evidenceDigest = "sha512:" <> hex64
+  -- uppercase hex
+  submitMustFail oracleOperator do
+    exerciseCmd policyCid trig with evidenceDigest = "sha256:" <> "FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210"
+  -- one character short, and one too many
+  submitMustFail oracleOperator do
+    exerciseCmd policyCid trig with evidenceDigest = "sha256:" <> "edcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+  submitMustFail oracleOperator do
+    exerciseCmd policyCid trig with evidenceDigest = "sha256:" <> hex64 <> "0"
+  -- a non-hex character
+  submitMustFail oracleOperator do
+    exerciseCmd policyCid trig with evidenceDigest = "sha256:" <> "gedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+  -- Well-formed: accepted, and it lands on the payout with the interval.
+  result <- submit oracleOperator do exerciseCmd policyCid trig
+  [leg] <- pure result.payouts
+  Some payout <- queryContractId insurer leg.cid
+  assert (payout.evidenceDigest == testEvidenceDigest)
+  assert (payout.eventStart == now)
+  assert (payout.eventEnd == addRelTime now (days 1))
+
+-- approvedAt, and flaggedAt on a remainder review item, are the
+-- transaction's ledger time; the caller supplies no instant.
+test_approvalInstantIsLedgerTime : Script ()
+test_approvalInstantIsLedgerTime = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  bank <- allocateParty "Bank"
+  let t0 = time (date 2026 Mar 1) 12 0 0
+  setTime t0
+  -- A charged coverage whose claim is below the payout, so one trigger
+  -- creates both a PayoutApproved and a ManualReviewRequired.
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None (Some bank) [chargedCoverage 10000.0]
+  let t1 = time (date 2026 Mar 5) 8 30 0
+  setTime t1
+  ledgerNow <- getTime
+  assert (ledgerNow == t1)
+  result <- submit oracleOperator do
+    exerciseCmd policyCid (frostTrigger policyCid (-2.0) t0 (addRelTime t0 (days 1)))
+  [leg] <- pure result.payouts
+  Some payout <- queryContractId insurer leg.cid
+  assert (payout.approvedAt == t1)
+  Some remainder <- pure result.unroutedRemainder
+  Some review <- queryContractId insurer remainder.reviewCid
+  assert (review.flaggedAt == t1)
+
+-- Under PB_SumInsured the tier percentage is of the sum insured, so a
+-- second event in the same tier pays the same as the first; the remaining
+-- limit still caps it.
+test_sumInsuredBasisSecondEventAndCap : Script ()
+test_sumInsuredBasisSecondEventAndCap = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None
+    [frostCoverage with payoutBasis = PB_SumInsured]
+  now <- getTime
+  let ev = addRelTime now (days 1)
+  reachEventEnd ev
+
+  first <- submit oracleOperator do exerciseCmd policyCid (frostTrigger policyCid (-2.0) now ev)
+  assert (first.trigger.payoutAmount == 25000.0)
+  Some cid2 <- pure first.newPolicyCid
+  second <- submit oracleOperator do exerciseCmd cid2 (frostTrigger cid2 (-2.0) now ev)
+  -- 25% of the 100000 sum insured, not of the 75000 left.
+  assert (second.trigger.payoutAmount == 25000.0)
+  assert (second.trigger.payoutPct == 25.0)
+  Some cid3 <- pure second.newPolicyCid
+  Some tok3 <- queryContractId insurer cid3
+  let Some cov3 = find (\c -> c.coverageCode == "FROST") tok3.coverages
+  assert (cov3.remainingLimit == 50000.0)
+
+  -- 100% of the sum insured is 100000; the remaining 50000 caps it.
+  third <- submit oracleOperator do exerciseCmd cid3 (frostTrigger cid3 (-5.0) now ev)
+  assert (third.trigger.payoutAmount == 50000.0)
+  assert third.trigger.isFullSettlement
+  assert (isNone third.newPolicyCid)
+
+-- PB_RemainingLimit keeps today's behaviour -- the second event pays
+-- the percentage of what the first left.
+test_remainingLimitBasisSecondEvent : Script ()
+test_remainingLimitBasisSecondEvent = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None
+    [frostCoverage with payoutBasis = PB_RemainingLimit]
+  now <- getTime
+  let ev = addRelTime now (days 1)
+  reachEventEnd ev
+  first <- submit oracleOperator do exerciseCmd policyCid (frostTrigger policyCid (-2.0) now ev)
+  assert (first.trigger.payoutAmount == 25000.0)
+  Some cid2 <- pure first.newPolicyCid
+  second <- submit oracleOperator do exerciseCmd cid2 (frostTrigger cid2 (-2.0) now ev)
+  assert (second.trigger.payoutAmount == 18750.0)
+
+-- Test fixture for linear tiers. The bounds and end percentages are TEST values chosen to
+-- make the arithmetic legible; they are not a product proposal.
+linearTier : PayoutTier
+linearTier = PayoutTier with
+  tierOrder = 1
+  label = "Linear frost (-10C to -2C)"
+  minValue = Some (-10.0)
+  maxValue = Some (-2.0)
+  payoutPct = 100.0
+  shape = TS_Linear
+  pctAtMin = Some 100.0
+  pctAtMax = Some 20.0
+
+linearCoverage : Coverage
+linearCoverage = frostCoverage with payoutTiers = [linearTier]
+
+-- A linear tier interpolates between its two end percentages across its
+-- two bounds; the floor to 2 dp and the remaining-limit cap are the step
+-- tier's.
+test_linearTierInterpolates : Script ()
+test_linearTierInterpolates = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  -- v22: each token's cover starts at the ledger clock when it is minted,
+  -- and its event must have ended on that clock before it is evaluated.
+  let payOn obs = do
+        cid <- mintTestPolicy insurer policyholder insured oracleOperator None None [linearCoverage]
+        now <- getTime
+        let ev = addRelTime now (days 1)
+        reachEventEnd ev
+        submit oracleOperator do exerciseCmd cid (frostTrigger cid obs now ev)
+
+  -- at the upper bound: pctAtMax
+  atMax <- payOn (-2.0)
+  assert (atMax.trigger.payoutPct == 20.0)
+  assert (atMax.trigger.payoutAmount == 20000.0)
+  -- in the middle: 100 + (-6 - -10) * (20 - 100) / 8 = 60
+  mid <- payOn (-6.0)
+  assert (mid.trigger.payoutPct == 60.0)
+  assert (mid.trigger.payoutAmount == 60000.0)
+  -- at the lower bound: pctAtMin, which closes the policy
+  atMin <- payOn (-10.0)
+  assert (atMin.trigger.payoutPct == 100.0)
+  assert (atMin.trigger.payoutAmount == 100000.0)
+  assert atMin.trigger.isFullSettlement
+  -- outside the bounds: no match
+  outside <- payOn (-1.0)
+  assert (not outside.trigger.matched)
+
+  -- floorTo2dp on an interpolated percentage: 100 + (-2.000003 - -10) * -10
+  -- = 20.00003 %, of 100000 = 20000.03
+  odd <- payOn (-2.000003)
+  assert (odd.trigger.payoutAmount == 20000.03)
+
+-- The basis applies to the interpolated percentage.
+test_linearTierWithSumInsuredBasis : Script ()
+test_linearTierWithSumInsuredBasis = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None
+    [linearCoverage with payoutBasis = PB_SumInsured]
+  now <- getTime
+  let ev = addRelTime now (days 1)
+  reachEventEnd ev
+  first <- submit oracleOperator do exerciseCmd policyCid (frostTrigger policyCid (-6.0) now ev)
+  assert (first.trigger.payoutAmount == 60000.0)
+  Some cid2 <- pure first.newPolicyCid
+  -- 60% of the 100000 sum insured is 60000; 40000 is left and caps it.
+  second <- submit oracleOperator do exerciseCmd cid2 (frostTrigger cid2 (-6.0) now ev)
+  assert (second.trigger.payoutAmount == 40000.0)
+  assert (isNone second.newPolicyCid)
+
+-- A linear tier needs both bounds and both end percentages, the end
+-- percentages inside [0, 100], and a step tier carries no end percentages.
+test_linearTierShapeIsEnforcedAtMint : Script ()
+test_linearTierShapeIsEnforcedAtMint = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  Some tok <- queryContractId insurer policyCid
+  let mintWith tier n = createCmd tok with
+        policyNo = "V22-TIER-" <> n
+        coverages = [frostCoverage with payoutTiers = [tier]]
+
+  -- an open bound on either side
+  submitMustFail insurer do mintWith (linearTier with minValue = None) "1"
+  submitMustFail insurer do mintWith (linearTier with maxValue = None) "2"
+  -- inverted or equal bounds
+  submitMustFail insurer do mintWith (linearTier with minValue = Some (-2.0), maxValue = Some (-10.0)) "3"
+  submitMustFail insurer do mintWith (linearTier with minValue = Some (-2.0), maxValue = Some (-2.0)) "4"
+  -- a missing end percentage
+  submitMustFail insurer do mintWith (linearTier with pctAtMin = None) "5"
+  submitMustFail insurer do mintWith (linearTier with pctAtMax = None) "6"
+  -- an end percentage outside [0, 100]
+  submitMustFail insurer do mintWith (linearTier with pctAtMin = Some 100.01) "7"
+  submitMustFail insurer do mintWith (linearTier with pctAtMax = Some (-0.01)) "8"
+  -- a step tier carrying end percentages
+  let [step, _] = frostTiers
+  submitMustFail insurer do mintWith (step with pctAtMin = Some 10.0) "9"
+  submitMustFail insurer do mintWith (step with pctAtMax = Some 10.0) "10"
+
+  -- controls: the linear fixture and its edges at 0 and 100 are accepted
+  _ <- submit insurer do mintWith linearTier "11"
+  _ <- submit insurer do mintWith (linearTier with pctAtMin = Some 0.0, pctAtMax = Some 100.0) "12"
+  pure ()
+
+-- oracleOperator /= insurer, on both templates, on the ledger itself.
+test_oracleOperatorMustDifferFromInsurer : Script ()
+test_oracleOperatorMustDifferFromInsurer = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  now <- getTime
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  Some tok <- queryContractId insurer policyCid
+  submitMustFail insurer do
+    createCmd tok with
+      policyNo = "V22-SAME-PARTY"
+      oracleOperator = insurer
+  -- control: the same token with distinct parties mints
+  _ <- submit insurer do createCmd tok with policyNo = "V22-DISTINCT"
+
+  let payout = PayoutApproved with
+        insurer
+        policyholder
+        oracleOperator = insurer
+        policyId = "V22-SAME-PARTY"
+        coverageCode = "FROST"
+        sourcePolicyContractId = "n/a"
+        amount = 1000.0
+        recipient = PDR_Insured
+        mortgagee = None
+        currency = "TRY"
+        payoutPercentage = 25.0
+        tierLabel = "t"
+        isFullSettlement = False
+        payoutDestination = [PDR_Insured]
+        approvedAt = now
+        eventStart = now
+        eventEnd = addRelTime now (days 1)
+        evidenceDigest = testEvidenceDigest
+  -- One signatory suffices when the two are equal, which is exactly why the
+  -- ensure is needed on PayoutApproved as well.
+  submitMustFail insurer do createCmd payout
+  -- control: with a distinct oracle party (both signing) it is created
+  _ <- submit (actAs [insurer, oracleOperator]) do createCmd payout with oracleOperator
+  pure ()
+
+-- ---------------------------------------------------------------------------
+-- v22: settlement and closure records, ledger time for failures and
+-- archives, the refusals that go with them
+-- ---------------------------------------------------------------------------
+
+-- A stand-in in the "sha256:" form the records check, for the salted digest
+-- of a bank reference or a closing note. Its content means nothing.
+testTextDigest : Text
+testTextDigest = "sha256:" <> "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+
+-- EvaluateTrigger refuses an event that has not ended on the ledger clock.
+-- Moves the clock forward to `t` when it is behind it; never backwards.
+reachEventEnd : Time -> Script ()
+reachEventEnd t = do
+  now <- getTime
+  if now < t then setTime t else pure ()
+
+-- ConfirmSettlement leaves a PayoutSettled behind and returns it; the
+-- record carries the payout's facts, the insurer's declared instant, the
+-- digest and the ledger time, and is seen by the payout's observers only.
+test_confirmSettlementLeavesARecord : Script ()
+test_confirmSettlementLeavesARecord = script do
+  (insurer, policyholder, _, oracleOperator, payoutCid) <- approvedPayout
+  Some payout <- queryContractId insurer payoutCid
+  let declared = time (date 2026 Feb 1) 9 0 0
+      t1 = time (date 2026 Feb 3) 10 0 0
+  setTime t1
+  recordCid <- submit insurer do
+    exerciseCmd payoutCid PayoutApproved_ConfirmSettlement with
+      bankReference = testTextDigest
+      settledAt = declared
+      paidRole = PDR_Insured
+  Some record <- queryContractId insurer recordCid
+  assert (record.insurer == insurer)
+  assert (record.policyholder == policyholder)
+  assert (record.oracleOperator == oracleOperator)
+  assert (isNone record.mortgagee)
+  assert (record.policyId == payout.policyId)
+  assert (record.coverageCode == "FROST")
+  assert (record.sourcePayoutContractId == Some payoutCid)
+  assert (record.amount == payout.amount)
+  assert (record.currency == payout.currency)
+  assert (record.recipient == PDR_Insured)
+  assert (record.eventStart == payout.eventStart)
+  assert (record.eventEnd == payout.eventEnd)
+  assert (record.evidenceDigest == payout.evidenceDigest)
+  assert (record.settledAt == declared)
+  assert (record.bankReferenceDigest == testTextDigest)
+  assert (record.recordedAt == t1)
+  -- The payout's observers see it; the oracle party, a plain field here,
+  -- does not.
+  Some _ <- queryContractId policyholder recordCid
+  notSeen <- queryContractId oracleOperator recordCid
+  assert (isNone notSeen)
+
+-- On a mortgagee leg the bank, an observer of its payout, observes the
+-- settlement record too.
+test_mortgageeLegSettlementRecordIsSeenByTheBank : Script ()
+test_mortgageeLegSettlementRecordIsSeenByTheBank = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  bank <- allocateParty "Bank"
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None (Some bank)
+    [chargedCoverage 40000.0]
+  result <- mildTrigger oracleOperator policyCid "settle-record"
+  [leg] <- pure result.payouts
+  now <- getTime
+  recordCid <- submit insurer do
+    exerciseCmd leg.cid PayoutApproved_ConfirmSettlement with
+      bankReference = testTextDigest
+      settledAt = now
+      paidRole = PDR_Mortgagee
+  Some seenByBank <- queryContractId bank recordCid
+  assert (seenByBank.mortgagee == Some bank)
+  assert (seenByBank.recipient == PDR_Mortgagee)
+  Some _ <- queryContractId policyholder recordCid
+  pure ()
+
+-- The bank reference reaches the record only as a salted
+-- digest; plain text is refused, and the existing refusals still hold.
+test_settlementRecordTakesADigestOnly : Script ()
+test_settlementRecordTakesADigestOnly = script do
+  (insurer, _, _, _, payoutCid) <- approvedPayout
+  now <- getTime
+  submitMustFail insurer do
+    exerciseCmd payoutCid PayoutApproved_ConfirmSettlement with
+      bankReference = "TR12 0006 1005 1978 6457 8413 26"
+      settledAt = now
+      paidRole = PDR_Insured
+  submitMustFail insurer do
+    exerciseCmd payoutCid PayoutApproved_ConfirmSettlement with
+      bankReference = "sha256:" <> "00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF"
+      settledAt = now
+      paidRole = PDR_Insured
+  _ <- submit insurer do
+    exerciseCmd payoutCid PayoutApproved_ConfirmSettlement with
+      bankReference = testTextDigest
+      settledAt = now
+      paidRole = PDR_Insured
+  pure ()
+
+-- Exit 1 of a review item that came from a failed payout leaves a
+-- PayoutSettled carrying the source payout's facts.
+test_resolveSettledLeavesARecord : Script ()
+test_resolveSettledLeavesARecord = script do
+  (insurer, policyholder, _, oracleOperator, payoutCid) <- approvedPayout
+  Some payout <- queryContractId insurer payoutCid
+  reviewCid <- submit insurer do
+    exerciseCmd payoutCid PayoutApproved_MarkFailed with
+      failureReason = testTextDigest
+      sourcePayoutContractId = "cid-placeholder"
+  let declared = time (date 2026 Apr 1) 9 0 0
+      t1 = time (date 2026 Apr 2) 9 0 0
+  setTime t1
+  -- the bank reference reaches the record only as a digest here too
+  submitMustFail insurer do
+    exerciseCmd reviewCid ManualReviewRequired_ResolveSettled with
+      bankReference = "BANK-REF-LATE"
+      settledAt = declared
+      paidRole = PDR_Insured
+  recordCid <- submit insurer do
+    exerciseCmd reviewCid ManualReviewRequired_ResolveSettled with
+      bankReference = testTextDigest
+      settledAt = declared
+      paidRole = PDR_Insured
+  Some record <- queryContractId insurer recordCid
+  assert (record.sourcePayoutContractId == Some payoutCid)
+  assert (record.oracleOperator == oracleOperator)
+  assert (record.amount == payout.amount)
+  assert (record.recipient == PDR_Insured)
+  assert (record.eventStart == payout.eventStart)
+  assert (record.eventEnd == payout.eventEnd)
+  assert (record.evidenceDigest == payout.evidenceDigest)
+  assert (record.settledAt == declared)
+  assert (record.recordedAt == t1)
+  Some _ <- queryContractId policyholder recordCid
+  gone <- queryContractId insurer reviewCid
+  assert (isNone gone)
+
+-- Exit 2 leaves a PayoutClosedUnpaid with the reason code, the note's
+-- digest, the insurer's declared closing instant and the ledger time.
+test_resolveUnpaidLeavesARecord : Script ()
+test_resolveUnpaidLeavesARecord = script do
+  (insurer, policyholder, _, oracleOperator, payoutCid) <- approvedPayout
+  Some payout <- queryContractId insurer payoutCid
+  reviewCid <- submit insurer do
+    exerciseCmd payoutCid PayoutApproved_MarkFailed with
+      failureReason = testTextDigest
+      sourcePayoutContractId = "cid-placeholder"
+  let declared = time (date 2026 May 1) 9 0 0
+      t1 = time (date 2026 May 2) 9 0 0
+  setTime t1
+  -- the note reaches the record only as a digest
+  submitMustFail insurer do
+    exerciseCmd reviewCid ManualReviewRequired_ResolveUnpaid with
+      unpaidReason = UR_Litigation
+      note = "referred to arbitration, file 2026/114"
+      closedAt = declared
+  recordCid <- submit insurer do
+    exerciseCmd reviewCid ManualReviewRequired_ResolveUnpaid with
+      unpaidReason = UR_Litigation
+      note = testTextDigest
+      closedAt = declared
+  Some record <- queryContractId insurer recordCid
+  assert (record.sourcePayoutContractId == Some payoutCid)
+  assert (record.oracleOperator == oracleOperator)
+  assert (record.amount == payout.amount)
+  assert (record.recipient == Some PDR_Insured)
+  assert (record.unpaidReason == UR_Litigation)
+  assert (record.noteDigest == testTextDigest)
+  assert (record.eventStart == payout.eventStart)
+  assert (record.eventEnd == payout.eventEnd)
+  assert (record.evidenceDigest == payout.evidenceDigest)
+  assert (record.closedAt == declared)
+  assert (record.recordedAt == t1)
+  Some _ <- queryContractId policyholder recordCid
+  notSeen <- queryContractId oracleOperator recordCid
+  assert (isNone notSeen)
+
+-- A review item that never came from a payout -- the m. 1456(2) surplus --
+-- closes with a record that says so: no source payout, no recipient.
+test_remainderReviewItemClosesWithARecord : Script ()
+test_remainderReviewItemClosesWithARecord = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  bank <- allocateParty "Bank"
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None (Some bank)
+    [chargedCoverage 10000.0]
+  result <- mildTrigger oracleOperator policyCid "surplus-record"
+  Some remainder <- pure result.unroutedRemainder
+  Some review <- queryContractId insurer remainder.reviewCid
+  now <- getTime
+  recordCid <- submit insurer do
+    exerciseCmd remainder.reviewCid ManualReviewRequired_ResolveUnpaid with
+      unpaidReason = UR_Other
+      note = testTextDigest
+      closedAt = now
+  Some record <- queryContractId insurer recordCid
+  assert (isNone record.sourcePayoutContractId)
+  assert (isNone record.recipient)
+  assert (isNone record.mortgagee)
+  assert (record.amount == 15000.0)
+  assert (record.eventStart == review.eventStart)
+  assert (record.evidenceDigest == testEvidenceDigest)
+  -- The bank observes neither the review item nor its closing record.
+  notSeen <- queryContractId bank recordCid
+  assert (isNone notSeen)
+
+-- Only the insurer can create either record, the two parties must
+-- differ, and the digest must be well formed. The only choice either record
+-- has is the implicit Archive, which its signatory alone can exercise.
+test_recordTemplatesAuthorityAndEnsure : Script ()
+test_recordTemplatesAuthorityAndEnsure = script do
+  (insurer, policyholder, _, oracleOperator) <- setupParties
+  now <- getTime
+  let settled = PayoutSettled with
+        insurer
+        policyholder
+        mortgagee = None
+        oracleOperator
+        policyId = "V22-RECORD"
+        coverageCode = "FROST"
+        sourcePayoutContractId = None
+        amount = 1000.0
+        currency = "TRY"
+        recipient = PDR_Insured
+        eventStart = now
+        eventEnd = addRelTime now (days 1)
+        evidenceDigest = testEvidenceDigest
+        settledAt = now
+        bankReferenceDigest = testTextDigest
+        recordedAt = now
+      closed = PayoutClosedUnpaid with
+        insurer
+        policyholder
+        mortgagee = None
+        oracleOperator
+        policyId = "V22-RECORD"
+        coverageCode = "FROST"
+        sourcePayoutContractId = None
+        amount = 1000.0
+        currency = "TRY"
+        recipient = Some PDR_Insured
+        eventStart = now
+        eventEnd = addRelTime now (days 1)
+        evidenceDigest = testEvidenceDigest
+        unpaidReason = UR_Other
+        noteDigest = testTextDigest
+        closedAt = now
+        recordedAt = now
+
+  -- nobody but the insurer
+  submitMustFail policyholder do createCmd settled
+  submitMustFail oracleOperator do createCmd settled
+  submitMustFail policyholder do createCmd closed
+  submitMustFail oracleOperator do createCmd closed
+  -- the oracle party equal to the insurer
+  submitMustFail insurer do createCmd settled with oracleOperator = insurer
+  submitMustFail insurer do createCmd closed with oracleOperator = insurer
+  -- a digest that is not one
+  submitMustFail insurer do createCmd settled with bankReferenceDigest = "BANK-REF-1"
+  submitMustFail insurer do createCmd closed with noteDigest = "a note"
+
+  -- controls, and Archive: the policyholder cannot, the insurer can
+  settledCid <- submit insurer do createCmd settled
+  closedCid <- submit insurer do createCmd closed
+  submitMustFail policyholder do archiveCmd settledCid
+  submitMustFail policyholder do archiveCmd closedCid
+  submit insurer do archiveCmd settledCid
+  submit insurer do archiveCmd closedCid
+
+-- MarkFailed's flaggedAt is the ledger time; the caller supplies none.
+test_markFailedFlaggedAtIsLedgerTime : Script ()
+test_markFailedFlaggedAtIsLedgerTime = script do
+  (insurer, _, _, oracleOperator, payoutCid) <- approvedPayout
+  Some payout <- queryContractId insurer payoutCid
+  let t1 = time (date 2026 Jun 7) 14 15 0
+  setTime t1
+  reviewCid <- submit insurer do
+    exerciseCmd payoutCid PayoutApproved_MarkFailed with
+      failureReason = testTextDigest
+      sourcePayoutContractId = "cid-placeholder"
+  Some review <- queryContractId insurer reviewCid
+  assert (review.flaggedAt == t1)
+  -- and the facts a closing record will need travel with the item
+  assert (review.oracleOperator == oracleOperator)
+  assert (review.recipient == Some PDR_Insured)
+  assert (review.sourcePayoutCid == Some payoutCid)
+  assert (review.eventStart == payout.eventStart)
+  assert (review.evidenceDigest == payout.evidenceDigest)
+
+-- An expiry archive is refused before the token's expiry, passes at or
+-- after it, and returns two instants: the contract's end (the expiry) and
+-- the record's closing (the ledger time).
+test_archiveForExpiryWaitsForExpiryAndReturnsTwoInstants : Script ()
+test_archiveForExpiryWaitsForExpiryAndReturnsTwoInstants = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  Some tok <- queryContractId insurer policyCid
+  setTime (addRelTime tok.expiry (hours (-1)))
+  submitMustFail insurer do
+    exerciseCmd policyCid PolicyToken_ArchiveForExpiry with reason = "policy term expired"
+  let closing = addRelTime tok.expiry (days 3)
+  setTime closing
+  instants <- submit insurer do
+    exerciseCmd policyCid PolicyToken_ArchiveForExpiry with reason = "policy term expired"
+  assert (instants.contractEndedAt == tok.expiry)
+  assert (instants.recordClosedAt == closing)
+  gone <- queryContractId insurer policyCid
+  assert (isNone gone)
+
+-- Exactly at the expiry instant the archive passes.
+test_archiveForExpiryAtTheExpiryInstant : Script ()
+test_archiveForExpiryAtTheExpiryInstant = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  Some tok <- queryContractId insurer policyCid
+  setTime tok.expiry
+  instants <- submit insurer do
+    exerciseCmd policyCid PolicyToken_ArchiveForExpiry with reason = "policy term expired"
+  assert (instants.contractEndedAt == tok.expiry)
+  assert (instants.recordClosedAt == tok.expiry)
+
+-- A non-payment archive under m. 1434(3) is refused before the
+-- termination instant, and its contract end is that instant.
+test_archiveForNonPaymentWaitsForTheTerminationInstant : Script ()
+test_archiveForNonPaymentWaitsForTheTerminationInstant = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  now <- getTime
+  let termInstant = time (date 2026 Sep 15) 12 0 0
+  inNoticeCid <- submit insurer do
+    exerciseCmd policyCid PolicyToken_ServeNotice with
+      noticeServiceDate = now
+      noticeRecordedAt = now
+  terminatedCid <- submit insurer do
+    exerciseCmd inNoticeCid PolicyToken_Terminate with
+      terminationInstant = termInstant
+      unrunDays = 107
+      mortgageeContinuationEndsAt = None
+  setTime (addRelTime termInstant (hours (-1)))
+  submitMustFail insurer do
+    exerciseCmd terminatedCid PolicyToken_ArchiveForNonPayment with
+      reason = "premium not paid"
+  let closing = addRelTime termInstant (days 2)
+  setTime closing
+  instants <- submit insurer do
+    exerciseCmd terminatedCid PolicyToken_ArchiveForNonPayment with
+      reason = "premium not paid"
+  assert (instants.contractEndedAt == termInstant)
+  assert (instants.recordClosedAt == closing)
+
+-- Under m. 1434(4) the contract end is twoNoticeEffectiveAt. The
+-- termination lands on its own frozen instant, so a token can be
+-- DS_TwoNoticeTerminated while the ledger clock is still before it; the
+-- archive is refused until the clock reaches it.
+test_archiveForNonPaymentWaitsForTheTwoNoticeEnd : Script ()
+test_archiveForNonPaymentWaitsForTheTwoNoticeEnd = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  now <- getTime
+  let periodEnd = addRelTime now (days 30)
+  oneCid <- noticeThenPay insurer policyCid (addRelTime now (days (-50)))
+  twoCid <- noticeThenPay insurer oneCid (addRelTime now (days (-20)))
+  electedCid <- submit insurer do
+    exerciseCmd twoCid PolicyToken_ElectTwoNoticeTermination with
+      electedAt = now
+      insurancePeriodStart = addRelTime now (days (-60))
+      insurancePeriodEnd = periodEnd
+  landedCid <- submit insurer do
+    exerciseCmd electedCid PolicyToken_ApplyTwoNoticeTermination with
+      appliedAt = addRelTime now (days 40)
+  Some landed <- queryContractId insurer landedCid
+  assert (landed.defaultState == DS_TwoNoticeTerminated)
+  submitMustFail insurer do
+    exerciseCmd landedCid PolicyToken_ArchiveForNonPayment with
+      reason = "m. 1434(4)"
+  setTime periodEnd
+  instants <- submit insurer do
+    exerciseCmd landedCid PolicyToken_ArchiveForNonPayment with
+      reason = "m. 1434(4)"
+  assert (instants.contractEndedAt == periodEnd)
+  assert (instants.recordClosedAt == periodEnd)
+
+-- Amend is refused on a contract that ended under m. 1434(4). This
+-- closes a gap: since v22 the trigger judges a terminated token by
+-- coverageValidThrough, and an Amend with newExpiry would have moved it back
+-- to the new expiry and reopened cover on a contract that has ended.
+test_amendRefusedAfterTwoNoticeTermination : Script ()
+test_amendRefusedAfterTwoNoticeTermination = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  now <- getTime
+  let periodEnd = addRelTime now (days 30)
+  oneCid <- noticeThenPay insurer policyCid (addRelTime now (days (-50)))
+  twoCid <- noticeThenPay insurer oneCid (addRelTime now (days (-20)))
+  electedCid <- submit insurer do
+    exerciseCmd twoCid PolicyToken_ElectTwoNoticeTermination with
+      electedAt = now
+      insurancePeriodStart = addRelTime now (days (-60))
+      insurancePeriodEnd = periodEnd
+  landedCid <- submit insurer do
+    exerciseCmd electedCid PolicyToken_ApplyTwoNoticeTermination with
+      appliedAt = addRelTime now (days 40)
+  Some landed <- queryContractId insurer landedCid
+  assert (landed.coverageValidThrough == periodEnd)
+
+  submitMustFail insurer do
+    exerciseCmd landedCid amendNothing with
+      newExpiry = Some landed.expiry
+  submitMustFail insurer do
+    exerciseCmd landedCid amendNothing
+  -- Cover is not reopened: the token is untouched, and an event after the
+  -- period end is still outside cover.
+  Some still <- queryContractId insurer landedCid
+  assert (still.coverageValidThrough == periodEnd)
+  let afterEnd = addRelTime periodEnd (days 1)
+  reachEventEnd (addRelTime afterEnd (days 1))
+  submitMustFail oracleOperator do
+    exerciseCmd landedCid (frostTrigger landedCid (-2.0) afterEnd (addRelTime afterEnd (days 1)))
+
+-- Amend is refused after a m. 1434(2) withdrawal as well.
+test_amendRefusedAfterFirstPremiumWithdrawal : Script ()
+test_amendRefusedAfterFirstPremiumWithdrawal = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  now <- getTime
+  unpaidCid <- inFirstPremiumDefault insurer policyCid (addRelTime now (days (-30)))
+  -- control: Amend works on the same token before the withdrawal
+  amendedCid <- submit insurer do
+    exerciseCmd unpaidCid amendNothing
+  withdrawnCid <- submit insurer do
+    exerciseCmd amendedCid PolicyToken_WithdrawForFirstPremium with
+      withdrawnAt = now
+      path = WP_InsurerWithdrew
+  submitMustFail insurer do
+    exerciseCmd withdrawnCid amendNothing
+  submitMustFail insurer do
+    exerciseCmd withdrawnCid amendNothing with
+      reason = ER_SumInsuredIncrease
+      sumInsuredChanges = [("FROST", 150000.0)]
+
+-- A first-premium payment dated after the ledger clock is refused; one
+-- dated at it passes.
+test_firstPremiumPaidInTheFutureIsRefused : Script ()
+test_firstPremiumPaidInTheFutureIsRefused = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintWithoutCover insurer policyholder insured oracleOperator
+  let t1 = time (date 2026 Mar 10) 12 0 0
+  setTime t1
+  submitMustFail insurer do
+    exerciseCmd policyCid PolicyToken_RecordFirstPremiumPaid with
+      paidAt = addRelTime t1 (seconds 1)
+  submitMustFail insurer do
+    exerciseCmd policyCid PolicyToken_RecordFirstPremiumPaid with
+      paidAt = addRelTime t1 (days 1)
+  paidCid <- submit insurer do
+    exerciseCmd policyCid PolicyToken_RecordFirstPremiumPaid with
+      paidAt = t1
+  Some paid <- queryContractId insurer paidCid
+  assert (paid.coverageBeganAt == Some t1)
+
+-- Decision (2026-09-23): a linear tier whose computed amount is 0.00 is
+-- no match -- nothing is created and the token is untouched -- whether the
+-- percentage itself is 0 or a small one floors to 0.00.
+test_linearTierZeroAmountIsNoMatch : Script ()
+test_linearTierZeroAmountIsNoMatch = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  let zeroAtMax = linearTier with pctAtMin = Some 100.0, pctAtMax = Some 0.0, payoutPct = 100.0
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None
+    [frostCoverage with payoutTiers = [zeroAtMax]]
+  now <- getTime
+  let ev = addRelTime now (days 1)
+  reachEventEnd ev
+  -- the percentage at the upper bound is exactly 0
+  atZero <- submit oracleOperator do exerciseCmd policyCid (frostTrigger policyCid (-2.0) now ev)
+  assert (not atZero.trigger.matched)
+  assert (atZero.trigger.payoutAmount == 0.0)
+  assert (null atZero.payouts)
+  assert (isNone atZero.newPolicyCid)
+  assert (isNone atZero.unroutedRemainder)
+  -- 100 - 12.5 * 7.9999999 = 0.00000125 %, of 100000 = 0.00125 -> 0.00
+  tiny <- submit oracleOperator do exerciseCmd policyCid (frostTrigger policyCid (-2.0000001) now ev)
+  assert (not tiny.trigger.matched)
+  assert (null tiny.payouts)
+  -- the token is untouched (the trigger is nonconsuming and nothing re-minted)
+  Some tok <- queryContractId insurer policyCid
+  assert (tok.status == PS_Active)
+  assert (tok.version == 1)
+  -- control: inside the tier with a positive amount it pays
+  paid <- submit oracleOperator do exerciseCmd policyCid (frostTrigger policyCid (-6.0) now ev)
+  assert paid.trigger.matched
+  assert (paid.trigger.payoutAmount == 50000.0)
+
+-- A linear tier's payoutPct is the highest rate it can pay,
+-- max pctAtMin pctAtMax, whichever end that is.
+test_linearTierPayoutPctIsTheHigherEnd : Script ()
+test_linearTierPayoutPctIsTheHigherEnd = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  Some tok <- queryContractId insurer policyCid
+  let mintWith tier n = createCmd tok with
+        policyNo = "V22-PCT-" <> n
+        coverages = [frostCoverage with payoutTiers = [tier]]
+  -- linearTier: pctAtMin 100, pctAtMax 20
+  submitMustFail insurer do mintWith (linearTier with payoutPct = 0.0) "1"
+  submitMustFail insurer do mintWith (linearTier with payoutPct = 20.0) "2"
+  submitMustFail insurer do mintWith (linearTier with payoutPct = 99.99) "3"
+  _ <- submit insurer do mintWith (linearTier with payoutPct = 100.0) "4"
+  -- rising the other way: pctAtMin 10, pctAtMax 60
+  let rising = linearTier with pctAtMin = Some 10.0, pctAtMax = Some 60.0
+  submitMustFail insurer do mintWith (rising with payoutPct = 10.0) "5"
+  _ <- submit insurer do mintWith (rising with payoutPct = 60.0) "6"
+  pure ()
+
+-- An event window that has not ended on the ledger clock is not
+-- evaluated; one that ended exactly at it is.
+test_unfinishedEventWindowIsRefused : Script ()
+test_unfinishedEventWindowIsRefused = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
+  Some tok <- queryContractId insurer policyCid
+  Some coverStart <- pure tok.coverageBeganAt
+  let t1 = addRelTime coverStart (days 2)
+  setTime t1
+  submitMustFail oracleOperator do
+    exerciseCmd policyCid (frostTrigger policyCid (-2.0) coverStart (addRelTime t1 (seconds 1)))
+  submitMustFail oracleOperator do
+    exerciseCmd policyCid (frostTrigger policyCid (-2.0) (addRelTime t1 (hours (-1))) (addRelTime t1 (days 1)))
+  result <- submit oracleOperator do
+    exerciseCmd policyCid (frostTrigger policyCid (-2.0) coverStart t1)
+  assert result.trigger.matched
+
+-- Housekeeping: the two m. 1431(4) record choices re-mint at version + 1,
+-- as every other re-mint in the file does.
+test_substitutionFactsIncrementTheVersion : Script ()
+test_substitutionFactsIncrementTheVersion = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintForAnothersAccount insurer policyholder insured oracleOperator
+  now <- getTime
+  fruitlessCid <- submit insurer do
+    exerciseCmd policyCid PolicyToken_RecordEnforcementFruitless with
+      fruitlessAt = addRelTime now (days (-20))
+      route = ER_Takip
+  Some fruitless <- queryContractId insurer fruitlessCid
+  assert (fruitless.version == 2)
+  notifiedCid <- submit insurer do
+    exerciseCmd fruitlessCid PolicyToken_RecordSubstitutionNotice with
+      notifiedAt = addRelTime now (days (-10))
+  Some notified <- queryContractId insurer notifiedCid
+  assert (notified.version == 3)
+
+-- ---------------------------------------------------------------------------
+-- v22: the records keep PayoutApproved's recipient/mortgagee rule,
+-- ResolveSettled checks the role an item carries, a zero after the cap is no
+-- match for every tier shape
+-- ---------------------------------------------------------------------------
+
+-- A mortgagee on a record exactly when its recipient is the mortgagee,
+-- the same rule PayoutApproved's ensure holds, on both record templates.
+test_recordsKeepTheRecipientMortgageeRule : Script ()
+test_recordsKeepTheRecipientMortgageeRule = script do
+  (insurer, policyholder, _, oracleOperator) <- setupParties
+  bank <- allocateParty "Bank"
+  now <- getTime
+  let settled = PayoutSettled with
+        insurer
+        policyholder
+        mortgagee = None
+        oracleOperator
+        policyId = "V22-V2B-RECORD"
+        coverageCode = "FROST"
+        sourcePayoutContractId = None
+        amount = 1000.0
+        currency = "TRY"
+        recipient = PDR_Insured
+        eventStart = now
+        eventEnd = addRelTime now (days 1)
+        evidenceDigest = testEvidenceDigest
+        settledAt = now
+        bankReferenceDigest = testTextDigest
+        recordedAt = now
+      closed = PayoutClosedUnpaid with
+        insurer
+        policyholder
+        mortgagee = None
+        oracleOperator
+        policyId = "V22-V2B-RECORD"
+        coverageCode = "FROST"
+        sourcePayoutContractId = None
+        amount = 1000.0
+        currency = "TRY"
+        recipient = Some PDR_Insured
+        eventStart = now
+        eventEnd = addRelTime now (days 1)
+        evidenceDigest = testEvidenceDigest
+        unpaidReason = UR_Other
+        noteDigest = testTextDigest
+        closedAt = now
+        recordedAt = now
+
+  -- a mortgagee recipient with no mortgagee party
+  submitMustFail insurer do createCmd settled with recipient = PDR_Mortgagee
+  submitMustFail insurer do createCmd closed with recipient = Some PDR_Mortgagee
+  -- a mortgagee party on a leg that is not the mortgagee's
+  submitMustFail insurer do createCmd settled with mortgagee = Some bank
+  submitMustFail insurer do createCmd closed with mortgagee = Some bank
+  -- and on an unrouted amount, which has no recipient at all
+  submitMustFail insurer do createCmd closed with recipient = None, mortgagee = Some bank
+
+  -- controls: the consistent combinations are created
+  _ <- submit insurer do createCmd settled
+  _ <- submit insurer do createCmd settled with recipient = PDR_Mortgagee, mortgagee = Some bank
+  _ <- submit insurer do createCmd closed
+  _ <- submit insurer do createCmd closed with recipient = Some PDR_Mortgagee, mortgagee = Some bank
+  _ <- submit insurer do createCmd closed with recipient = None
+  pure ()
+
+-- An item MarkFailed raised carries its payout's recipient, and
+-- ResolveSettled refuses a paidRole other than that one.
+test_resolveSettledChecksTheRoleItCarries : Script ()
+test_resolveSettledChecksTheRoleItCarries = script do
+  (insurer, _, _, _, payoutCid) <- approvedPayout
+  reviewCid <- submit insurer do
+    exerciseCmd payoutCid PayoutApproved_MarkFailed with
+      failureReason = testTextDigest
+      sourcePayoutContractId = "cid-placeholder"
+  now <- getTime
+  submitMustFail insurer do
+    exerciseCmd reviewCid ManualReviewRequired_ResolveSettled with
+      bankReference = testTextDigest
+      settledAt = now
+      paidRole = PDR_Beneficiary
+  submitMustFail insurer do
+    exerciseCmd reviewCid ManualReviewRequired_ResolveSettled with
+      bankReference = testTextDigest
+      settledAt = now
+      paidRole = PDR_EnforcementOffice
+  recordCid <- submit insurer do
+    exerciseCmd reviewCid ManualReviewRequired_ResolveSettled with
+      bankReference = testTextDigest
+      settledAt = now
+      paidRole = PDR_Insured
+  Some record <- queryContractId insurer recordCid
+  assert (record.recipient == PDR_Insured)
+
+-- The same on a mortgagee leg: the insured is refused, the mortgagee
+-- passes and the bank sees the record.
+test_resolveSettledChecksTheMortgageeRoleItCarries : Script ()
+test_resolveSettledChecksTheMortgageeRoleItCarries = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  bank <- allocateParty "Bank"
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None (Some bank)
+    [chargedCoverage 40000.0]
+  result <- mildTrigger oracleOperator policyCid "v2b-mortgagee-review"
+  [leg] <- pure result.payouts
+  reviewCid <- submit insurer do
+    exerciseCmd leg.cid PayoutApproved_MarkFailed with
+      failureReason = testTextDigest
+      sourcePayoutContractId = "cid-placeholder"
+  now <- getTime
+  submitMustFail insurer do
+    exerciseCmd reviewCid ManualReviewRequired_ResolveSettled with
+      bankReference = testTextDigest
+      settledAt = now
+      paidRole = PDR_Insured
+  recordCid <- submit insurer do
+    exerciseCmd reviewCid ManualReviewRequired_ResolveSettled with
+      bankReference = testTextDigest
+      settledAt = now
+      paidRole = PDR_Mortgagee
+  Some seenByBank <- queryContractId bank recordCid
+  assert (seenByBank.recipient == PDR_Mortgagee)
+  assert (seenByBank.mortgagee == Some bank)
+
+-- An item the trigger raised for an unrouted amount carries no
+-- recipient, and ResolveSettled records the reported role unchecked, as
+-- before -- the record's own ensure still holds it to the
+-- recipient/mortgagee rule. Such an item carries the policy's
+-- mortgagee party, so the mortgagee role is accepted again.
+test_resolveSettledOnAnUnroutedItemIsNotRoleChecked : Script ()
+test_resolveSettledOnAnUnroutedItemIsNotRoleChecked = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  bank <- allocateParty "Bank"
+  let resolveAs role = do
+        policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None (Some bank)
+          [chargedCoverage 10000.0]
+        result <- mildTrigger oracleOperator policyCid "v2b-unrouted"
+        Some remainder <- pure result.unroutedRemainder
+        now <- getTime
+        pure (remainder.reviewCid, ManualReviewRequired_ResolveSettled with
+                bankReference = testTextDigest
+                settledAt = now
+                paidRole = role)
+  -- neither role is checked against anything on the item
+  (cid1, arg1) <- resolveAs PDR_Insured
+  r1 <- submit insurer do exerciseCmd cid1 arg1
+  Some rec1 <- queryContractId insurer r1
+  assert (rec1.recipient == PDR_Insured)
+  (cid2, arg2) <- resolveAs PDR_EnforcementOffice
+  r2 <- submit insurer do exerciseCmd cid2 arg2
+  Some rec2 <- queryContractId insurer r2
+  assert (rec2.recipient == PDR_EnforcementOffice)
+  -- The mortgagee role now leaves a mortgagee record with the bank on it
+  (cid3, arg3) <- resolveAs PDR_Mortgagee
+  r3 <- submit insurer do exerciseCmd cid3 arg3
+  Some rec3 <- queryContractId insurer r3
+  assert (rec3.recipient == PDR_Mortgagee)
+  assert (rec3.mortgagee == Some bank)
+
+-- Fixture: FROST plus a second coverage, so FROST can be exhausted while
+-- the policy stays open.
+secondCoverage : Coverage
+secondCoverage = frostCoverage with coverageCode = "FROST-2"
+
+-- FROST (with the given tiers and basis) is exhausted by `severe`, then
+-- `inTier`, a value its tiers match, is evaluated: no match, nothing created,
+-- the token untouched. Under PB_SumInsured the cap is what makes the amount
+-- 0.00; under PB_RemainingLimit the basis is already 0.
+exhaustedThenMatch : [PayoutTier] -> PayoutBasis -> Decimal -> Decimal -> Script ()
+exhaustedThenMatch tiers basis severe inTier = do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None
+    [(frostCoverage with payoutTiers = tiers, payoutBasis = basis), secondCoverage]
+  now <- getTime
+  let ev = addRelTime now (days 1)
+  reachEventEnd ev
+  -- 100% of FROST exhausts it; FROST-2 keeps the policy open
+  first <- submit oracleOperator do exerciseCmd policyCid (frostTrigger policyCid severe now ev)
+  Some cid2 <- pure first.newPolicyCid
+  Some before <- queryContractId insurer cid2
+  let Some exhausted = find (\c -> c.coverageCode == "FROST") before.coverages
+  assert (exhausted.remainingLimit == 0.0)
+
+  second <- submit oracleOperator do exerciseCmd cid2 (frostTrigger cid2 inTier now ev)
+  assert (not second.trigger.matched)
+  assert (second.trigger.payoutAmount == 0.0)
+  assert (null second.payouts)
+  assert (isNone second.newPolicyCid)
+  assert (isNone second.unroutedRemainder)
+  Some after <- queryContractId insurer cid2
+  assert (after == before)
+
+-- A step tier on an exhausted coverage. Before this rule the matched value
+-- reached PayoutApproved's `amount > 0.0` ensure and the trigger failed.
+test_exhaustedCoverageStepTierIsNoMatch : Script ()
+test_exhaustedCoverageStepTierIsNoMatch = script do
+  -- severe frost 100%, then the 25% mild tier
+  exhaustedThenMatch frostTiers PB_SumInsured (-5.0) (-1.0)
+  exhaustedThenMatch frostTiers PB_RemainingLimit (-5.0) (-1.0)
+
+-- The same on a linear tier.
+test_exhaustedCoverageLinearTierIsNoMatch : Script ()
+test_exhaustedCoverageLinearTierIsNoMatch = script do
+  -- pctAtMin 100% at the lower bound, then 60% in the middle
+  exhaustedThenMatch [linearTier] PB_SumInsured (-10.0) (-6.0)
+  exhaustedThenMatch [linearTier] PB_RemainingLimit (-10.0) (-6.0)
+
+-- ---------------------------------------------------------------------------
+-- v22: an unrouted review item on a charged coverage carries the
+-- policy's mortgagee party without showing the item to it, so a human can
+-- settle it to the mortgagee
+-- ---------------------------------------------------------------------------
+
+-- Fixture: a fresh charged policy with `bank` as its mortgagee, and the
+-- review item the trigger raised on it -- the competing-claims kind (charge
+-- plus attachment) or the surplus kind (charge only).
+unroutedChargedItem
+  : Party -> Party -> Party -> Party -> Party -> Bool -> Text
+  -> Script (ContractId ManualReviewRequired)
+unroutedChargedItem insurer policyholder insured oracleOperator bank competing ref = do
+  now <- getTime
+  result <- if competing then do
+      policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None (Some bank)
+        [chargedCoverageFor 40000.0]
+      attachedCid <- submit insurer do
+        exerciseCmd policyCid PolicyToken_RecordAttachment with
+          coverageCode = "FROST"
+          attachedAt = addRelTime now (days (-5))
+      attachTrigger oracleOperator attachedCid ref
+    else do
+      policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None (Some bank)
+        [chargedCoverage 10000.0]
+      mildTrigger oracleOperator policyCid ref
+  Some remainder <- pure result.unroutedRemainder
+  assert (remainder.reason == (if competing then UNR_CompetingClaims else UNR_MortgageeSurplus))
+  pure remainder.reviewCid
+
+-- On either kind of item the item carries the bank but the bank does
+-- not see it; settled to the mortgagee, the bank sees the record; settled to
+-- the insured, as before, and the bank sees nothing; closed unpaid, as
+-- before, and the bank sees nothing.
+unroutedChargedItemSettles : Bool -> Text -> Script ()
+unroutedChargedItemSettles competing ref = do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  bank <- allocateParty "Bank"
+  let item = unroutedChargedItem insurer policyholder insured oracleOperator bank competing
+
+  toBank <- item (ref <> "-mortgagee")
+  Some review <- queryContractId insurer toBank
+  assert (review.mortgagee == Some bank)
+  assert (isNone review.recipient)
+  hidden <- queryContractId bank toBank
+  assert (isNone hidden)
+  now <- getTime
+  recordCid <- submit insurer do
+    exerciseCmd toBank ManualReviewRequired_ResolveSettled with
+      bankReference = testTextDigest
+      settledAt = now
+      paidRole = PDR_Mortgagee
+  Some seenByBank <- queryContractId bank recordCid
+  assert (seenByBank.recipient == PDR_Mortgagee)
+  assert (seenByBank.mortgagee == Some bank)
+
+  toInsured <- item (ref <> "-insured")
+  hidden2 <- queryContractId bank toInsured
+  assert (isNone hidden2)
+  insuredCid <- submit insurer do
+    exerciseCmd toInsured ManualReviewRequired_ResolveSettled with
+      bankReference = testTextDigest
+      settledAt = now
+      paidRole = PDR_Insured
+  Some insuredRecord <- queryContractId insurer insuredCid
+  assert (insuredRecord.recipient == PDR_Insured)
+  assert (isNone insuredRecord.mortgagee)
+  notSeen <- queryContractId bank insuredCid
+  assert (isNone notSeen)
+
+  unpaid <- item (ref <> "-unpaid")
+  closedCid <- submit insurer do
+    exerciseCmd unpaid ManualReviewRequired_ResolveUnpaid with
+      unpaidReason = UR_Other
+      note = testTextDigest
+      closedAt = now
+  Some closed <- queryContractId insurer closedCid
+  assert (isNone closed.recipient)
+  assert (isNone closed.mortgagee)
+  notSeen2 <- queryContractId bank closedCid
+  assert (isNone notSeen2)
+
+test_competingClaimsItemSettlesToTheMortgagee : Script ()
+test_competingClaimsItemSettlesToTheMortgagee = script do
+  unroutedChargedItemSettles True "v2c-competing"
+
+test_surplusItemSettlesToTheMortgagee : Script ()
+test_surplusItemSettlesToTheMortgagee = script do
+  unroutedChargedItemSettles False "v2c-surplus"
+
+-- Submits `cmds` and expects it through when `allowed`, refused otherwise.
+expectAllowed : Bool -> Party -> Commands a -> Script ()
+expectAllowed allowed party cmds =
+  if allowed
+  then do
+    _ <- submit party cmds
+    pure ()
+  else submitMustFail party cmds
+
+-- Six choices act only on a policy whose claim axis is active or partially
+-- paid. Every other status is refused by each of them; the two allowed
+-- statuses, on the same token otherwise, are the control.
+test_claimAxisStatusGuards : Script ()
+test_claimAxisStatusGuards = script do
+  (insurer, policyholder, insured, oracleOperator) <- setupParties
+  now <- getTime
+  -- One shape every one of the six can act on: cover begun, two notices in
+  -- the period named below, enforcement reported fruitless and the
+  -- sigortali notified, on a policy taken for another's account.
+  let base = PolicyToken with
+        policyNo = "TEST-STATUS-GUARDS"
+        version = 1
+        predecessorRef = None
+        insurer
+        policyholder
+        insured
+        beneficiary = None
+        beneficiaryDescriptorHash = None
+        mortgagee = None
+        oracleOperator
+        coverages = [frostCoverage]
+        termStart = time (date 2026 Jan 1) 12 0 0
+        expiry = time (date 2026 Dec 31) 12 0 0
+        coverageValidThrough = time (date 2026 Dec 31) 12 0 0
+        noticeServiceDate = Some (addRelTime now (days (-20)))
+        noticeRecordedAt = Some (addRelTime now (days (-20)))
+        noticeCount = 2
+        noticeServiceDates = [addRelTime now (days (-50)), addRelTime now (days (-20))]
+        twoNoticeElectionAt = None
+        twoNoticeEffectiveAt = None
+        coverageBeganAt = Some now
+        coverageStartBasis = Some CSB_AgreedWithoutPayment
+        retroactiveCoverCheckedAt = None
+        enforcementFruitlessAt = Some (addRelTime now (days (-20)))
+        enforcementRoute = Some ER_Takip
+        substitutionNotifiedAt = Some (addRelTime now (days (-10)))
+        substitutedAt = None
+        supersededPolicyholder = None
+        premiumDueDate = None
+        enforcementCommencedAt = None
+        withdrawnAt = None
+        withdrawalPath = None
+        terminationInstant = None
+        unrunDays = None
+        mortgageeNotifiedAt = None
+        mortgageeContinuationEndsAt = None
+        mortgageeElection = None
+        mortgageeInfoRequestedAt = None
+        mortgageeInfoProvidedAt = None
+        status = PS_Active
+        defaultState = DS_None
+        documentHash = None
+        amendmentReason = None
+  reachEventEnd (addRelTime now (days 1))
+
+  _ <- forA
+    [ (PS_Active, True), (PS_PartiallyPaid, True)
+    , (PS_Expired, False), (PS_Cancelled, False)
+    , (PS_ClaimedAndClosed, False), (PS_ManualReview, False) ] $ \(s, allowed) -> do
+    let shaped = base with status = s
+
+    triggerCid <- submit insurer do createCmd shaped
+    expectAllowed allowed oracleOperator do
+      exerciseCmd triggerCid PolicyToken_EvaluateTrigger with
+        selfContractId = show triggerCid
+        coverageCode = "FROST"
+        observedValue = -2.0
+        metric = "TEMPERATURE_C"
+        attestationRef = "status-guard"
+        currency = "TRY"
+        eventStart = now
+        eventEnd = addRelTime now (days 1)
+        cellCommitment = testCellCommitment
+        evidenceDigest = testEvidenceDigest
+
+    electCid <- submit insurer do createCmd shaped
+    expectAllowed allowed insurer do
+      exerciseCmd electCid PolicyToken_ElectTwoNoticeTermination with
+        electedAt = now
+        insurancePeriodStart = addRelTime now (days (-60))
+        insurancePeriodEnd = addRelTime now (days 30)
+
+    serveCid <- submit insurer do createCmd shaped
+    expectAllowed allowed insurer do
+      exerciseCmd serveCid PolicyToken_ServeNotice with
+        noticeServiceDate = now
+        noticeRecordedAt = now
+
+    fruitlessCid <- submit insurer do createCmd shaped
+    expectAllowed allowed insurer do
+      exerciseCmd fruitlessCid PolicyToken_RecordEnforcementFruitless with
+        fruitlessAt = now
+        route = ER_Dava
+
+    substituteCid <- submit insurer do createCmd shaped
+    expectAllowed allowed insurer do
+      exerciseCmd substituteCid PolicyToken_SubstitutePolicyholder with
+        substitutedAtInstant = now
+
+    amendCid <- submit insurer do createCmd shaped
+    expectAllowed allowed insurer do
+      exerciseCmd amendCid amendNothing with
+        reason = ER_Correction
   pure ()

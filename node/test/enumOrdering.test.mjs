@@ -31,10 +31,12 @@ import { config } from '../src/config.js';
 
 const ROOT = path.resolve(import.meta.dirname, '../..');
 
-// Read-only by construction, not by promise. This is the one test file that
+// Read-only by construction, not by promise. This is a test file that
 // runs against DATABASE_URL instead of the guarded test database (package.json
 // runs it apart from the tests that write), so a write added here later fails
-// in the database instead of reaching the working data.
+// in the database instead of reaching the working data. It was the first;
+// eventHandlers, notificationsContract and schemaDrift now run against it too,
+// each read-only.
 const pool = new pg.Pool({ connectionString: config.databaseUrl, options: '-c default_transaction_read_only=on' });
 
 after(async () => { await pool.end(); });

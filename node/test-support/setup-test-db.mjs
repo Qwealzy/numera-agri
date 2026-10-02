@@ -33,8 +33,12 @@ const TIMEOUT_MS = 15000;
 const testUrl = process.env.TEST_DATABASE_URL;
 const workingUrl = process.env.DATABASE_URL;
 
+// 2026-09-18: the child runs without NODE_OPTIONS -- with NODE_OPTIONS=--import <this file> set, each child loaded this file again and started its own child, 236 processes deep before anyone noticed.
+const { NODE_OPTIONS: _dropped, ...childEnv } = process.env;
+
 try {
   execFileSync(process.execPath, [CHECK], {
+    env: childEnv,
     input: JSON.stringify({ testUrl, workingUrl }),
     stdio: ['pipe', 'pipe', 'pipe'],
     encoding: 'utf8',

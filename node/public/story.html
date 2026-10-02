@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Payout Story</title>
+<!-- Read-only. Fetches GET /debug/story-data every 2 seconds and draws it;
+     nothing on this page writes anywhere. No external asset of any kind:
+     system fonts, inline CSS, inline script. -->
+<style>
+  :root {
+    --paper: #f6f7f9; --surface: #ffffff; --ink: #14181c; --muted: #5b6770; --line: #d7dde2;
+    --done: #1f7a4d; --done-soft: #e3f3ea; --wait: #9aa6ae;
+    --human: #8a5a00; --human-soft: #fdf0d6;
+    --strip: #14181c; --strip-ink: #f6f7f9; --strip-accent: #f2c14e;
+    --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0e1216; --surface: #161c21; --ink: #e8edf1; --muted: #97a4ad; --line: #2b353d;
+      --done: #6fd39c; --done-soft: #173024; --wait: #56636c;
+      --human: #f0c264; --human-soft: #33280f;
+      --strip: #e8edf1; --strip-ink: #0e1216; --strip-accent: #8a5a00;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--font); }
+  body { font-size: 18px; line-height: 1.4; overflow-x: hidden; }
+  .strip {
+    position: sticky; top: 0; z-index: 10;
+    background: var(--strip); color: var(--strip-ink);
+    padding: 10px 16px; font-size: 16px; font-weight: 600;
+    display: flex; flex-wrap: wrap; gap: 6px 20px; justify-content: center; text-align: center;
+  }
+  .strip .source { color: var(--strip-accent); }
+  .page { max-width: 1040px; margin: 0 auto; padding: 28px 16px 64px; display: flex; flex-direction: column; gap: 22px; }
+  h1 { font-size: 34px; margin: 0; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 17px; margin-top: 6px; }
+  .meta { color: var(--muted); font-size: 14px; font-family: var(--mono); overflow-wrap: anywhere; }
+  .meta.error { color: var(--human); }
+  .card {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+    padding: 20px 22px; display: flex; flex-direction: column; gap: 16px; min-width: 0;
+  }
+  .card-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 16px; }
+  .amount { font-size: 32px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .role { font-size: 20px; color: var(--muted); }
+  .policy-line { font-size: 15px; color: var(--muted); overflow-wrap: anywhere; }
+  .verdict { font-size: 18px; font-weight: 700; padding: 6px 12px; border-radius: 8px; width: fit-content; }
+  .verdict.auto { background: var(--done-soft); color: var(--done); }
+  .verdict.human { background: var(--human-soft); color: var(--human); }
+  .verdict.progress { background: transparent; color: var(--muted); border: 1px dashed var(--line); }
+  .timeline { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 0; }
+  .step { position: relative; padding: 0 6px; text-align: center; min-width: 0; }
+  .step::before {
+    content: ""; position: absolute; top: 13px; left: -50%; width: 100%; height: 3px; background: var(--line);
+  }
+  .step:first-child::before { display: none; }
+  .step.linked::before { background: var(--done); }
+  .dot {
+    position: relative; z-index: 1; width: 28px; height: 28px; margin: 0 auto 8px; border-radius: 50%;
+    border: 3px solid var(--wait); background: var(--surface);
+  }
+  .step.done .dot { border-color: var(--done); background: var(--done); }
+  .step-name { font-size: 16px; font-weight: 600; }
+  .step.pending .step-name { color: var(--muted); }
+  .step-kind { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .step-time { font-family: var(--mono); font-size: 14px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .step-delta { font-family: var(--mono); font-size: 14px; color: var(--done); font-variant-numeric: tabular-nums; }
+  .step.pending .step-time { font-style: italic; }
+  .details { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px 22px; font-size: 15px; }
+  .details div { min-width: 0; }
+  .details .k { color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .details .v { overflow-wrap: anywhere; }
+  .mono { font-family: var(--mono); }
+  button.hash {
+    font: inherit; font-family: var(--mono); color: var(--ink); background: transparent;
+    border: 1px dashed var(--line); border-radius: 6px; padding: 1px 6px; cursor: pointer;
+    text-align: left; overflow-wrap: anywhere; max-width: 100%;
+  }
+  .empty { color: var(--muted); font-size: 18px; padding: 28px; border: 2px dashed var(--line); border-radius: 12px; text-align: center; }
+  .badges { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 4px; }
+  .badge { font-size: 13px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--human-soft); color: var(--human); }
+  .note { font-size: 14px; color: var(--muted); }
+  .why { font-size: 15px; color: var(--muted); }
+  h2 { font-size: 22px; margin: 0; }
+  table.evals { border-collapse: collapse; width: 100%; font-size: 14px; font-variant-numeric: tabular-nums; }
+  table.evals th, table.evals td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
+  table.evals th { color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+  .out-matched { color: var(--done); font-weight: 700; }
+  .out-none { color: var(--muted); font-weight: 700; }
+  .out-refused { color: var(--human); font-weight: 700; }
+  .scroll { overflow-x: auto; }
+  @media (max-width: 720px) {
+    body { font-size: 16px; }
+    h1 { font-size: 26px; }
+    .amount { font-size: 26px; }
+    .timeline { grid-template-columns: repeat(3, minmax(0, 1fr)); row-gap: 18px; }
+    .step:nth-child(4)::before { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class="strip" role="note">
+  <span id="network">Network: loading…</span>
+  <span id="source" class="source">Data source: loading…</span>
+</div>
+<div class="page">
+  <header>
+    <h1>From a weather reading to a closed payout</h1>
+    <div class="sub">Each card is one payout record, newest first. A filled circle is a recorded step; an empty one has not happened yet. Times are as recorded, with the seconds since the step before.</div>
+  </header>
+  <div class="meta" id="meta">Waiting for the first refresh…</div>
+  <div id="cards"></div>
+</div>
+<script>
+  const STEP_NAMES = {
+    reading: 'Reading',
+    evidence: 'Evidence',
+    window: 'Window',
+    approved: 'Approved on ledger',
+    notified: 'Insurer notified',
+    settled: 'Settled by insurer',
+  };
+  // The last step, once done, is named by how the record closed --
+  // resolved_at is stamped by a close-unpaid as well as by a settlement.
+  const CLOSED_AS = {
+    settled: STEP_NAMES.settled,
+    closed_unpaid: 'Closed unpaid',
+  };
+  function stepName(s, closureStatus) {
+    if (s.key === 'settled' && s.state === 'done') return CLOSED_AS[closureStatus] || 'Closed';
+    return STEP_NAMES[s.key] || s.key;
+  }
+  const ROLE_NAMES = {
+    PDR_Insured: 'to the insured',
+    PDR_Mortgagee: 'to the mortgagee',
+    PDR_Beneficiary: 'to the beneficiary',
+    PDR_EnforcementOffice: 'to the enforcement office',
+  };
+
+  function el(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined && text !== null) node.textContent = text;
+    return node;
+  }
+  const fmtTime = (t) => (t ? new Date(t).toISOString().replace('T', ' ').replace(/\.\d+Z$/, 'Z') : 'not yet');
+  const orNotYet = (v) => (v === null || v === undefined || v === '' ? 'not yet' : String(v));
+
+  // Shortened by default; a click shows the whole value and a second click
+  // shortens it again. Which values are open survives the 2-second redraw.
+  const openValues = new Set();
+  function hashButton(full, shortLen) {
+    if (!full) return el('span', 'mono', 'not yet');
+    const shown = () => (openValues.has(full) || full.length <= shortLen ? full : full.slice(0, shortLen) + '…');
+    const b = el('button', 'hash', shown());
+    b.type = 'button';
+    b.title = 'Click to show the whole value';
+    b.addEventListener('click', () => {
+      if (openValues.has(full)) openValues.delete(full); else openValues.add(full);
+      b.textContent = shown();
+    });
+    return b;
+  }
+
+  // The markers oracleBot.js and the replay script write into a reading's
+  // source string, read back out as their own words. The raw string stays on
+  // the card underneath, unchanged.
+  function sourceBadges(label) {
+    const box = el('div', 'badges');
+    if (!label) return box;
+    if (label.includes('STAND-IN(forecast,not-observation)')) {
+      box.append(el('span', 'badge', 'forecast, not an observation'));
+    }
+    const replay = /REPLAY\(recorded ([^)]+)\)/.exec(label);
+    if (replay) box.append(el('span', 'badge', 'replayed from a recording made at ' + fmtTime(replay[1])));
+    return box;
+  }
+
+  const DELIVERY_WORDS = {
+    'no address configured': 'no address configured for this insurer, so nothing is queued',
+    queued: 'queued, waiting its turn',
+    sending: 'being sent right now',
+    delivered: 'delivered',
+    failed: 'failed',
+  };
+
+  function detail(parent, key, value) {
+    const box = el('div');
+    box.append(el('div', 'k', key));
+    const v = el('div', 'v');
+    if (value instanceof Node) v.append(value); else v.textContent = orNotYet(value);
+    box.append(v);
+    parent.append(box);
+  }
+
+  function timeline(steps, closureStatus) {
+    const ol = el('ol', 'timeline');
+    let prev = null;
+    let prevDone = false;
+    for (const s of steps) {
+      const done = s.state === 'done';
+      // The line into a step is drawn filled only when both ends are recorded.
+      const li = el('li', 'step ' + (done ? 'done' : 'pending') + (done && prevDone ? ' linked' : ''));
+      li.append(el('div', 'dot'));
+      li.append(el('div', 'step-name', stepName(s, closureStatus)));
+      // Each step's time is a DIFFERENT kind of time -- the reading's is the
+      // hour the value was measured for, the evidence's the moment the
+      // response arrived -- so the kind is named under every one of them.
+      li.append(el('div', 'step-kind', s.timeKind || ''));
+      li.append(el('div', 'step-time', done ? fmtTime(s.at) : 'not yet'));
+      if (done && prev) {
+        const secs = Math.round((new Date(s.at) - new Date(prev)) / 1000);
+        li.append(el('div', 'step-delta', (secs >= 0 ? '+' : '') + secs + ' s'));
+      }
+      if (done) prev = s.at;
+      prevDone = done;
+      ol.append(li);
+    }
+    return ol;
+  }
+
+  function card(p) {
+    const c = el('article', 'card');
+
+    const head = el('div', 'card-head');
+    const left = el('div');
+    const a = p.approval;
+    left.append(el('span', 'amount', a.amount ? a.amount + ' ' + (a.currency || '') : 'amount not yet'));
+    left.append(document.createTextNode(' '));
+    left.append(el('span', 'role', a.recipientRole ? (ROLE_NAMES[a.recipientRole] || a.recipientRole) : 'no recipient decided'));
+    head.append(left);
+    head.append(el('div', 'policy-line',
+      'Policy ' + p.policy.idPrefix + '… · ' + orNotYet(p.policy.productCode) + ' · ' +
+      orNotYet(p.policy.perilType) + ' · ' + p.policy.coverageCode + ' · cell ' + orNotYet(p.policy.cell)));
+    c.append(head);
+
+    const settled = p.steps[p.steps.length - 1].state === 'done';
+    if (p.path === 'automatic') c.append(el('div', 'verdict auto', 'No human in the loop'));
+    else if (p.path === 'human') {
+      c.append(el('div', 'verdict human', settled ? 'Resolved through human review' : 'Waiting for a human decision'));
+    } else c.append(el('div', 'verdict progress', 'Still in progress'));
+    // Why it is on that path, in the handler's own words -- an "in progress"
+    // card used to say nothing at all about what it was still short of.
+    c.append(el('div', 'why', p.pathReason || ''));
+
+    c.append(timeline(p.steps, p.closure.status));
+
+    const d = el('div', 'details');
+    const r = p.reading;
+    // A mean has no deciding reading at all, which is a different thing from
+    // a payout that has read nothing yet; the handler says which it is.
+    detail(d, 'Determining reading', r.note ? r.note : r.value === null ? null : r.value + ' ' + (r.metric || ''));
+    detail(d, 'Measured at (the hour the value is for)', r.measuredAt && fmtTime(r.measuredAt));
+    if (r.sourceLabel) {
+      const src = el('div');
+      src.append(sourceBadges(r.sourceLabel));
+      src.append(el('div', 'mono', r.sourceLabel));
+      detail(d, 'Source label (raw)', src);
+    } else detail(d, 'Source label (raw)', null);
+    detail(d, 'Evidence SHA-256', hashButton(p.evidence.sha256, 12));
+    detail(d, 'Fetched at (when the response arrived)', p.evidence.fetchedAt && fmtTime(p.evidence.fetchedAt));
+    const w = p.window;
+    detail(d, 'Window (opened → closed)', w.start ? fmtTime(w.start) + ' → ' + fmtTime(w.end) : null);
+    detail(d, 'Aggregation', w.aggregation === null ? null
+      : w.aggregation + ' of ' + orNotYet(w.readingCount) + ' reading(s) in the window' +
+        (w.tieRule ? ' — ' + w.tieRule : ''));
+    detail(d, 'Attestation evidence', w.attestation ? hashButton(w.attestation.evidenceSha256, 12) : null);
+    detail(d, 'Tier', a.tierLabel === null ? null : a.tierLabel + ' (' + a.percentage + '%)');
+    detail(d, 'Approved at', a.approvedAt && fmtTime(a.approvedAt));
+    detail(d, 'Ledger contract (first 12)', a.contractIdPrefix ? el('span', 'mono', a.contractIdPrefix + '…') : null);
+    detail(d, 'Record', p.recordKind + ' · ' + p.status);
+    for (const n of p.notifications) {
+      detail(d, 'Notification · ' + n.kind,
+        (DELIVERY_WORDS[n.delivery] || n.delivery) +
+        ' · ' + (n.attemptCountMeans || 'failed attempts') + ': ' + n.attemptCount +
+        (n.lastStatusCode ? ' · HTTP ' + n.lastStatusCode : '') +
+        (n.deliveredAt ? ' · notified at ' + fmtTime(n.deliveredAt) : ''));
+    }
+    if (!p.notifications.length) detail(d, 'Notification', null);
+    detail(d, 'Settled at (insurer-reported)', p.closure.settledAt && fmtTime(p.closure.settledAt));
+    detail(d, 'Closed at', p.closure.resolvedAt && fmtTime(p.closure.resolvedAt));
+    // Window CLOSED -> approved on the ledger. Nothing before the
+    // first of those two instants is in it.
+    detail(d, 'Pipeline time (window closed → approved)',
+      p.pipelineSeconds === null ? null
+        : p.pipelineSeconds + ' s — LocalNet, one machine; a provider’s publication delay is not included');
+    c.append(d);
+    return c;
+  }
+
+  const OUTCOME_CLASS = { matched: 'out-matched', refused: 'out-refused' };
+
+  // The second list: windows that were evaluated, whatever came of them. The
+  // cards above are only the ones that paid, so without this a demo cannot
+  // show the ordinary case -- a window evaluated, no tier matched, nothing
+  // changes.
+  function outcomeText(e) {
+    if (e.outcome === 'matched') return 'matched tier ' + orNotYet(e.tierLabel) + ' → payout';
+    if (e.outcome === 'no tier matched') return 'no tier matched → no payout';
+    if (e.outcome === 'refused') return 'refused by the ledger: ' + e.refusalCode;
+    if (e.outcome === 'not sent') return 'not sent to the ledger: the platform stopped it before submitting';
+    if (e.outcome === 'accepted, not recorded') return 'accepted by the ledger, but not recorded here: needs reconciliation by hand';
+    if (e.outcome === 'failed') return 'failed; the record does not say whether the ledger saw it';
+    if (e.outcome === 'not evaluated yet') return 'queued, not evaluated yet';
+    return 'no trigger queued for this window';
+  }
+
+  function evaluations(list) {
+    const section = el('section', 'card');
+    section.append(el('h2', null, 'Evaluated windows, matched or not'));
+    section.append(el('div', 'why',
+      'Every window the platform closed and evaluated, newest first — including the ones where no tier matched and nothing changed.'));
+    if (!list.length) {
+      section.append(el('div', 'empty', 'No window has been evaluated yet.'));
+      return section;
+    }
+    const wrap = el('div', 'scroll');
+    const t = el('table', 'evals');
+    const head = t.insertRow();
+    for (const h of ['Policy', 'Coverage', 'Window', 'Value', 'Aggregation', 'Readings', 'Outcome']) {
+      const th = document.createElement('th');
+      th.textContent = h;
+      head.append(th);
+    }
+    for (const e of list) {
+      const row = t.insertRow();
+      const cells = [
+        e.policyIdPrefix + '…', e.coverageCode,
+        fmtTime(e.windowStart) + ' → ' + fmtTime(e.windowEnd),
+        orNotYet(e.value) + ' ' + (e.metric || ''),
+        e.aggregation, String(e.readingCount),
+      ];
+      for (const v of cells) row.insertCell().textContent = v;
+      row.insertCell().append(el('span', OUTCOME_CLASS[e.outcome] || 'out-none', outcomeText(e)));
+    }
+    wrap.append(t);
+    section.append(wrap);
+    return section;
+  }
+
+  async function refresh() {
+    const meta = document.getElementById('meta');
+    try {
+      const res = await fetch('/debug/story-data', { cache: 'no-store' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+      const h = data.header;
+      document.getElementById('network').textContent =
+        'Network: ' + h.network + ' · package ' + h.packageIdPrefix + '…';
+      document.getElementById('source').textContent =
+        h.dataSource.label ? h.dataSource.label : 'data source: not labelled';
+      const cards = document.getElementById('cards');
+      cards.replaceChildren();
+      if (!data.payouts.length) cards.append(el('div', 'empty', 'No payout records yet.'));
+      const list = el('div');
+      list.style.display = 'flex';
+      list.style.flexDirection = 'column';
+      list.style.gap = '18px';
+      for (const p of data.payouts) list.append(card(p));
+      list.append(evaluations(data.evaluations ?? []));
+      cards.append(list);
+      meta.className = 'meta';
+      meta.textContent = 'Refreshed ' + fmtTime(data.checkedAt) + ' · ' + data.payouts.length + ' record(s) · every 2 s';
+    } catch (err) {
+      meta.className = 'meta error';
+      meta.textContent = 'Could not read /debug/story-data: ' + err.message;
+    }
+  }
+  refresh();
+  setInterval(refresh, 2000);
+</script>
+</body>
+</html>

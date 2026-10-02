@@ -10,7 +10,9 @@ import { enqueuePayoutNotification } from '../src/notifications/enqueue.js';
 // that makes enqueueing idempotent, and the status-transition trigger that
 // refuses in the table what application code might otherwise get wrong.
 //
-// Nothing here sends anything. There is no sender yet, as
+// Nothing here sends anything. The sender (src/notifications/sender.js) has
+// its own test, notificationSender.test.mjs, against a loopback receiver. It
+// is loopback-only unless WEBHOOK_ALLOW_NON_LOOPBACK is 'true', as
 // (the project's standing rule).
 
 let insurerId;

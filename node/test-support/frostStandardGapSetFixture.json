@@ -1,0 +1,39 @@
+{
+  "note": "Fixture for a future validateTierSet test in test/tiers.test.mjs; no test reads it yet. The FROST-STANDARD tier set exactly as resolveCoverage snapshots it from the payout_tiers rows scripts/setupDemo.mjs wrote from scripts/demo/frost-standard-tiers.json -- the terms demo policy 7979dd95 was created with. Not an actuarial figure. The set leaves -4 < x < -2 matching no tier, and must still be accepted.",
+  "productCode": "FROST-STANDARD",
+  "perilType": "FROST",
+  "tiers": [
+    {
+      "tierOrder": 1,
+      "label": "Mild frost (-2C to 0C)",
+      "minValue": "-2.0000",
+      "maxValue": "0.0000",
+      "payoutPct": "25.00",
+      "shape": "TS_Step",
+      "pctAtMin": null,
+      "pctAtMax": null
+    },
+    {
+      "tierOrder": 2,
+      "label": "Severe frost (below -4C)",
+      "minValue": null,
+      "maxValue": "-4.0000",
+      "payoutPct": "100.00",
+      "shape": "TS_Step",
+      "pctAtMin": null,
+      "pctAtMax": null
+    }
+  ],
+  "expectAccepted": true,
+  "probes": [
+    { "observed": "0.0001", "tierOrder": null },
+    { "observed": "0.0000", "tierOrder": 1 },
+    { "observed": "-1.0000", "tierOrder": 1 },
+    { "observed": "-2.0000", "tierOrder": 1 },
+    { "observed": "-2.0001", "tierOrder": null },
+    { "observed": "-3.0000", "tierOrder": null },
+    { "observed": "-3.9999", "tierOrder": null },
+    { "observed": "-4.0000", "tierOrder": 2 },
+    { "observed": "-10.0000", "tierOrder": 2 }
+  ]
+}

@@ -53,6 +53,47 @@ test('on a DST day the window is one LOCAL day long, and windows stay contiguous
   assert.equal(next.start.getTime(), dstDay.end.getTime(), 'no gap and no overlap between windows');
 });
 
+test('a window boundary that falls in a spring-forward gap moves to the end of the gap', () => {
+  // Santiago skips 00:00-01:00 on 2026-09-06 (-04 -> -03), so that local
+  // midnight does not exist; the day of the 5th ends when the 6th's clock
+  // resumes, at 01:00 -03 = 04:00Z.
+  const santiago = { timezone: 'America/Santiago', startHour: 0 };
+  const reading = '2026-09-06T03:30:00Z'; // 23:30 -04 on the 5th
+  const w = windowFor(reading, santiago);
+  assert.equal(w.start.toISOString(), '2026-09-05T04:00:00.000Z');
+  assert.equal(w.end.toISOString(), '2026-09-06T04:00:00.000Z');
+  assert.equal(w.end.getTime() - w.start.getTime(), 24 * 3600 * 1000);
+  const t = new Date(reading).getTime();
+  assert.ok(w.start.getTime() <= t && t < w.end.getTime(), 'the reading lies inside its own window');
+  const next = windowFor(w.end, santiago);
+  assert.equal(next.start.getTime(), w.end.getTime(), 'no gap and no overlap between windows');
+  assert.equal(next.end.getTime() - next.start.getTime(), 23 * 3600 * 1000);
+});
+
+test('a start hour inside the gap keeps the pre-gap hour in the previous day (New York, 02:00)', () => {
+  // New York skips 02:00-03:00 on 2026-03-08; 01:30 EST is still the 7th's day.
+  const w = windowFor('2026-03-08T06:30:00Z', { timezone: 'America/New_York', startHour: 2 });
+  assert.equal(w.start.toISOString(), '2026-03-07T07:00:00.000Z');
+  assert.equal(w.end.toISOString(), '2026-03-08T07:00:00.000Z');
+});
+
+test('Havana skips local midnight on 2026-03-08; the 7th ends at the end of the gap', () => {
+  const havana = { timezone: 'America/Havana', startHour: 0 };
+  const w = windowFor('2026-03-08T04:30:00Z', havana); // 23:30 -05 on the 7th
+  assert.equal(w.start.toISOString(), '2026-03-07T05:00:00.000Z');
+  assert.equal(w.end.toISOString(), '2026-03-08T05:00:00.000Z');
+  const next = windowFor(w.end, havana);
+  assert.equal(next.start.getTime(), w.end.getTime(), 'no gap and no overlap between windows');
+  assert.equal(next.end.getTime() - next.start.getTime(), 23 * 3600 * 1000);
+});
+
+test('a gap at local midnight in a positive-offset zone still starts at the end of the gap (Beirut)', () => {
+  // Beirut skips 00:00-01:00 on 2026-03-29 (+02 -> +03): the day starts at 01:00 +03.
+  const w = windowFor('2026-03-29T06:00:00Z', { timezone: 'Asia/Beirut', startHour: 0 });
+  assert.equal(w.start.toISOString(), '2026-03-28T22:00:00.000Z');
+  assert.equal(w.end.toISOString(), '2026-03-29T21:00:00.000Z');
+});
+
 test('a window is closed only once its end has passed', () => {
   const w = windowFor('2026-09-01T12:00:00+03:00', ISTANBUL_CALENDAR_DAY);
   assert.equal(isClosed(w, new Date(w.end.getTime() - 1)), false);

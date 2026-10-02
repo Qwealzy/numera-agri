@@ -27,25 +27,24 @@ import { config } from '../config.js';
 // than from a clock, so a late run records the instant it would have recorded
 // on time.
 //
-// It reads the window off the INSURER, not off the policy: unlike the grace
-// period, which handleActivation freezes onto the row, this window is only
-// ever needed from the due date onward and is resolved when the withdrawal is
-// dispatched. resolveFirstPremiumWindow enforces the three-month ceiling
-// there -- a policy whose insurer has configured a longer window fails loudly
-// at dispatch rather than being swept on a period the Code would not allow.
+// It reads the window off the POLICY: like the grace period, handleActivation
+// freezes it onto the row (migration 037), so a later change to the insurer's
+// value never moves an activated policy's window. resolveFirstPremiumWindow
+// enforces the three-month ceiling when the withdrawal is dispatched -- a
+// policy frozen with a longer window fails loudly at dispatch rather than
+// being swept on a period the Code would not allow.
 async function runOnce({ insurerIds } = {}) {
   // insurerIds is for tests, which pass their own fixture insurers. Production
   // passes nothing, and the query is then exactly what it always was.
   const { rows: elapsed } = await pool.query(
     `SELECT p.id FROM policies p
-     JOIN insurers i ON i.id = p.insurer_id
      WHERE p.default_state = 'first_premium_unpaid'
        AND p.premium_due_date IS NOT NULL
        -- The whole point of the second sentence: it applies only where the
        -- claim was NOT pursued.
        AND p.enforcement_commenced_at IS NULL
-       AND i.first_premium_withdrawal_days IS NOT NULL
-       AND p.premium_due_date + (i.first_premium_withdrawal_days * INTERVAL '1 day') < now()` +
+       AND p.first_premium_withdrawal_days IS NOT NULL
+       AND p.premium_due_date + (p.first_premium_withdrawal_days * INTERVAL '1 day') < now()` +
       (insurerIds === undefined ? '' : ' AND p.insurer_id = ANY($1)'),
     insurerIds === undefined ? undefined : [insurerIds]
   );
