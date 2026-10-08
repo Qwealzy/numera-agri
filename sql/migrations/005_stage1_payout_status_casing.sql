@@ -1,5 +1,5 @@
 -- ============================================================================
--- Stage 1 cleanup: payout_event_status moves to the same lowercase-with-
+-- Cleanup: payout_event_status moves to the same lowercase-with-
 -- underscores convention policy_status already uses. Values and their
 -- meanings are unchanged -- this is a spelling migration only.
 --

@@ -125,11 +125,11 @@ export const config = {
   mintWatcher: {
     pollMs: Number(process.env.MINT_WATCHER_POLL_MS ?? 2000),
   },
-  // Stage 2 Part 2: the payout notification sender (notifications/sender.js).
+  // The payout notification sender (notifications/sender.js).
   // No default for the master key: without it the sender does not start, and
   // there is no unsigned delivery path. The per-insurer secret is derived from
   // it (notifications/signature.js) and never stored.
-  // allowNonLoopback is the project's standing rule made
+  // allowNonLoopback makes the loopback-only rule
   // mechanical: only the exact string 'true' opens it, anything else is
   // loopback-only.
   notificationSender: {

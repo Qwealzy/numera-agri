@@ -5,7 +5,7 @@ import { queryActiveContracts } from '../damlClient.js';
 import { enqueuePayoutNotification } from '../notifications/enqueue.js';
 
 // Polls the ledger for PayoutApproved contracts (the on-chain
-// "Payout_Approved" signal). Stage 2 Part 1: this no longer exercises
+// "Payout_Approved" signal). This does not exercise
 // anything itself -- dispatch/dispatcher.js's handleTrigger already writes
 // the payout_events row directly, in
 // the same transaction as the exercise that created the PayoutApproved
@@ -90,7 +90,7 @@ async function ensureTracked(contract, insurerId) {
     });
   }
 
-  // Stage 4: this used to queue a `settlement` outbox row too, which the
+  // This used to queue a `settlement` outbox row too, which the
   // dispatcher then turned into an unconditional MarkFailed. Removed --
   // settlement is now reported by the insurer, never inferred from the mere
   // existence of a PayoutApproved. What remains below is the defensive

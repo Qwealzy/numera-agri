@@ -1,7 +1,7 @@
 // The webhook's envelope and signature, as pure functions. What is under test
 // is the shape of what leaves this platform: the envelope carries exactly five
 // fields and nothing a regulator would call the content of the payout
-// (a standing rule -- the webhook
+// (by design -- the webhook
 // carries a thin envelope, everything else moves to an authenticated GET).
 //
 // Needs no database and no LocalNet. The known vectors below were computed

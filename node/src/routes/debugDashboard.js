@@ -20,13 +20,7 @@ debugDashboardRouter.use((req, res, next) => {
   next();
 });
 
-// Read-only: fetches its data client-side from the existing, untouched
-// GET /debug/contracts. This route only ever serves the static page.
-debugDashboardRouter.get('/dashboard', (_req, res) => {
-  res.sendFile(path.join(__dirname, '..', '..', 'public', 'debug-dashboard.html'));
-});
-
-// Read-only too: the story page fetches GET /debug/story-data client-side.
+// Read-only: the story page fetches GET /debug/story-data client-side.
 debugDashboardRouter.get('/story', (_req, res) => {
   res.sendFile(path.join(__dirname, '..', '..', 'public', 'story.html'));
 });

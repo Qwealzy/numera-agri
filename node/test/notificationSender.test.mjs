@@ -4,15 +4,14 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import http from 'node:http';
 
-// The payout notification sender (Stage 2 Part 2) against a receiver on a
+// The payout notification sender against a receiver on a
 // loopback port. It needs no LocalNet. What is under test is what goes onto
 // the wire -- the envelope's bytes, the signature over exactly those bytes,
 // the delivery id -- and what the queue row records afterwards, including
 // what it must never record: anything the receiver said.
 //
-// The loopback gate is the project's standing rule made
-// mechanical: nothing is delivered to a real insurer address before the
-// lawyer answers.
+// The loopback gate makes a rule mechanical: nothing is delivered to a
+// real insurer address until a legal review is complete.
 
 const MASTER_KEY = 'test-master-key-not-a-secret';
 

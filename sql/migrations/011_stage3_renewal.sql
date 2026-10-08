@@ -1,5 +1,5 @@
 -- ============================================================================
--- Stage 3 Part 4: renewal (tecditname) -- the last lifecycle mechanism.
+-- Renewal (tecditname) -- the last lifecycle mechanism.
 --
 -- A renewal is NOT an endorsement. An endorsement archives and re-mints the
 -- SAME policy at version + 1; a renewal opens a NEW risk period as a NEW

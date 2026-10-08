@@ -100,7 +100,7 @@ th,td{border-bottom:1px solid var(--line);padding:4px 8px;text-align:left;white-
 th{color:var(--muted);font-weight:600}
 .muted{color:var(--muted)}
 </style></head><body>
-<div class="banner">FAKE INSURER — on this machine, with invented data</div>
+<div class="banner">FAKE INSURER — on the local machine, with invented data</div>
 <div class="muted" id="meta"></div>
 <h2>Notifications received</h2><div class="wrap"><table id="n"></table></div>
 <h2>Records fetched</h2><div class="wrap"><table id="r"></table></div>

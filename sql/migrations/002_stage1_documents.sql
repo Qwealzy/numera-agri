@@ -1,4 +1,4 @@
--- Stage 1 addendum: one document mechanism (not one per Turkish document
+-- Addendum: one document mechanism (not one per Turkish document
 -- name), plus the three token fields renewal/notice/release will need
 -- later. No handling logic for any document type is implemented here.
 

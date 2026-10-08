@@ -1,9 +1,9 @@
 -- ============================================================================
 -- Role intake for mortgagee and beneficiary.
 --
--- Both roles have existed on PolicyToken since the roles round, and the whole
--- m. 1456 mechanism (notification, continuation window, election) has been
--- implemented and tested since the termination round -- but nothing could
+-- Both roles had long existed on PolicyToken, and the whole
+-- m. 1456 mechanism (notification, continuation window, election) had been
+-- implemented and tested since termination was built -- but nothing could
 -- ever set them, because there was no intake path. dispatcher.js minted every
 -- policy with `mortgagee: null` and `beneficiary: null`, so every one of
 -- those choices refused on every policy the platform could create.
@@ -47,7 +47,7 @@ ALTER TABLE policies ADD CONSTRAINT policies_beneficiary_named_xor_described
 ALTER TABLE policies ADD CONSTRAINT policies_beneficiary_descriptor_not_empty
   CHECK (beneficiary_descriptor_hash IS NULL OR beneficiary_descriptor_hash <> '');
 
--- policy_coverages.mortgagee_claim_amount already exists (Stage 2 Part 2) and
+-- policy_coverages.mortgagee_claim_amount already exists (migration 007) and
 -- is unchanged. What was missing was any way to SET it: the API did not
 -- accept it, and the token's own ensure clause forbids it on a policy with no
 -- mortgagee, which was every policy.

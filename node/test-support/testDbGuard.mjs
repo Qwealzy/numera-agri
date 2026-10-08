@@ -11,7 +11,7 @@
 //   2. The target carries a positive marker, the database-level setting
 //      app.is_test_database = 'on', which only markTestDatabase() puts there
 //      (called by scripts/setupTestDb.mjs). Identity alone only recognises
-//      this machine's working database; the marker is what rules out every
+//      the working database; the marker is what rules out every
 //      other database that is not a test database.
 //
 // Every connection this file opens for checking is read-only.

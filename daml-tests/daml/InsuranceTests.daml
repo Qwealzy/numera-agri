@@ -34,7 +34,7 @@ frostTiers =
       pctAtMax = None
   ]
 
--- Stage 2 Part 2's default single-coverage fixture -- today's frost
+-- The default single-coverage fixture -- today's frost
 -- product represented as the one-element coverage list it now has to be.
 -- No special case, same shape a two-coverage policy uses.
 frostCoverage : Coverage
@@ -133,9 +133,9 @@ mintTestPolicy insurer policyholder insured oracleOperator beneficiary mortgagee
 -- Happy path across Modules 1-4's Daml half, single coverage:
 --   mint -> a reading in the unmapped gap changes nothing (fails closed) ->
 --   a mild-frost reading pays 25% and re-mints at a reduced remainingLimit
---   (Module 3) -> a severe-frost reading on the re-minted policy consumes
+--   -> a severe-frost reading on the re-minted policy consumes
 --   the rest, archives for good instead of re-minting a worthless 0-limit
---   NFT, and creates a PayoutApproved (Module 4) -> insurer confirms
+--   NFT, and creates a PayoutApproved -> insurer confirms
 --   settlement once the (simulated) EFT lands.
 test_mintAndFullLifecycle : Script ()
 test_mintAndFullLifecycle = script do
@@ -232,7 +232,7 @@ test_mintAndFullLifecycle = script do
   finalPayout <- queryContractId insurer payoutCid2
   assert (fmap (.isFullSettlement) finalPayout == Some True)  -- policy now closed
 
-  -- Stage 4: the insurer closes the loop by REPORTING a settlement it made
+  -- The insurer closes the loop by REPORTING a settlement it made
   -- through its own banking systems. settledAt is its reported date, not a
   -- clock reading, and paidRole must be one the coverage allows.
   settleTime <- getTime
@@ -257,7 +257,7 @@ test_mintExactlyOneToken = script do
 -- None for both must mint at all (ensure doesn't wrongly reject the
 -- all-None case) and must evaluate triggers identically to one with them
 -- populated -- their absence is not supposed to change any business
--- outcome in this stage.
+-- outcome.
 test_mintWithNoneOptionalRoles : Script ()
 test_mintWithNoneOptionalRoles = script do
   (insurer, policyholder, insured, oracleOperator) <- setupParties
@@ -862,7 +862,7 @@ test_observerRolesCannotExerciseAnyChoice = script do
 
   pure ()
 
--- Module 3's premium-default burn path. Unlike EvaluateTrigger there's no
+-- The premium-default burn path. Unlike EvaluateTrigger there's no
 -- conflict-of-interest concern here -- the insurer choosing to walk away
 -- from an unpaid policy is exactly the intended incentive -- so `insurer`
 -- alone is the controller. oracleOperator must NOT be able to burn a
@@ -873,7 +873,7 @@ test_archiveForNonPayment = script do
   policyCid <- mintTestPolicy insurer policyholder insured oracleOperator None None [frostCoverage]
   now <- getTime
 
-  -- Stage 4: this is phase TWO of termination, so the policy must first be
+  -- This is phase TWO of termination, so the policy must first be
   -- put through notice -> terminate. The ledger guard is proven separately
   -- in test_archiveForNonPaymentRequiresTermination.
   inNoticeCid <- submit insurer do
@@ -901,9 +901,9 @@ test_archiveForNonPayment = script do
   remaining <- queryContractId insurer terminatedCid
   assert (isNone remaining)
 
--- Module 3's natural-expiry burn path (endDate/expiry reached, no
+-- The natural-expiry burn path (endDate/expiry reached, no
 -- outstanding claim). Same controller = insurer reasoning as non-payment
--- above. reason (Stage 3 Part 1) is just carried through here --
+-- above. reason is only carried through here --
 -- its content isn't asserted on, only that the choice still requires
 -- `insurer` alone with the new arguments in place.
 test_archiveForExpiry : Script ()
@@ -929,7 +929,7 @@ test_archiveForExpiry = script do
   remaining <- queryContractId insurer policyCid
   assert (isNone remaining)
 
--- Stage 3 Part 1: expiry must archive a multi-coverage policy outright --
+-- Expiry must archive a multi-coverage policy outright --
 -- no re-mint, no special-casing per coverage. Complements
 -- test_archiveForExpiry (single coverage) by proving the same choice works
 -- unchanged when there's more than one coverage to carry nothing forward
@@ -973,7 +973,7 @@ test_archiveForExpiryArchivesMultiCoveragePolicy = script do
   remaining <- queryContractId insurer policyCid
   assert (isNone remaining)
 
--- Stage 3 Part 1: a partially-paid policy (one coverage already drawn
+-- A partially-paid policy (one coverage already drawn
 -- down by a real payout, not just minted with a lower remainingLimit)
 -- must still expire the same way -- the unused limit on the untouched
 -- coverage lapses with it, since there is no re-mint for it to survive in.
@@ -1037,7 +1037,7 @@ test_archiveForExpiryArchivesPartiallyPaidPolicy = script do
   remaining <- queryContractId insurer policyCid2
   assert (isNone remaining)   -- gone regardless of GLASS's still-unused limit
 
--- Stage 3 Part 2: notice served leaves coverage fully in force --
+-- Notice served leaves coverage fully in force --
 -- coverageValidThrough must be byte-for-byte untouched, only status and
 -- the two notice fields change. Also the authorization proof for
 -- PolicyToken_ServeNotice: every observer role must fail, insurer alone
@@ -1090,7 +1090,7 @@ test_serveNoticeLeavesCoverageValidThroughUntouched = script do
   old <- queryContractId insurer policyCid
   assert (isNone old)
 
--- Stage 3 Part 2: a loss during the grace period is exactly as payable as
+-- A loss during the grace period is exactly as payable as
 -- one against an ordinary active policy -- this is the whole point of
 -- keeping DS_GracePeriod distinct from DS_Terminated: cover during the
 -- notice period is real.
@@ -1124,7 +1124,7 @@ test_triggerPaysDuringGracePeriod = script do
   Some paidWhileInGrace <- queryContractId insurer newPolicyCid
   assert (paidWhileInGrace.status == PS_PartiallyPaid)  -- pays and re-mints exactly as it would from PS_Active
 
--- Stage 4: PolicyToken_Terminate must be unreachable directly from
+-- PolicyToken_Terminate must be unreachable directly from
 -- DS_None -- a contract cannot be terminated for non-payment without notice
 -- having been served and recorded first.
 test_terminateNotReachableDirectlyFromActive : Script ()
@@ -1139,7 +1139,7 @@ test_terminateNotReachableDirectlyFromActive = script do
       unrunDays = 100
       mortgageeContinuationEndsAt = None
 
--- Stage 4: termination itself. Reachable only from the notice period, sets
+-- Termination itself. Reachable only from the notice period, sets
 -- the coverage end AT the termination instant, records the unrun days, and
 -- does NOT archive the token. Also the authorization proof: every observer
 -- role must fail, insurer alone must succeed.
@@ -1185,7 +1185,7 @@ test_terminateObserverRolesCannotExerciseInsurerCan = script do
   gone <- queryContractId insurer inNoticeCid
   assert (isNone gone)
 
--- Stage 4: a trigger after termination is refused -- there is no contract
+-- A trigger after termination is refused -- there is no contract
 -- to claim under. The resulting `failed` outbox row is proven at the Node
 -- layer in dispatcher.test.mjs.
 test_triggerRejectedAfterTermination : Script ()
@@ -1269,7 +1269,7 @@ test_triggerEvaluatedForEventBeforeTermination = script do
   assert (after.defaultState == DS_Terminated)   -- the default axis is untouched
   assert (after.coverageValidThrough == termInstant)
 
--- Stage 4, the two-phase shape. A loss during the NOTICE period is payable,
+-- The two-phase shape. A loss during the NOTICE period is payable,
 -- the payout survives termination untouched, and the token cannot be
 -- archived for non-payment until the contract is terminated.
 test_payoutDuringNoticePeriodSurvivesTermination : Script ()
@@ -1331,7 +1331,7 @@ test_payoutDuringNoticePeriodSurvivesTermination = script do
   survives <- queryContractId insurer payoutCid
   assert (isSome survives)
 
--- Stage 4: ArchiveForNonPayment is guarded on the ledger, not only in the
+-- ArchiveForNonPayment is guarded on the ledger, not only in the
 -- sweeper that calls it -- a policy that was never terminated cannot be
 -- burned for non-payment.
 test_archiveForNonPaymentRequiresTermination : Script ()
@@ -1353,7 +1353,7 @@ test_archiveForNonPaymentRequiresTermination = script do
     exerciseCmd inNoticeCid PolicyToken_ArchiveForNonPayment with
       reason = "premium not paid"
 
--- Stage 4: reinstatement is NARROWED to the notice period. Payment inside
+-- Reinstatement is NARROWED to the notice period. Payment inside
 -- the period means the default never matured; a terminated contract has
 -- ended and cannot be reinstated -- what would follow is a new contract.
 test_reinstateRejectedAfterTermination : Script ()
@@ -1375,7 +1375,7 @@ test_reinstateRejectedAfterTermination = script do
   submitMustFail insurer do
     exerciseCmd terminatedCid PolicyToken_Reinstate
 
--- Stage 4, m. 1456(4) and (5): the mortgagee notification, the continuation
+-- m. 1456(4) and (5): the mortgagee notification, the continuation
 -- window opening at termination, and the election -- all recorded, none
 -- acted on. A policy with no mortgagee cannot record any of them.
 test_mortgageeNoticeWindowAndElectionAreRecorded : Script ()
@@ -1536,11 +1536,11 @@ test_coverageAmountAndTerminationEnsureGuards = script do
   Some created <- queryContractId insurer ok
   assert (created.defaultState == DS_Terminated)
 
--- Stage 3 Part 2: a PS_PartiallyPaid policy must stay PS_PartiallyPaid
+-- A PS_PartiallyPaid policy must stay PS_PartiallyPaid
 -- through reinstatement, not come back PS_Active -- here the coverage list
 -- itself already shows a reduced remainingLimit from before notice was ever
 -- served, and reinstatement must not silently erase a real payout history.
--- Since Part 3 split the status axes, PolicyToken_Reinstate never touches
+-- Since the status axes were split, PolicyToken_Reinstate never touches
 -- status (the inferActiveStatus helper this test first exercised was
 -- deleted; see Types.daml).
 test_reinstateRestoresPartiallyPaidStatus : Script ()
@@ -1571,7 +1571,7 @@ test_reinstateRestoresPartiallyPaidStatus = script do
     exerciseCmd partiallyPaidCid PolicyToken_ServeNotice with
       noticeServiceDate = now
       noticeRecordedAt = now
-  -- Stage 4: reinstatement is from the NOTICE PERIOD only. The suspend hop
+  -- Reinstatement is from the NOTICE PERIOD only. The suspend hop
   -- this test used to make no longer exists -- after the period elapses the
   -- contract is terminated, and a terminated contract is not reinstatable.
   reinstatedCid <- submit insurer do
@@ -1671,10 +1671,10 @@ test_noticeFieldsEnsureRejectsMismatch = script do
       amendmentReason = None
 
 -- ---------------------------------------------------------------------------
--- Stage 3 Part 3, Part A -- the two status axes are independent
+-- The two status axes are independent
 -- ---------------------------------------------------------------------------
 
--- The defect this round fixes, proven at the ledger layer: a payout during
+-- The defect the split fixes, proven at the ledger layer: a payout during
 -- the grace period moves the CLAIM axis and must leave the DEFAULT axis
 -- exactly where it was. Before the split these shared one field, so the
 -- re-mint silently dropped the policy out of the default flow entirely.
@@ -1720,7 +1720,7 @@ test_payoutDuringGraceLeavesDefaultStateUntouched = script do
   assert (terminated.status == PS_PartiallyPaid)    -- claim history survives
 
 -- ---------------------------------------------------------------------------
--- Stage 3 Part 3, Part B -- endorsements
+-- Endorsements
 -- ---------------------------------------------------------------------------
 
 -- Default argument set for PolicyToken_Amend: changes nothing. Each test
@@ -1999,7 +1999,7 @@ test_amendObserverRolesCannotExercise = script do
   pure ()
 
 -- ---------------------------------------------------------------------------
--- Stage 3 Part 4 -- renewal (tecditname)
+-- Renewal (tecditname)
 -- ---------------------------------------------------------------------------
 
 -- Renewal is the one lifecycle mechanism that does NOT archive the policy it
@@ -2229,7 +2229,7 @@ test_amendPreservesPredecessorRef = script do
   assert (amended.version == 2)
 
 -- ---------------------------------------------------------------------------
--- Stage 4 -- closing the payout loop
+-- Closing the payout loop
 -- ---------------------------------------------------------------------------
 
 -- Drives a policy to a matched payout and returns the live PayoutApproved.
@@ -2316,7 +2316,7 @@ test_settlementRejectsRoleNotInPayoutDestination = script do
   pure ()
 
 -- A failed payout produces a review item that carries the link back to the
--- payout it came from, and the coverage it came from. Before Stage 4 only
+-- payout it came from, and the coverage it came from. Previously only
 -- policyId travelled, which is ambiguous once a policy has several payouts.
 test_markFailedCarriesSourceAndCoverage : Script ()
 test_markFailedCarriesSourceAndCoverage = script do
@@ -2788,8 +2788,8 @@ test_claimAmountWithoutMortgageeIsRejected = script do
       amendmentReason = None
 
 -- The m. 1456 sequence, end to end, on a policy that actually has a
--- mortgagee. Every one of these choices has existed since the termination
--- round and none had ever run against a token where `mortgagee` was Some.
+-- mortgagee. Every one of these choices had existed since termination was
+-- built, and none had ever run against a token where `mortgagee` was Some.
 test_mortgageeFlowsRunOnAPolicyThatHasOne : Script ()
 test_mortgageeFlowsRunOnAPolicyThatHasOne = script do
   (insurer, policyholder, insured, oracleOperator) <- setupParties
@@ -3268,7 +3268,7 @@ mintWithoutCover insurer policyholder insured oracleOperator =
       amendmentReason = None
 
 -- A minted policy has no cover until it is reported. This is the change to
--- Stage 1's founding assumption, asserted directly.
+-- the original design's assumption, asserted directly.
 test_mintedPolicyHasNoCoverUntilReported : Script ()
 test_mintedPolicyHasNoCoverUntilReported = script do
   (insurer, policyholder, insured, oracleOperator) <- setupParties

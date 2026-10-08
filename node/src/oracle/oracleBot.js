@@ -190,13 +190,13 @@ async function fetchExternalReading(cellId) {
   return readingFromResponse(cellId, await fetchProviderResponse(cellId));
 }
 
-// Stage 2 Part 2: cell_ids live on each coverage now, not the policy --
+// cell_ids live on each coverage, not the policy --
 // a package policy's coverages can watch entirely different cells (or
 // none). This fetches every coverage on the policy and loops
 // coverage-by-coverage, cell-by-cell within it, rather than the single
 // flat cell_ids loop this had when a policy could only have one coverage.
 //
-// Stage 2 Part 1 had this function fetch a reading, record it, and insert
+// An earlier version had this function fetch a reading, record it, and insert
 // one 'trigger' outbox row for it, keyed on reading_id. That was the defect
 // migration 030 closes: one event produced as many triggers as it had
 // readings, so a frost night polled every 15 minutes paid out once per poll.

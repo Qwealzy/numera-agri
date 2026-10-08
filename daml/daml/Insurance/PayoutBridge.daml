@@ -25,12 +25,12 @@ template PayoutApproved
     policyholder            : Party
     oracleOperator          : Party
     policyId                : Text
-    coverageCode            : Text   -- which of the policy's coverages this payout came from (Stage 2 Part 2)
-    -- The PolicyToken this payout was raised on. FIXED in Stage 4's
-    -- termination round: it was set with `show self` inside
+    coverageCode            : Text   -- which of the policy's coverages this payout came from
+    -- The PolicyToken this payout was raised on. It was once set with
+    -- `show self` inside
     -- PolicyToken_EvaluateTrigger, which on this participant renders the
     -- literal "<contract-id>" -- Canton redacts contract ids in `show` -- so
-    -- from Stage 1 until now it never carried a usable reference. The
+    -- for a long time it never carried a usable reference. The
     -- caller supplies the id it is exercising against instead.
     --
     -- This link matters more since termination: the token can be archived
@@ -58,7 +58,7 @@ template PayoutApproved
     payoutPercentage        : Decimal
     tierLabel                : Text
     isFullSettlement        : Bool
-    -- Snapshotted from the triggering coverage at approval time (Stage 4),
+    -- Snapshotted from the triggering coverage at approval time,
     -- so the ledger can check a reported settlement against the destination
     -- the policy actually specified. Without it the role check below would
     -- have nothing on-ledger to check against.
@@ -96,7 +96,7 @@ template PayoutApproved
       -- to a party that is not its recipient.
       (recipient == PDR_Mortgagee) == isSome mortgagee
 
-    -- Stage 4: the NORMAL path. The insurer has already paid, through its
+    -- The NORMAL path. The insurer has already paid, through its
     -- own systems, and is reporting that fact.
     --
     -- The ledger cannot verify that money moved -- nothing on-chain can.
@@ -158,7 +158,7 @@ template PayoutApproved
           bankReferenceDigest = bankReference
           recordedAt
 
-    -- Stage 4: the EXCEPTION path, and only that. Until Stage 4 every
+    -- The EXCEPTION path, and only that. Before the settlement path every
     -- payout came through here, because no settlement path existed and the
     -- dispatcher called this unconditionally. That is no longer the
     -- default: nothing routes a payout here automatically any more, and it
@@ -170,10 +170,10 @@ template PayoutApproved
         -- The link back to the payout this review item came from, passed in
         -- rather than derived. `show self` CANNOT be used: on this
         -- participant it renders the literal string "<contract-id>", not an
-        -- id -- Canton redacts contract ids in `show`. Found in Stage 4's
+        -- id -- Canton redacts contract ids in `show`. Found in a
         -- live verification, and the reason the pre-existing
         -- sourcePolicyContractId field on this template had been recording a
-        -- placeholder since Stage 1. That one was fixed the same way in v12
+        -- placeholder from the start. That one was fixed the same way in v12
         -- (PolicyToken_EvaluateTrigger now takes selfContractId); this
         -- comment is kept because the trap it describes is a property of the
         -- participant, not of either field.
@@ -195,7 +195,7 @@ template PayoutApproved
           policyholder
           policyId
           coverageCode
-          -- Before Stage 4 only policyId travelled, which is ambiguous the
+          -- Before this, only policyId travelled, which is ambiguous the
           -- moment a policy has more than one payout -- the chain back to
           -- the specific PayoutApproved was simply lost.
           sourcePayoutContractId
@@ -212,7 +212,7 @@ template PayoutApproved
           evidenceDigest
 
 -- Landing spot when a payout could not be settled through the normal path.
--- Until Stage 4 this had no choices at all beyond the implicit Archive, so
+-- Originally this had no choices at all beyond the implicit Archive, so
 -- a review item that was created could never be closed with a recorded
 -- outcome -- the queue only grew. It now has exactly two exits, and both
 -- record what happened. There is deliberately no third exit that discards
@@ -222,7 +222,7 @@ template ManualReviewRequired
     insurer                : Party
     policyholder           : Party
     policyId               : Text
-    coverageCode           : Text   -- carried through the whole chain (Stage 4)
+    coverageCode           : Text   -- carried through the whole chain
     sourcePayoutContractId : Text   -- contract id of the PayoutApproved this came from, supplied by the caller
     amount                 : Decimal
     currency               : Text

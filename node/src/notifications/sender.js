@@ -5,13 +5,13 @@ import { config } from '../config.js';
 import { buildEnvelope } from './envelope.js';
 import { deriveSecret, sign } from './signature.js';
 
-// Stage 2 Part 2: drains payout_notifications (migration 035). One POST per
+// Drains payout_notifications (migration 035). One POST per
 // due row, of the thin envelope (envelope.js), signed (signature.js), to the
 // address the insurer set with `npm run set-webhook`.
 //
 // Loopback only unless WEBHOOK_ALLOW_NON_LOOPBACK is 'true'. This is
-// the project's standing rule made mechanical: nothing is
-// delivered to a real insurer address before the lawyer answers. A row whose
+// a rule made mechanical: nothing is delivered to a real insurer
+// address until a legal review is complete. A row whose
 // address is not loopback is marked failed WITHOUT a request.
 //
 // last_error records a classification only -- 'http ' and the response code,

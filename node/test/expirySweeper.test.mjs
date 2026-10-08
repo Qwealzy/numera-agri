@@ -44,17 +44,15 @@ before(async () => {
 // Removes every row this file created, in FK dependency order, so a suite run
 // leaves the database as it found it.
 //
-// This exists for one screen: a fixture policy carrying `fake-cid` (or no
-// contract id) while still `active` is exactly what /debug/dashboard reports
-// as ORPHAN_SQL, so every run used to add noise to the one view that says
-// whether the system is healthy. The orphan detection is right -- it was the
-// fixtures that were wrong.
+// A fixture policy carrying `fake-cid` (or no contract id) while still
+// `active` has no matching token on the ledger, so a leftover one would read
+// as an orphan in the /debug/contracts reconciliation. The reconciliation is
+// right -- it was the fixtures that were wrong.
 //
 // Scoped by this file's own insurerId, so the three test files cannot delete
 // each other's rows, and nothing outside the fixtures is touched. Deleting by
-// insurer also sweeps the role registry whole, which matters: the v13 round
-// showed a mortgagee's or beneficiary's `policyholders` row survives a
-// policyholder-only sweep as residue.
+// insurer also sweeps the role registry whole, which matters: a mortgagee's or beneficiary's `policyholders` row survives a
+// policyholder-only sweep as residue otherwise.
 //
 // Two ordering traps, both learned by having them bite: `policy_events`
 // references `oracle_readings`, so outbox rows must go BEFORE the readings

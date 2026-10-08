@@ -20,7 +20,7 @@ import { evaluateAgainstTiers, basisFor } from './tiers.js';
 // Every ledger-changing action in this system enters through the
 // `policy_events` outbox and is processed here. No other code path in the
 // service may submit a command that changes the ledger -- oracleBot.js and
-// payoutListener.js (Stage 2 Part 1) only read the ledger and write outbox
+// payoutListener.js only read the ledger and write outbox
 // rows now. The one command the service sends from elsewhere is the probe
 // POST /debug/roles/try-insurer-trigger (routes/debug.js), mounted only while
 // DEBUG_ROUTES_ENABLED is 'true': it submits a trigger as the insurer that
@@ -109,7 +109,7 @@ export const EVENT_HANDLERS = {
 };
 
 async function notImplemented(event) {
-  throw new Error(`event type '${event.event_type}' is not implemented in stage 1`);
+  throw new Error(`event type '${event.event_type}' is not implemented`);
 }
 
 // Daml's PolicyStatus constructors -> SQL's policy_status enum values. The
@@ -126,7 +126,7 @@ const DAML_STATUS_TO_SQL = {
   PS_ManualReview: 'manual_review',
 };
 
-// The second, orthogonal axis (Stage 3 Part 3). PS_GracePeriod/PS_Suspended
+// The second, orthogonal axis. PS_GracePeriod/PS_Suspended
 // used to sit in the map above; they are DefaultState constructors now, not
 // PolicyStatus ones, and translate through here instead. Keeping the two
 // maps separate is what makes a status accidentally written to the wrong
@@ -140,7 +140,7 @@ const DAML_DEFAULT_STATE_TO_SQL = {
   DS_WithdrawnForFirstPremium: 'withdrawn_for_first_premium',
 };
 
-// Which predecessor statuses a renewal may be built on (Stage 3 Part 4).
+// Which predecessor statuses a renewal may be built on.
 // 'expired' is in the list on purpose and is in fact the NORMAL case -- a
 // policy that ran its full term and lapsed is the ordinary thing to renew.
 // 'claimed_and_closed' is deliberately absent: its limits were exhausted by
@@ -149,8 +149,8 @@ const DAML_DEFAULT_STATE_TO_SQL = {
 // renewed at all, whatever its claim status).
 const RENEWABLE_STATUSES = new Set(['active', 'partially_paid', 'expired']);
 
-// Daml's EndorsementReason constructors -> SQL's endorsement_reason enum
-// (Stage 3 Part 3). Same hand-kept-in-sync arrangement as the two maps
+// Daml's EndorsementReason constructors -> SQL's endorsement_reason enum.
+// Same hand-kept-in-sync arrangement as the two maps
 // above; an unmapped reason surfaces as a loud failure in
 // handleEndorsement rather than a NULL written into the column.
 const DAML_REASON_TO_SQL = {
@@ -169,8 +169,8 @@ const DAML_REASON_TO_SQL = {
 // ArchiveForExpiry re-mints nothing at all). Pulls the new contract id out
 // of the exercise result and the new version off that same contract's own
 // CreatedEvent in the same flat events array -- never by incrementing the
-// old SQL value blind, which is exactly the SQL-vs-ledger drift Stage 2
-// Part 1 existed to fix.
+// old SQL value blind, which is exactly the SQL-vs-ledger drift the outbox
+// exists to prevent.
 function readReMintResult(responseData, choiceName, event) {
   const commandId = responseData?.transaction?.commandId;
   const events = responseData?.transaction?.events ?? [];
@@ -298,7 +298,7 @@ export function policyTermInstant(dateStr) {
   return new Date(guessUtcMillis - offsetMillis).toISOString();
 }
 
-// Stage 3 Part 2 (Change D): the grace period is configuration, never a
+// The grace period is configuration, never a
 // literal. A policy's own grace_period_days wins; the insurer's
 // default_grace_period_days is the fallback; if NEITHER is set this throws
 // rather than assuming a number -- the statutory minimum is a legally
@@ -591,7 +591,7 @@ async function handleActivation(event, policy) {
     ? await ensurePolicyholderParty(policy.beneficiary_policyholder_id)
     : null;
 
-  // Stage 2 Part 2: each coverage was already fully resolved (tiers
+  // Each coverage was already fully resolved (tiers
   // snapshotted, payoutDestination derived) at creation time in
   // policies.js -- this just carries policy_coverages rows into the
   // token's coverages list as-is. Ordered by creation so the list is
@@ -661,7 +661,7 @@ async function handleActivation(event, policy) {
       mortgagee: mortgageeParty,
       oracleOperator: oracleOperatorParty,
       coverages,
-      // Stage 4: the term START, added so a refund under m. 1419 has the
+      // The term START, so a refund under m. 1419 has the
       // facts it needs on-ledger. Same noon-Europe/Istanbul conversion as
       // the term end.
       termStart: termStartInstant,
@@ -694,7 +694,7 @@ async function handleActivation(event, policy) {
       mortgageeContinuationEndsAt: null,
       mortgageeElection: null,
       status: 'PS_Active',
-      // Second axis (Stage 3 Part 3) -- every policy mints with no premium
+      // Second axis -- every policy mints with no premium
       // default outstanding.
       defaultState: 'DS_None',
       documentHash: policy.document_hash ?? null,
@@ -749,7 +749,7 @@ async function handleActivation(event, policy) {
 }
 
 // Exercises PolicyToken_EvaluateTrigger for one 'trigger' outbox row.
-// oracleBot.js no longer exercises anything itself (Stage 2 Part 1) -- it
+// oracleBot.js exercises nothing itself -- it
 // only fetches a reading, writes it to oracle_readings, and inserts this
 // row; observedValue/metric/coverageCode travel in `payload`, keyed for
 // idempotency on `trigger_window_id` since migration 030 (`reading_id`, the
@@ -1065,7 +1065,7 @@ async function handleTrigger(event, policy) {
     argument: {
       // Supplied because `show self` renders a redacted placeholder on this
       // participant -- recorded onto PayoutApproved.sourcePolicyContractId,
-      // which never carried a usable value before Stage 4.
+      // which once carried that placeholder instead of a usable id.
       selfContractId: policy.daml_contract_id,
       coverageCode,
       observedValue: String(observedValue),
@@ -1135,8 +1135,8 @@ async function handleTrigger(event, policy) {
   // entirely -- there is no re-mint then) is where the real new `version`
   // and the triggered coverage's real new remainingLimit come from.
   // Reading it here, instead of incrementing the old SQL value blind, is
-  // what closes the SQL-says-1/ledger-says-2 gap Stage 2 Part 1 exists to
-  // fix. Every other coverage in that same CreatedEvent is byte-for-byte
+  // what closes the SQL-says-1/ledger-says-2 gap the outbox exists to
+  // prevent. Every other coverage in that same CreatedEvent is byte-for-byte
   // what it already was -- nothing here touches their SQL rows at all.
   const newTokenPayload = newPolicyCid
     ? events.find(
@@ -1308,7 +1308,7 @@ async function handleTrigger(event, policy) {
           kind: 'review_required',
         });
       }
-      // Stage 4: this used to queue a `settlement` row here, which the
+      // This used to queue a `settlement` row here, which the
       // dispatcher processed by unconditionally exercising MarkFailed --
       // that is precisely how every payout landed in manual_review
       // automatically, and why the queue only ever grew. A payout now stays
@@ -1326,7 +1326,7 @@ async function handleTrigger(event, policy) {
   };
 }
 
-// Stage 4: the settlement path, and the only way a payout ever ends.
+// The settlement path, and the only way a payout ever ends.
 //
 // THE PLATFORM NEVER MOVES MONEY. The insurer settles the indemnity through
 // its own banking systems and then REPORTS that fact here; this handler
@@ -1344,7 +1344,7 @@ async function handleTrigger(event, policy) {
 //   resolve_unpaid  -> ManualReviewRequired_ResolveUnpaid        (review exit 2)
 //
 // Every one is initiated by the insurer through the API. NOTHING here fires
-// on a timer, on a poll, or by inference -- before Stage 4 this handler
+// on a timer, on a poll, or by inference -- an earlier version of this handler
 // unconditionally exercised MarkFailed on every payout the moment it
 // existed, which is why the manual-review queue only grew. That automatic
 // routing is gone: handleTrigger no longer queues a settlement row, and
@@ -1640,7 +1640,7 @@ async function handleSettlement(event, policy) {
 
   // 'fail' supersedes rather than resolves: the payout is not finished, it
   // has moved to a review item that still has to end somewhere. Only the
-  // three terminal actions stamp resolved_at, which is what the debug dashboard,
+  // three terminal actions stamp resolved_at, which is what /debug/contracts,
   // the story page and the unresolved index key off.
   const resolvesNow = action !== 'fail';
 
@@ -1756,7 +1756,7 @@ async function handleExpiry(event, policy) {
   };
 }
 
-// Stage 3 Part 2, step 1 of 3: exercises PolicyToken_ServeNotice for one
+// Premium default, step 1 of 3: exercises PolicyToken_ServeNotice for one
 // 'notice' outbox row. Coverage CONTINUES through the grace period -- this
 // only records the notice and moves the policy to grace_period status;
 // coverageValidThrough is deliberately untouched (see PolicyToken.daml).
@@ -1814,7 +1814,7 @@ async function handleNotice(event, policy) {
     contractId: newContractId,
     commandId,
     writeBack: async (txClient) => {
-      // Stage 3 Part 3: moves the DEFAULT axis only. `status` is
+      // Moves the DEFAULT axis only. `status` is
       // deliberately absent from this UPDATE -- a partially-paid policy
       // stays partially paid while also entering its grace period.
       await txClient.query(
@@ -1849,7 +1849,7 @@ async function handleNotice(event, policy) {
   };
 }
 
-// Stage 4, PHASE ONE of termination. Exercises PolicyToken_Terminate for one
+// PHASE ONE of termination. Exercises PolicyToken_Terminate for one
 // 'termination' outbox row, written only by sweepers/graceSweeper.js, which
 // never calls the ledger itself.
 //
@@ -1976,9 +1976,9 @@ async function handleTermination(event, policy) {
   };
 }
 
-// Stage 4, PHASE TWO of termination. Exercises PolicyToken_ArchiveForNonPayment
-// -- the choice that has existed, compiled and been tested since Stage 1 and
-// was called by nothing until now.
+// PHASE TWO of termination. Exercises PolicyToken_ArchiveForNonPayment
+// -- a choice that long existed, compiled and tested, before anything
+// called it.
 //
 // Termination ends the CONTRACT; this ends the TOKEN, and the two are
 // deliberately separate events. A loss during the notice period is payable,
@@ -2068,7 +2068,7 @@ async function handleTerminationArchive(event, policy) {
   };
 }
 
-// Stage 4, m. 1456(4): records that the insurer says it notified a known
+// m. 1456(4): records that the insurer says it notified a known
 // real-right holder of the policyholder's default and of the notice served.
 // The date is the insurer's REPORTED date, like the service date -- this
 // system generates and sends nothing, and cannot observe a notification.
@@ -2116,7 +2116,7 @@ async function handleMortgageeNotice(event, policy) {
   };
 }
 
-// Stage 4, m. 1456(5): the real-right holder's election within the
+// m. 1456(5): the real-right holder's election within the
 // continuation window, recorded if one is reported. RECORDED ONLY -- the
 // takeover itself is deliberately not implemented, and nothing in this
 // system acts on ME_Continue.
@@ -2163,13 +2163,13 @@ async function handleMortgageeElection(event, policy) {
   };
 }
 
-// Stage 3 Part 2, step 3 of 3: exercises PolicyToken_Reinstate for one
+// Premium default, step 3 of 3: exercises PolicyToken_Reinstate for one
 // 'reinstatement' outbox row. The SAME policy resumes -- no new policyNo,
 // no new token identity beyond the usual re-mint, no extension of expiry
 // or the term (the Daml choice restores coverageValidThrough to `expiry`
 // itself, which never moved).
 //
-// Stage 4 narrowed this to the grace period ONLY. It used to be reachable
+// This is narrowed to the grace period ONLY. It used to be reachable
 // from a suspended policy as well, on the theory that payment could arrive
 // after the period elapsed and revive the cover. Under TTK 6102 m. 1434(3)
 // there is nothing left to revive: the contract is `feshedilmiş olur` at
@@ -2180,8 +2180,8 @@ async function handleMortgageeElection(event, policy) {
 // backfilled: coverage ran in full throughout the notice period and a loss
 // during it is payable.
 //
-// Stage 3 Part 3: this now clears the DEFAULT axis only and leaves `status`
-// exactly as it was. Part 2's version had to reconstruct whether the policy
+// This clears the DEFAULT axis only and leaves `status`
+// exactly as it was. An earlier version had to reconstruct whether the policy
 // came back as active or partially_paid, because the default states were
 // packed into the same field; with the axes split there is nothing to
 // reconstruct -- a policy that was partially paid before it defaulted is
@@ -2265,7 +2265,7 @@ export function isNumeric14_2Amount(value) {
     Number(value) > 0;
 }
 
-// Stage 3 Part 3, Part B: exercises PolicyToken_Amend for one 'endorsement'
+// Exercises PolicyToken_Amend for one 'endorsement'
 // outbox row -- the third lifecycle mechanism, alongside the claim path
 // (trigger) and the premium-default path (notice/termination/reinstatement).
 //
@@ -2529,7 +2529,7 @@ async function handleEndorsement(event, policy) {
               // `?? null`, not a bare read: a None Optional INSIDE a nested
               // record comes back from the JSON API with the key ABSENT
               // entirely, not as null -- unlike a None at template level,
-              // which is present and null. Found by the v13 wire check. pg
+              // which is present and null. Found by a wire check. pg
               // happens to coerce undefined to NULL, but relying on that is
               // relying on two libraries agreeing by accident.
               c.mortgageeClaimAmount ?? null,
@@ -2589,7 +2589,7 @@ async function handleEndorsement(event, policy) {
   };
 }
 
-// Stage 3 Part 4: renewal (tecditname) -- the last lifecycle mechanism, and
+// Renewal (tecditname) -- the last lifecycle mechanism, and
 // the only one that does NOT archive-and-re-mint the policy it acts on.
 //
 // A renewal opens a NEW risk period as a NEW policy (new policyNo, new
@@ -2839,7 +2839,7 @@ async function handleRenewal(event, predecessor) {
       mortgagee: mortgageeParty,
       oracleOperator: oracleOperatorParty,
       coverages,
-      // Stage 4: the term START, added so a refund under m. 1419 has the
+      // The term START, so a refund under m. 1419 has the
       // facts it needs on-ledger. Same noon-Europe/Istanbul conversion as
       // the term end.
       termStart: termStartInstant,
@@ -4042,7 +4042,7 @@ function makeWithdrawalHandler(path) {
   };
 }
 
-// A ledger outage, stage 1 of the outage handling: the dispatcher stops CLAIMING rows
+// A ledger outage: the dispatcher stops CLAIMING rows
 // rather than failing them. A claimed row can only reach done or failed (the
 // table's own trigger), and failed is terminal -- so claiming through an
 // outage would burn every pending row for as long as it lasted. Left pending,

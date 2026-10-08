@@ -3,7 +3,7 @@ module Insurance.Types where
 import DA.Optional (isNone)
 import qualified DA.Text as T
 
--- One row of the parametric payout matrix (Module 2). Bounds are inclusive;
+-- One row of the parametric payout matrix. Bounds are inclusive;
 -- None means unbounded on that side. Confirm inclusive/exclusive boundary
 -- semantics with underwriting before relying on exact-threshold behavior --
 -- this is a real money question at the boundary, not just a style choice.
@@ -45,7 +45,7 @@ data PayoutBasis
 -- token exists has nothing on-chain to hold a status field in the first
 -- place.
 --
--- Stage 3 Part 3: this type is now CLAIM/TERM state only. The
+-- This type is CLAIM/TERM state only. The
 -- premium-default states that used to live here (PS_GracePeriod,
 -- PS_Suspended) moved to DefaultState below, because they are a second,
 -- orthogonal axis -- see that type's comment for the defect that proved
@@ -61,7 +61,7 @@ data PolicyStatus
   | PS_ManualReview
   deriving (Eq, Show)
 
--- Stage 3 Part 3: the premium-default axis, deliberately separate from
+-- The premium-default axis, deliberately separate from
 -- PolicyStatus above. These two are orthogonal -- a policy can be
 -- partially paid AND in its grace period at the same time, and one field
 -- cannot express that.
@@ -72,15 +72,15 @@ data PolicyStatus
 -- that same field) never saw the policy again, so it was never suspended
 -- even though the premium was still unpaid, and the notice index blocked
 -- serving a second notice to recover. Found in live verification at the
--- end of Stage 3 Part 2, fixed here by splitting the axes rather than by
+-- end of the premium-default work, fixed here by splitting the axes rather than by
 -- special-casing the trigger.
 --
 -- Movement on the two axes is fully independent: a payout changes
 -- PolicyStatus and never touches DefaultState; serving notice, terminating,
 -- and reinstating change DefaultState and never touch PolicyStatus.
 --
--- Stage 4 (termination): DS_Suspended is GONE, and its removal is the whole
--- point of this round. The implemented model had the contract survive the
+-- Termination: DS_Suspended is GONE, and its removal is deliberate.
+-- The earlier model had the contract survive the
 -- notice period with coverage merely stopped, which conflicts with TTK 6102
 -- m. 1434(3): at the end of the notice period the contract is
 -- `feshedilmiş olur` -- deemed terminated. That is a consequence, not a
@@ -188,7 +188,7 @@ data EnforcementRoute
   | ER_Dava    -- a lawsuit
   deriving (Eq, Show)
 
--- Stage 4: what a known real-right holder (the mortgagee) elected to do
+-- What a known real-right holder (the mortgagee) elected to do
 -- within the continuation window m. 1456(5) opens at termination. Recorded
 -- only -- the takeover itself is deliberately not implemented, so nothing
 -- in this system acts on an election beyond writing it down.
@@ -197,7 +197,7 @@ data MortgageeElection
   | ME_Decline    -- elected not to
   deriving (Eq, Show)
 
--- Stage 4: why an approved indemnity legitimately never settles. These are
+-- Why an approved indemnity legitimately never settles. These are
 -- outcomes, not failures to pay -- a failure to pay is
 -- PayoutApproved_MarkFailed, which produces a review item that is still
 -- expected to end somewhere. This enum is where a review item ends when the
@@ -218,7 +218,7 @@ data UnpaidReason
 -- Same taxonomy as sql/schema.sql's `document_type` enum -- keep the two in
 -- sync by hand, there's no way to share a single definition across SQL and
 -- Daml. Not referenced by any template/choice yet: schema only, no
--- document-type handling is implemented in this stage.
+-- document-type handling is implemented.
 data DocumentType
   = DT_Offer
   | DT_Endorsement
@@ -248,7 +248,7 @@ data EndorsementReason
 -- Which stakeholder role a payout should route to. A list, not a single
 -- value, so a later multi-recipient split (e.g. part to mortgagee, part to
 -- beneficiary) can be expressed without changing the token's field shape
--- again. Not acted on in this stage -- routing/splitting logic is Stage 2.
+-- again.
 data PayoutDestinationRole
   = PDR_Beneficiary
   | PDR_Mortgagee
@@ -283,7 +283,7 @@ data UnroutedReason
       -- repository. So nothing routes.
   deriving (Eq, Show)
 
--- Stage 2 Part 2: one coverage within a package policy (e.g. fire, theft,
+-- One coverage within a package policy (e.g. fire, theft,
 -- glass on a single home policy). Each coverage is fully independent --
 -- its own sum insured, its own remaining limit, its own tier matrix, its
 -- own payout destination, and (if the policy has a mortgagee) its own
@@ -341,10 +341,10 @@ allDistinct : Eq a => [a] -> Bool
 allDistinct [] = True
 allDistinct (x :: xs) = notElem x xs && allDistinct xs
 
--- (Stage 3 Part 2 had an `inferActiveStatus` helper here, which
+-- (An earlier version had an `inferActiveStatus` helper here, which
 -- PolicyToken_Reinstate used to reconstruct whether a policy should come
--- back as PS_Active or PS_PartiallyPaid. Splitting the two status axes in
--- Part 3 removed the need for it entirely: reinstatement now only clears
+-- back as PS_Active or PS_PartiallyPaid. Splitting the two status axes
+-- removed the need for it entirely: reinstatement now only clears
 -- DefaultState back to DS_None and never touches PolicyStatus, so there is
 -- nothing left to reconstruct. Deleted rather than left dead, because a
 -- status-inferring helper sitting next to a status field would imply

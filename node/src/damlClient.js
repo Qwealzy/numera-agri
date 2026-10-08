@@ -101,8 +101,8 @@ function clientFor(baseURL) {
   // Canton returns a structured error body ({ code, cause, correlationId, ... })
   // that axios's own message throws away, leaving only "Request failed with
   // status code 400" -- useless in a failed outbox row, where the whole point
-  // is that a human can later read WHY a ledger action was refused. Stage 3
-  // Part 2 depends on this directly: a trigger against a terminated policy is
+  // is that a human can later read WHY a ledger action was refused. The
+  // premium-default flow depends on this directly: a trigger against a terminated policy is
   // required to leave a failed row stating the reason, and the reason lives
   // in `cause`. Enrich the message in place and leave err.response intact for
   // anything that wants the raw body.
@@ -218,7 +218,7 @@ export async function revokeUserRights(userId, rights, { endpoint } = {}) {
   return data.newlyRevokedRights ?? [];
 }
 
-// Module 1: allocate a fresh Canton Party (used for both insurers and
+// Allocates a fresh Canton Party (used for both insurers and
 // policyholders -- the caller decides the display name / hint).
 export async function allocateParty(displayName, partyIdHint, { grantActAs, endpoint } = {}) {
   const { data } = await clientFor(resolveEndpoint(endpoint)).post('/v2/parties', {

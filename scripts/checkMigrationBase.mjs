@@ -3,8 +3,8 @@
 // schema.sql is a mirror of the numbered migrations and is verified to apply
 // to an empty database on its own. The migrations are the other half of that
 // claim, and nobody had ever tested them from nothing -- migration 001's own
-// header says it expects "schema.sql + the round-8 migration" to have been
-// applied first, so the schema that PREDATES the outbox is the base, and it
+// header says it expects the earlier schema.sql and the migration that
+// followed it to have been applied first, so the schema that PREDATES the outbox is the base, and it
 // is not in the repository.
 //
 // This creates a THROWAWAY database, applies both paths, and reports. It

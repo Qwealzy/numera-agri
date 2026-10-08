@@ -1,4 +1,4 @@
-// Stage 2 Part 3: the payout record the insurer reads from the two GET
+// The payout record the insurer reads from the two GET
 // endpoints (routes/policies.js). The webhook carries only the thin envelope
 // (envelope.js); everything else about a payout is this record, fetched with
 // the insurer's own API key (a design rule of the notification

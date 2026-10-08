@@ -1,10 +1,10 @@
 -- ============================================================================
--- Drop eft_transactions, the last remnant of the abandoned Stage 1 EFT design.
+-- Drop eft_transactions, the last remnant of an abandoned early EFT design.
 --
 -- It was declared in the original schema and NEVER had a writer: no INSERT,
 -- UPDATE or SELECT targeting it exists anywhere in node/src, and the live
 -- table held zero rows when this ran. Its `destination_iban TEXT NOT NULL`
--- contradicts the standing rule that this platform holds no funds,
+-- contradicts the rule that this platform holds no funds,
 -- instructs no payments, and stores no account numbers -- there is no IBAN
 -- anywhere else in the system, and none may be added.
 --

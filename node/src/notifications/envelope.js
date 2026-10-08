@@ -1,4 +1,4 @@
-// Stage 2 Part 2: the webhook body. The thin envelope, and nothing else
+// The webhook body. The thin envelope, and nothing else
 // (a design rule of the notification contract):
 // which notification, what kind, which payout, when, and the envelope's own
 // version. Amount, recipient role, the insurer's customer reference, coverage

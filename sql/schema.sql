@@ -40,7 +40,7 @@ CREATE TYPE party_allocation_status AS ENUM ('PENDING', 'ALLOCATED', 'FAILED');
 -- same state. 'pending_mint' is the one SQL-only exception: there is no
 -- token yet at that point, so Daml has no contract to hold a status field
 -- for it in the first place.
--- CLAIM/TERM axis only, as of Stage 3 Part 3. The premium-default states
+-- CLAIM/TERM axis only (since migration 010). The premium-default states
 -- moved to `default_state` below -- the two are orthogonal (a policy can be
 -- partially paid AND in its grace period at once) and packing both into
 -- this one column caused a real defect: see migration 010's header and the
@@ -75,8 +75,8 @@ CREATE TYPE party_allocation_status AS ENUM ('PENDING', 'ALLOCATED', 'FAILED');
 CREATE TYPE policy_status AS ENUM (
   'pending_mint',        -- SQL row exists, Daml Create not yet confirmed
   'active',
-  'grace_period',         -- DEAD as of Stage 3 Part 3 -- historical rows only, use default_state
-  'suspended',            -- DEAD as of Stage 3 Part 3 -- historical rows only, use default_state
+  'grace_period',         -- DEAD since migration 010 -- historical rows only, use default_state
+  'suspended',            -- DEAD since migration 010 -- historical rows only, use default_state
   'partially_paid',      -- one or more partial payouts fired, NFT re-minted at a reduced limit
   'expired',              -- burned: reached expiry with no outstanding claim
   'cancelled',            -- burned: non-payment past the grace period
@@ -84,7 +84,7 @@ CREATE TYPE policy_status AS ENUM (
   'manual_review'
 );
 
--- The premium-default axis (Stage 3 Part 3), deliberately separate from
+-- The premium-default axis, deliberately separate from
 -- policy_status above and moved independently of it: a payout changes only
 -- `status`, and notice/termination/reinstatement change only `default_state`.
 -- Shares its vocabulary with Daml's DefaultState (Insurance/Types.daml),
@@ -92,7 +92,7 @@ CREATE TYPE policy_status AS ENUM (
 --   none         -- no notice outstanding; premium not in default
 --   grace_period -- notice served; coverage CONTINUES in full, losses payable
 --   terminated   -- notice period elapsed unpaid; the CONTRACT has ended
---   suspended    -- DEAD (Stage 4, migration 013). The suspension model was
+--   suspended    -- DEAD (migration 013). The suspension model was
 --                   wrong on TTK 6102 m. 1434(3): at the end of the notice
 --                   period the contract is `feshedilmiş olur`, terminated,
 --                   not suspended -- and m. 1452(3) makes m. 1434
@@ -147,9 +147,9 @@ CREATE TYPE endorsement_reason AS ENUM (
 -- Same lowercase-with-underscores convention as policy_status -- not the
 -- same shared vocabulary (this one has no Daml counterpart), just the same
 -- spelling style throughout the schema.
--- Stage 4: 'settled' and 'closed_unpaid' are the two terminal states a
+-- 'settled' and 'closed_unpaid' are the two terminal states a
 -- payout can reach. The 'eft_*' values are DEAD -- named for an Open Banking
--- bridge removed in Stage 1 Cleanup that is not coming back; they remain
+-- bridge removed early on that is not coming back; they remain
 -- only because Postgres cannot drop an enum value without recreating the
 -- type and every dependent object. Do not write them.
 CREATE TYPE payout_event_status AS ENUM (
@@ -247,7 +247,7 @@ CREATE TABLE policyholders (
 );
 
 -- ---------------------------------------------------------------------------
--- 3. payout_tiers -- Module 2: the tiered payout matrix, configured per
+-- 3. payout_tiers -- the tiered payout matrix, configured per
 --    insurer + product + peril. Snapshotted at policy creation and at the
 --    renewal request and carried onto the Daml PolicyToken contract, so
 --    evaluation stays fully on-ledger and auditable -- editing a row here
@@ -303,7 +303,7 @@ ALTER TABLE payout_tiers ADD CONSTRAINT payout_tiers_payout_percentage_range
 --    policyholder, reused across all of their policies). current_version
 --    mirrors the token's on-ledger `version` field -- 0 until activated --
 --    and is what every event's `expected_version` is checked against.
---    Stage 2 Part 2: product_code/peril_type/cell_ids/sum_insured/
+--    product_code/peril_type/cell_ids/sum_insured/
 --    remaining_limit/payout_tiers_snapshot moved to policy_coverages
 --    (below) -- a package policy has one premium and one term but several
 --    independent coverages, each with its own values; this table now only
@@ -318,12 +318,12 @@ CREATE TABLE policies (
   start_date          DATE NOT NULL,
   end_date            DATE NOT NULL CHECK (end_date > start_date),
   status              policy_status NOT NULL DEFAULT 'pending_mint',
-  -- Premium-default axis, independent of `status` above (Stage 3 Part 3).
+  -- Premium-default axis, independent of `status` above.
   -- 'none' is the state machine's initial state, not a business default.
   default_state       default_state NOT NULL DEFAULT 'none',
   current_version     INTEGER NOT NULL DEFAULT 0,    -- mirrors the token's on-ledger `version`; 0 = not yet activated
   daml_contract_id    TEXT,                          -- current active PolicyToken cid; changes on every archive+re-create
-  -- Stage 3 Part 1: mirrors the token's own absolute `expiry` instant
+  -- Mirrors the token's own absolute `expiry` instant
   -- (noon local time, Europe/Istanbul, computed once in dispatcher.js's
   -- handleActivation and written here the same time as current_version)
   -- so expirySweeper.js can query "expiry in the past" without
@@ -331,7 +331,7 @@ CREATE TABLE policies (
   -- activated; afterwards an endorsement's write-back moves it to the
   -- re-minted token's expiry.
   expiry              TIMESTAMPTZ,
-  -- Stage 3 Part 2: this policy's own grace period, if it overrides the
+  -- This policy's own grace period, if it overrides the
   -- insurer's default (insurers.default_grace_period_days). Nullable, no
   -- SQL default -- see that column's comment for why there is no literal
   -- fallback number anywhere.
@@ -553,10 +553,10 @@ CREATE TABLE policies (
   withdrawn_at             TIMESTAMPTZ,
   withdrawal_path          TEXT,
   -- The policy term's start instant (noon Europe/Istanbul), mirroring the
-  -- token's termStart. Stage 4 added it because "days unrun" could not be
+  -- token's termStart. It exists because "days unrun" could not be
   -- derived from the contract alone without it. NULL until activated.
   term_start          TIMESTAMPTZ,
-  -- Stage 4 termination (m. 1434(3)), written together by handleTermination.
+  -- Termination (m. 1434(3)), written together by handleTermination.
   -- terminated_at is DERIVED FROM THE NOTICE -- the externally supplied
   -- service date plus this policy's own grace period -- never a clock
   -- reading, so a sweeper that runs late records the same instant it would
@@ -589,9 +589,9 @@ CREATE TABLE policies (
   mortgagee_election             TEXT,
   mortgagee_election_at          TIMESTAMPTZ,
   -- Mirrors the token's own amendmentReason -- why the most recent
-  -- endorsement happened (Stage 3 Part 3). NULL until first amended.
+  -- endorsement happened. NULL until first amended.
   last_amendment_reason endorsement_reason,
-  -- The renewal chain (Stage 3 Part 4), navigable in both directions
+  -- The renewal chain, navigable in both directions
   -- without walking the ledger. A renewal mints a NEW policy row; these
   -- link it to the period it succeeds. renewed_by_policy_id doubles as the
   -- "already renewed" guard -- a period is succeeded exactly once -- and
@@ -683,9 +683,9 @@ ALTER TABLE policies ADD CONSTRAINT policies_withdrawal_path_known
 CREATE INDEX idx_policies_first_premium_open
   ON policies (premium_due_date)
   WHERE default_state = 'first_premium_unpaid' AND enforcement_commenced_at IS NULL;
--- Change C: policies whose cover never began. They cannot be swept -- the
+-- Policies whose cover never began. They cannot be swept -- the
 -- text gives no basis to end a contract merely because cover has not
--- started -- so the dashboards surface them as inert instead.
+-- started -- so /debug/contracts surfaces them as inert instead.
 CREATE INDEX idx_policies_cover_not_begun
   ON policies (created_at)
   WHERE coverage_began_at IS NULL AND status NOT IN ('expired', 'cancelled', 'claimed_and_closed');
@@ -720,7 +720,7 @@ CREATE INDEX idx_policies_mortgagee ON policies (mortgagee_policyholder_id)
   WHERE mortgagee_policyholder_id IS NOT NULL;
 CREATE INDEX idx_policies_expiry_open ON policies(expiry) WHERE status IN ('active', 'partially_paid');
 -- Phase two of termination: terminated contracts whose token is still live
--- because a payout raised on it had not yet resolved (Stage 4).
+-- because a payout raised on it had not yet resolved.
 CREATE INDEX idx_policies_terminated_unarchived
   ON policies (terminated_at)
   WHERE default_state = 'terminated' AND daml_contract_id IS NOT NULL;
@@ -731,7 +731,7 @@ CREATE UNIQUE INDEX idx_policies_renewed_by_unique
   ON policies (renewed_by_policy_id) WHERE renewed_by_policy_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
--- 4z. policy_coverages -- Stage 2 Part 2: one row per coverage on a
+-- 4z. policy_coverages -- one row per coverage on a
 --    package policy (fire, theft, glass, ... -- or just one row for a
 --    single-coverage product like today's frost policy, no special case).
 --    Mirrors the Daml token's own Coverage record field-for-field.
@@ -934,7 +934,7 @@ CREATE TRIGGER trg_attested_evidence_no_truncate
   FOR EACH STATEMENT EXECUTE FUNCTION refuse_attested_evidence_removal();
 
 -- ---------------------------------------------------------------------------
--- 4a. oracle_readings -- Module 4: raw readings ingested by the oracle bot
+-- 4a. oracle_readings -- raw readings ingested by the oracle bot
 --    before/after being submitted to the ledger via EvaluateTrigger.
 --
 --    Declared HERE, before policy_events, because policy_events.reading_id
@@ -944,7 +944,7 @@ CREATE TRIGGER trg_attested_evidence_no_truncate
 CREATE TABLE oracle_readings (
   id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   policy_id             UUID NOT NULL REFERENCES policies(id),
-  coverage_code         TEXT NOT NULL,                -- which of the policy's coverages this cell belongs to (Stage 2 Part 2)
+  coverage_code         TEXT NOT NULL,                -- which of the policy's coverages this cell belongs to
   cell_id               TEXT NOT NULL,
   metric                TEXT NOT NULL,               -- e.g. TEMPERATURE_C
   value                 NUMERIC(12,4) NOT NULL,
@@ -1028,7 +1028,7 @@ ALTER TABLE trigger_windows ADD CONSTRAINT trigger_windows_event_interval
 --    write-back that failed after the ledger already succeeded) is never
 --    auto-retried, rebased, or cleaned up -- it waits for a human.
 -- ---------------------------------------------------------------------------
--- 'suspension' is DEAD from Stage 4 on -- see the default_state comment.
+-- 'suspension' is DEAD since migration 013 -- see the default_state comment.
 -- Nothing writes it; historical rows carrying it stay readable.
 -- ORDER DIVERGENCE, deliberate and recorded -- the same case as
 -- policy_status above, and the full reasoning is there. This list is grouped
@@ -1084,7 +1084,7 @@ CREATE UNIQUE INDEX idx_policy_events_trigger_key
 -- node/test/dispatcher.test.mjs still writes one.
 CREATE UNIQUE INDEX idx_policy_events_trigger_window_key
   ON policy_events (trigger_window_id) WHERE event_type = 'trigger' AND trigger_window_id IS NOT NULL;
--- In-flight only (Stage 4), like every other lifecycle event type since
+-- In-flight only, like every other lifecycle event type since
 -- migration 010: a rejected settlement report must not permanently consume
 -- a payout's only chance to be reported on. "A payout ends once" is
 -- enforced by handleSettlement's resolved_at check and by the ledger.
@@ -1093,10 +1093,10 @@ CREATE UNIQUE INDEX idx_policy_events_settlement_key
   WHERE event_type = 'settlement' AND status IN ('pending', 'processing');
 CREATE UNIQUE INDEX idx_policy_events_expiry_key
   ON policy_events (policy_no) WHERE event_type = 'expiry';
--- Stage 3 Part 3 re-scoped these four from "once per policy, ever" to
+-- Migration 010 re-scoped these four from "once per policy, ever" to
 -- "at most one IN FLIGHT per policy". The old shape made a second default
 -- cycle impossible -- a reinstated policy could never receive a later
--- notice -- which was a known limitation in Part 2 and is fixed here.
+-- notice -- which was a known limitation of migration 009 and is fixed here.
 -- Restricting to pending/processing keeps the guarantee that actually
 -- mattered (never queue the same action twice concurrently) while allowing
 -- a policy to default, be reinstated, and default again; endorsements
@@ -1190,7 +1190,7 @@ CREATE TYPE document_type AS ENUM ('offer', 'endorsement', 'renewal', 'release',
 
 -- (endorsement_reason is declared up in the enumerations block near the top
 -- of this file, not here where it used to sit -- `policies` gained a
--- last_amendment_reason column of that type in Stage 3 Part 3, and
+-- last_amendment_reason column of that type in migration 010, and
 -- `policies` is created well before this section, so the type has to exist
 -- by then for a fresh top-to-bottom run of this file to work.)
 
@@ -1226,7 +1226,7 @@ CREATE TABLE policy_status_history (
   event_type            event_type,
   old_status            policy_status,
   new_status            policy_status NOT NULL,
-  -- The premium-default axis (Stage 3 Part 3). Both NULL on an event that
+  -- The premium-default axis. Both NULL on an event that
   -- moved only the claim axis; both set on notice, termination,
   -- reinstatement and the first-premium and two-notice events, which move
   -- only this one and leave status unchanged ('suspension' is dead -- see
@@ -1249,7 +1249,7 @@ CREATE TABLE policy_status_history (
 CREATE TABLE payout_events (
   id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   policy_id            UUID NOT NULL REFERENCES policies(id),
-  coverage_code        TEXT NOT NULL,               -- which coverage this payout came from (Stage 2 Part 2)
+  coverage_code        TEXT NOT NULL,               -- which coverage this payout came from
   oracle_reading_id    UUID REFERENCES oracle_readings(id),
   trigger_window_id    UUID REFERENCES trigger_windows(id), -- the aggregated event that caused this payout (migration 031); names every reading, including a mean's
   tier_label           TEXT,
@@ -1292,7 +1292,7 @@ CREATE TABLE payout_events (
   -- ManualReviewRequired_Resolve* paths as a failed payout, inheriting
   -- close-unpaid and resolve-settled rather than needing a second queue.
   record_kind          TEXT NOT NULL DEFAULT 'payout',
-  -- Stage 4. The platform never moves money: bank_reference is an opaque
+  -- The platform never moves money: bank_reference is an opaque
   -- string the insurer reports AFTER settling through its own systems, not
   -- a means of paying, and settled_at is its reported date -- an external
   -- fact like notice_service_date, never a system clock reading. No IBAN or

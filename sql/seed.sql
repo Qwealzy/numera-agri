@@ -9,7 +9,7 @@
 --   below -4C  -> 100%
 --
 -- NOTE: only those two bands are inserted. The gap between -4C and -2C was
--- left unspecified in the brief -- a reading that lands there will match no
+-- left unspecified in the product specification -- a reading that lands there will match no
 -- tier and pay nothing (fails closed) until a row is added for it. That is
 -- deliberate: better to leave a visible gap than invent an actuarial number.
 -- Add the missing band here once underwriting confirms it.

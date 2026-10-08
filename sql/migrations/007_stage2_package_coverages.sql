@@ -1,5 +1,5 @@
 -- ============================================================================
--- Stage 2 Part 2: package policies (multiple coverages per token).
+-- Package policies (multiple coverages per token).
 --
 -- sumInsured/remainingLimit/payoutTiers/payoutDestination/
 -- mortgageeClaimAmount move off `policies` onto their own per-coverage

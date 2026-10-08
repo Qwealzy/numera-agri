@@ -226,7 +226,7 @@ function inlineTierSet(coverageInput) {
 
 // Resolves and snapshots one coverage's tier matrix at creation time -- not
 // re-read at mint time, which may be much later depending on when the
-// policy is activated. See Module 2 note in the README. Throws a 422 if
+// policy is activated. See the tiered payout matrix note in the README. Throws a 422 if
 // the insurer hasn't configured tiers for this coverage's product/peril,
 // unless the coverage carries its own payoutTiers --
 // a package policy creates all-or-nothing: one unconfigured coverage fails
@@ -313,7 +313,7 @@ async function resolveCoverage(insurer, coverageInput) {
 //   coverages:    [{ coverageCode, productCode, perilType, cellIds[], sumInsured,
 //                    metric, payoutBasis, payoutTiers? }, ...]
 //                  -- required, non-empty, coverageCode unique within the
-//                  array. Stage 2 Part 2: there is no single-coverage
+//                  array. There is no single-coverage
 //                  convenience shape -- even a one-coverage policy (e.g.
 //                  today's frost product) sends a one-element array.
 //                  payoutTiers, in the snapshot shape, is the coverage's own
@@ -740,7 +740,7 @@ policiesRouter.post('/policies/:policyId/activate', async (req, res, next) => {
 // outbox row, return it. None of them touches the ledger;
 // dispatch/dispatcher.js is still the only thing that ever does.
 //
-// Stage 3 Part 3: the idempotency guarantee changed from "at most one of
+// The idempotency guarantee changed from "at most one of
 // this event type per policy, ever" to "at most one IN FLIGHT per policy".
 // The old shape made a second default cycle impossible -- a reinstated
 // policy could never receive a later notice -- and would have been wrong
@@ -825,7 +825,7 @@ async function insertLifecycleEvent(req, eventType, payload = null) {
   throw err;
 }
 
-// POST /api/v1/policies/:policyId/notice -- Stage 3 Part 2, step 1: the
+// POST /api/v1/policies/:policyId/notice -- premium default, step 1: the
 // insurer tells us a policy is in premium default and that formal notice
 // has been served. This system does NOT compute premium default, track
 // instalments, or observe payment -- the insurer is the only party that
@@ -859,10 +859,10 @@ policiesRouter.post('/policies/:policyId/notice', async (req, res, next) => {
   }
 });
 
-// POST /api/v1/policies/:policyId/reinstate -- Stage 3 Part 2, step 3: the
+// POST /api/v1/policies/:policyId/reinstate -- premium default, step 3: the
 // insurer tells us the outstanding premium has been paid. Takes no body:
 // the same policy resumes on its original dates, so there is nothing to
-// supply. Stage 4 narrowed this to the grace period only: once the notice
+// supply. This is narrowed to the grace period only: once the notice
 // period elapses the contract is terminated (TTK 6102 m. 1434(3)) and a
 // later payment does not undo that -- the Daml choice enforces it.
 policiesRouter.post('/policies/:policyId/reinstate', async (req, res, next) => {
@@ -888,7 +888,7 @@ const ENDORSEMENT_REASONS = new Set([
   'ER_Correction',
 ]);
 
-// POST /api/v1/policies/:policyId/endorse -- Stage 3 Part 3, Part B: change
+// POST /api/v1/policies/:policyId/endorse -- change
 // a LIVE policy's terms. Distinct from a renewal, which is a new policy
 // with a new term and a predecessor reference, and which is implemented
 // separately as POST /api/v1/policies/:policyId/renew below.
@@ -1178,7 +1178,7 @@ policiesRouter.post('/policies/:policyId/endorse', async (req, res, next) => {
 // the advisory lock, where this route cannot.
 const RENEWABLE_STATUSES = new Set(['active', 'partially_paid', 'expired']);
 
-// POST /api/v1/policies/:policyId/renew -- Stage 3 Part 4: open a NEW risk
+// POST /api/v1/policies/:policyId/renew -- open a NEW risk
 // period succeeding this one. `:policyId` is the PREDECESSOR.
 //
 // A renewal is not an endorsement. An endorsement changes the terms of the
@@ -1424,7 +1424,7 @@ policiesRouter.post('/policies/:policyId/renew', async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// Stage 4 -- reporting what happened to a payout
+// Reporting what happened to a payout
 //
 // THE PLATFORM NEVER MOVES MONEY. These endpoints do not pay anyone. The
 // insurer settles the indemnity through its own banking systems and then
@@ -1697,7 +1697,7 @@ policiesRouter.post('/payouts/:payoutId/close-unpaid', async (req, res, next) =>
 });
 
 // ---------------------------------------------------------------------------
-// Stage 2 Part 3 -- the insurer READS its payouts (the pull half).
+// The insurer READS its payouts (the pull half).
 //
 // The webhook carries the thin envelope and nothing else; every detail of a
 // payout is fetched here, with the insurer's own API key
@@ -1981,7 +1981,7 @@ policiesRouter.get('/policies/:policyId', async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// Stage 4 -- m. 1456(4) and (5): the mortgagee facts.
+// m. 1456(4) and (5): the mortgagee facts.
 //
 // Both endpoints RECORD what the insurer says happened. This system generates
 // and sends no notification, and it does not implement the mortgagee taking

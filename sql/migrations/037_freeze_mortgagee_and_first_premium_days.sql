@@ -1,6 +1,6 @@
 -- 037: the m. 1456(5) mortgagee continuation window and the m. 1434(2)
 -- first-premium withdrawal window are frozen onto the policy at activation
--- (the standing rule to freeze at activation).
+-- (the rule that such periods are frozen at activation).
 --
 -- Until now both were read from insurers when they were used, so a change to
 -- the insurer's value reached policies already active. From here activation

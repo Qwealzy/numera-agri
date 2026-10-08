@@ -1,4 +1,4 @@
-// Stage 2 Part 1: the one place a payout notification is queued.
+// The one place a payout notification is queued.
 //
 // It takes the caller's client rather than the pool, so it joins the caller's
 // transaction. handleTrigger's write-back queues the notification in the same

@@ -15,12 +15,12 @@ cd node && npm run set-webhook -- <insurerId> http://127.0.0.1:9099/webhook   # 
 MOCK_INSURER_API_KEY=<insurer-api-key> MOCK_INSURER_WEBHOOK_SECRET=<secret-printed-above> node scripts/mock-insurer.mjs --auto-settle
 # story page: http://localhost:8080/debug/story (fake insurer: http://127.0.0.1:9099/)
 # roles page: http://localhost:8080/debug/roles (one policy as the insurer's, the policyholder's, the mortgagee's and another insurer's ledger views return it)
-# /debug (story page, roles page, dashboard) is off by default: DEBUG_ROUTES_ENABLED=true in node/.env turns it on
+# /debug (story page, roles page, reconciliation data) is off by default: DEBUG_ROUTES_ENABLED=true in node/.env turns it on
 ```
 
   These addresses work after you run the stack on your own machine (see Setup). To see the system without installing it, watch the demo video: [Numera demo video](https://youtu.be/0npkRoUI_ZA).
 
-- **A recorded night.** Provider responses recorded by `scripts/recordProviderResponses.mjs` are replayed, with their recorded times, against a demo policy whose cover began before that night: the policy is made and its first premium reported paid before the first hour you record, the night is recorded, and the recording is replayed once the event window holding it has closed. Cover begins at the reported payment instant, which can be no later than now, and a reading from before cover began is stored but never folded into a window. Start the API with `CLIMATE_API_URL` empty, so the live oracle writes no reading to the demo cell and every reading shown is a replayed one (its source ends in `REPLAY(recorded …)`). The demo terms in `scripts/demo/` are synthetic. From `node/`, with `DEMO_INSURER_API_KEY` set to the demo insurer's key:
+- **A recorded night.** Provider responses recorded by `scripts/recordProviderResponses.mjs` are replayed, with their recorded times, against a demo policy whose cover began before that night: the policy is made and its first premium reported paid before the first hour you record, the night is recorded, and the recording is replayed once the event window holding it has closed. Cover begins at the reported payment instant, which can be no later than now, and a reading from before cover began is stored but never folded into a window. Start the API with `CLIMATE_API_URL` empty, so the running oracle writes no reading to the demo cell and every reading shown is a replayed one (its source ends in `REPLAY(recorded …)`). The demo terms in `scripts/demo/` are synthetic. From `node/`, with `DEMO_INSURER_API_KEY` set to the demo insurer's key:
 
   Give the demo an insurer of its own, and give that insurer's key to no verify script. `scripts/verify-notification.mjs` repoints the webhook address of whichever insurer its key names, for the length of its run, and every notification of that insurer still waiting for an address is delivered there while it is pointed away, so a demo payout's notification can reach a receiver that has nothing to do with the demo. `--demo-insurer-name` onboards one and gives it the key already in `DEMO_INSURER_API_KEY`; no key is printed or typed back. A freshly onboarded insurer has no `default_grace_period_days`: it is a legally constrained period with no default anywhere here, so the script stops until `--grace-period-days` supplies the value you want.
 
@@ -65,7 +65,7 @@ tiered parametric payout matrix on-chain, and records the full contract
 lifecycle — issue, endorse, renew, notice of premium default, termination,
 expiry, payout, settlement — as an auditable chain of ledger transactions.
 
-**Minting a token does not mean the policy is live.** It means the contract
+**Minting a token does not mean the policy is in force.** It means the contract
 exists. Under TTK 6102 m. 1421 the insurer's liability begins with payment of
 the first premium unless the parties agreed otherwise, so a minted policy
 carries no cover until that is reported — and a trigger against one is
@@ -100,7 +100,7 @@ not part of this repository.
 | `node/src/sweepers/graceSweeper.js` | Node.js | Two phases: notice period elapsed → `termination`; terminated with all payouts closed → `termination_archive` |
 | `node/src/sweepers/firstPremiumSweeper.js` | Node.js | m. 1434(2)'s deemed withdrawal — window elapsed with no suit or enforcement reported. A separate mechanism from the above, not a phase of it |
 | `node/src/sweepers/twoNoticeSweeper.js` | Node.js | m. 1434(4)'s deferred effect — an elected termination reaching the end of its insurance period. The third premium-default mechanism, and the third separate file |
-| `node/src/routes/debug.js`, `node/public/` | Node.js | Read-only reconciliation dashboard (SQL mirror vs. the live ledger); `/debug/story`, one payout's steps from reading to closure, for the demo. Mounted only when `DEBUG_ROUTES_ENABLED=true` |
+| `node/src/routes/debug.js`, `node/public/` | Node.js | Read-only reconciliation data at `/debug/contracts` (SQL mirror vs. the running ledger); `/debug/story`, one payout's steps from reading to closure, for the demo. Mounted only when `DEBUG_ROUTES_ENABLED=true` |
 | `node/public/konsol/` | Browser | Read-only insurer console prototype at `/konsol`: the insurer's own policies and payouts through the four GET endpoints, with the key it pastes (kept in sessionStorage). Not behind `DEBUG_ROUTES_ENABLED` |
 | `node/src/scripts/onboardInsurer.js` | Node.js | Admin CLI to onboard an insurer + allocate its two Parties |
 | `scripts/` | Node.js | Operational scripts — setup and schema checks, the demo, package-migration steps and verification runs against LocalNet. Kept in the repository rather than improvised, because each of them has been needed more than once |
@@ -169,7 +169,7 @@ DELETE /api/v1/terms/payout-tiers/:productCode/:perilType   remove the set; none
      contract: docs/api/terms-v1.openapi.json
 GET  /konsol                                       read-only insurer console (prototype, node/public/konsol/): the
      insurer pastes its key, the page sends it as x-api-key to the four payout and policy GETs above, and nothing on it writes
-GET  /debug/contracts, /debug/dashboard            read-only reconciliation
+GET  /debug/contracts                              read-only reconciliation
 GET  /debug/story, /debug/roles                    the demo's story page; one policy as four parties' ledger views return it:
      the insurer, the policyholder, the mortgagee and another insurer
      every /debug route is mounted only when DEBUG_ROUTES_ENABLED=true in node/.env; off by default
@@ -433,7 +433,7 @@ in all):
   `claimed_and_closed`, `manual_review`); `default_state` is the
   premium-default axis (`none`, `grace_period`, `terminated`,
   `first_premium_unpaid`, `withdrawn_for_first_premium`, `two_notice_elected`,
-  `two_notice_terminated`). They were one field until a live run proved
+  `two_notice_terminated`). They were one field until a verification run proved
   it broken: a payout during the grace period overwrote the single field and
   silently dropped the policy out of the default flow entirely. Never merge
   them into one derived label.
@@ -482,8 +482,8 @@ in all):
   `coverageBeganAt` is what makes that legible. The mirror of termination,
   where cover ends early with no extension to compensate.
 - **A policy whose cover never began is surfaced, never swept.** Nothing in
-  the statute ends a contract merely because cover has not started, so both
-  dashboards flag it as inert rather than acting on it. Where the premium is
+  the statute ends a contract merely because cover has not started, so
+  `/debug/contracts` flags it as inert rather than acting on it. Where the premium is
   reported due and unpaid, m. 1434(2) already provides the ending.
 - **Backdating cover is lawful, and checked against the platform's own
   history.** m. 1458 permits it outright, then voids the contract where the

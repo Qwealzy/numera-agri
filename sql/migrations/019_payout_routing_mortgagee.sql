@@ -49,7 +49,7 @@ ALTER TABLE payout_events ADD CONSTRAINT payout_events_record_kind_known
   CHECK (record_kind IN ('payout', 'unrouted_remainder'));
 
 -- A remainder has no PayoutApproved to point at, so the column that has been
--- NOT NULL since Stage 1 has to admit NULL for exactly that case -- and only
+-- NOT NULL from the start has to admit NULL for exactly that case -- and only
 -- that case. UNIQUE still holds: Postgres permits many NULLs in a unique
 -- index, and every real payout still gets exactly one row.
 ALTER TABLE payout_events ALTER COLUMN daml_contract_id DROP NOT NULL;

@@ -12,8 +12,7 @@ import { enqueuePayoutNotification } from '../src/notifications/enqueue.js';
 //
 // Nothing here sends anything. The sender (src/notifications/sender.js) has
 // its own test, notificationSender.test.mjs, against a loopback receiver. It
-// is loopback-only unless WEBHOOK_ALLOW_NON_LOOPBACK is 'true', as
-// (the project's standing rule).
+// is loopback-only unless WEBHOOK_ALLOW_NON_LOOPBACK is 'true'.
 
 let insurerId;
 let policyholderId;
@@ -115,7 +114,7 @@ test('a queued row starts pending, unattempted, due and carries no payload', asy
   assert.equal(rows[0].due, true);
   assert.equal(rows[0].delivered_at, null);
   // No payload is stored: the row points at the payout and carries nothing
-  // about it (a standing rule -- the envelope is built at delivery).
+  // about it (by design -- the envelope is built at delivery).
   assert.equal(rows[0].last_status_code, null);
   assert.equal(rows[0].last_error, null);
 });

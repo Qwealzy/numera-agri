@@ -14,10 +14,9 @@ reasoning in their comments that `schema.sql` has no room for.
 `001_stage1_outbox_and_policyholder_party.sql` fails on its first
 `CREATE TABLE` against an empty database — `relation "policies" does not
 exist` — because it expects the schema that predates the outbox. Its own
-header says so: *"Run against a database that already has schema.sql + the
-round-8 migration applied."* Neither that earlier `schema.sql` nor the
-round-8 migration is in this repository, and the string `round-8` appears
-exactly once in the whole tree — in that sentence.
+header says so: it runs against a database that already has the earlier
+`schema.sql` and the migration that followed it applied. Neither of those is
+in this repository.
 
 Demonstrate it rather than taking it on trust:
 
@@ -30,8 +29,8 @@ It applies both paths to throwaway databases and drops them afterwards.
 ## Why no base was reconstructed
 
 Much of one could be recovered — `schema.sql` minus what these files add,
-plus the `USING` mappings in 004 and 005, which record the pre-Stage-1 enum
-values and casing exactly, plus `eft_transactions`, still in git history. What could not be recovered is the round-8 migration's content and
+plus the `USING` mappings in 004 and 005, which record the earlier enum
+values and casing exactly, plus `eft_transactions`, still in git history. What could not be recovered is that earlier migration's content and
 the exact types, defaults and constraints of the columns dropped before this
 repository was under version control.
 
@@ -39,7 +38,7 @@ But recoverability is not what decided it. **A faithful base would have to
 contain a `policyholders.iban` column and the `eft_transactions` table**,
 because 001 drops the first and 015 drops the second. That means committing
 both back into the tree as SQL a fresh install would create and immediately
-delete — against a standing rule that this platform holds no account
+delete — against the rule that this platform holds no account
 numbers and instructs no payments, and neither may exist here. A base that
 omitted them would not be the original; it would be a guess wearing the
 original's name, and a wrong base is worse than a missing one.

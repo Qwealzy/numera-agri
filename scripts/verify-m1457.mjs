@@ -142,7 +142,7 @@ const out = [];
 const say = (s = '') => { out.push(s); console.log(s); };
 const line = (r) => `    ${r.record_kind.padEnd(26)} recipient=${String(r.recipient).padEnd(22)} amount=${Number(r.payout_amount).toFixed(2).padStart(9)}  status=${r.status}`;
 
-say('## 3r. Live verification run (v21 — attachment of the insured property, m. 1457)');
+say('## Live verification run (attachment of the insured property, m. 1457)');
 say('');
 say('Through the real HTTP API against the real participant, package');
 say(`${PACKAGE}. All three routing cases, side by side.`);

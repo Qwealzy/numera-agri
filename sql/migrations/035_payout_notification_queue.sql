@@ -1,5 +1,5 @@
 -- 035: the payout notification queue -- one row per approved payout the
--- insurer is to be told about (Stage 2 Part 1).
+-- insurer is to be told about.
 --
 -- A notification is NOT a policy_events row. That table is the outbox for
 -- ledger-changing actions and forbids retry on purpose (README "One outbox...",

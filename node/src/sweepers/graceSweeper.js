@@ -8,7 +8,7 @@ import { lastWindowPending } from './expirySweeper.js';
 // respect: it never touches the ledger, it only observes state and writes
 // outbox rows for dispatch/dispatcher.js to act on.
 //
-// Stage 4 replaced what it does. It used to queue a 'suspension' row, which
+// What it does was replaced. It used to queue a 'suspension' row, which
 // moved coverageValidThrough back and left the contract alive in a suspended
 // state. TTK 6102 m. 1434(3) terminates the contract at the end of the
 // notice period instead -- `feshedilmiş olur` -- and m. 1452(3) makes that
@@ -25,7 +25,7 @@ import { lastWindowPending } from './expirySweeper.js';
 // than JS so the comparison happens against the same `now()` the row is
 // read at.
 //
-// Stage 3 Part 3: this filters on `default_state`, NOT on `status`. That
+// This filters on `default_state`, NOT on `status`. That
 // change is the point of splitting the two axes. While both lived in one
 // column, a payout during the grace period overwrote it with
 // 'partially_paid' and this query stopped matching the policy entirely --

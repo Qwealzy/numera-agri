@@ -71,16 +71,16 @@ debugRouter.get('/contracts', async (_req, res) => {
     }
 
     // No LIMIT here (unlike payoutEvents below) -- the reconciliation
-    // dashboard needs every policy row to compare against the ledger, and
+    // needs every policy row to compare against the ledger, and
     // a capped result silently made it look complete when it wasn't (it
     // undercounted real orphans by only checking the most-recently-
     // touched 20 rows).
-    // sum_insured/remaining_limit moved to policy_coverages (Stage 2 Part
-    // 2, one row per coverage) -- these are policy-level totals across
+    // sum_insured/remaining_limit live in policy_coverages (one row per
+    // coverage) -- these are policy-level totals across
     // every coverage, derived here for this debug view only, never
     // stored, same principle as the Daml token itself never storing one.
     //
-    // Stage 3 Part 3/4 additions, all read-only:
+    // Premium-default and renewal fields, all read-only:
     //   default_state           -- the premium-default axis, INDEPENDENT of
     //                              status; never merge the two into one
     //                              derived label, they mean different things
@@ -95,7 +95,7 @@ debugRouter.get('/contracts', async (_req, res) => {
     //                              recorded fact and this is only the
     //                              prediction it was derived from.
     //
-    // Stage 4 additions, all read-only:
+    // Termination and mortgagee fields, all read-only:
     //   terminated_at/unrun_days -- the recorded consequence of the notice
     //                              period elapsing (m. 1434(3)) and the
     //                              facts a refund is computed from (m.
@@ -183,7 +183,7 @@ debugRouter.get('/contracts', async (_req, res) => {
     // Uncapped, deliberately: the counts below come from their own
     // COUNT(*), so a re-introduced cap would show as a mismatch on screen
     // rather than silently under-reporting.
-    // Stage 4: a payout now has a real end, so the interesting set is the
+    // A payout has a real end, so the interesting set is the
     // UNRESOLVED ones -- still awaiting the insurer's report, or sitting as
     // a review item that has not been closed either way. Ordered oldest
     // first: the age of the oldest open item is the number that matters.
@@ -208,8 +208,8 @@ debugRouter.get('/contracts', async (_req, res) => {
       `SELECT status, count(*)::int AS n FROM payout_events GROUP BY status`
     );
     // Independent COUNT(*)s, not derived from the arrays above. If a list
-    // ever gets capped again these stay honest -- the dashboard renders
-    // these as the authoritative totals and flags any disagreement.
+    // ever gets capped again these stay honest -- they are the
+    // authoritative totals a reader compares the lists against.
     const totals = await pool.query(
       `SELECT (SELECT count(*)::int FROM policies)       AS policies,
               (SELECT count(*)::int FROM payout_events)  AS payout_events`
@@ -239,7 +239,7 @@ debugRouter.get('/contracts', async (_req, res) => {
 // field or last_error leaves this handler. attestation_ref carries the
 // provider's request URL, so only its evidence hash is passed on. A step with
 // nothing recorded is 'not yet' with a null time -- nothing is inferred.
-const NETWORK_LABEL = 'Canton LocalNet, this machine';
+const NETWORK_LABEL = 'Canton LocalNet (local test network)';
 // Read off oracleBot.js's own source label at request time, never typed in
 // here: while the bot labels its readings STAND-IN, so does the page.
 const ORACLE_BOT_SOURCE = new URL('../oracle/oracleBot.js', import.meta.url);

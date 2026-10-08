@@ -1,4 +1,4 @@
--- Stage 1 addendum: generalize the outbox. `policy_activated` only ever
+-- Addendum: generalize the outbox. `policy_activated` only ever
 -- carried one event type (activation) and could hold exactly one row per
 -- policy, ever -- that shape can't carry endorsement/renewal/notice/release
 -- events later. `policy_events` replaces it as the single channel every

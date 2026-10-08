@@ -1,5 +1,5 @@
 -- ============================================================================
--- Stage 2 Part 1: oracleBot.js and payoutListener.js move onto the outbox
+-- oracleBot.js and payoutListener.js move onto the outbox
 -- instead of calling exerciseChoice directly. Two new event types need
 -- idempotency keys the existing (policy_no, event_type, expected_version)
 -- triple cannot express -- a (policy_no, expected_version) pair is not

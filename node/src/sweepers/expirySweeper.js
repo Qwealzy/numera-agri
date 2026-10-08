@@ -5,8 +5,8 @@ import { config } from '../config.js';
 import { resolveFrozenWindowRule, windowFor, isClosed } from '../oracle/eventWindow.js';
 import { livePolicyNos, tokenNotLive } from '../oracle/oracleBot.js';
 
-// Stage 3 Part 1: policies are born and can be triggered, but nothing ever
-// ends them naturally -- this closes that gap. Like oracleBot.js and
+// Policies are born and can be triggered; without this sweep nothing
+// would end them naturally. Like oracleBot.js and
 // payoutListener.js, this file never touches the ledger itself; it only
 // finds policies whose term has passed and writes one 'expiry' outbox row
 // per policy for dispatch/dispatcher.js's handleExpiry to actually exercise

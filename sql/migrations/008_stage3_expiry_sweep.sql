@@ -1,5 +1,5 @@
 -- ============================================================================
--- Stage 3 Part 1: expiry sweep.
+-- Expiry sweep.
 --
 -- The sweeper needs to query "expiry in the past, still open" directly in
 -- SQL, but `policies` only ever stored start_date/end_date (bare calendar

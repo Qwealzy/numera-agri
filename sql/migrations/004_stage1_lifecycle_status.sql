@@ -1,5 +1,5 @@
 -- ============================================================================
--- Stage 1 -- shared lifecycle status vocabulary.
+-- Shared lifecycle status vocabulary.
 --
 -- Replaces policy_status's old ad-hoc labels with the vocabulary now shared
 -- with Daml's PolicyStatus (daml/daml/Insurance/Types.daml): active,

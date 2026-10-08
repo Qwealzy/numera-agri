@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 
-// Stage 2 Part 2: the webhook signature. Pure; the sender and the CLI both
+// The webhook signature. Pure; the sender and the CLI both
 // call it, and neither logs what it returns.
 //
 // The per-insurer secret is DERIVED, never stored: HMAC of the insurer id and

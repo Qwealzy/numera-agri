@@ -4,7 +4,7 @@
 --
 -- SEPARATE FILE for the reason 021, 023 and 025 were: `ALTER TYPE ... ADD
 -- VALUE` cannot be used in the same transaction that later reads the new
--- value, and migration 026 adds both. The v20 round proved the rule also
+-- value, and migration 026 adds both. An earlier pair of migrations proved the rule also
 -- applies WITHIN a file -- a partial index placed above its own ADD VALUE
 -- fails on its own line -- so anything reading a new value goes after the
 -- transaction that adds it, whether that means a later statement or a later

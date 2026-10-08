@@ -116,7 +116,7 @@ const PACKAGE = `\`${packageName}\` (id \`${process.env.DAML_PACKAGE_ID}\`)`;
 const out = [];
 const say = (s = '') => { out.push(s); console.log(s); };
 
-say('## 3q. Live verification run (v20 — the two-notice termination right, m. 1434(4))');
+say('## Live verification run (the two-notice termination right, m. 1434(4))');
 say('');
 say('Through the real HTTP API against the real participant, package');
 say(`${PACKAGE}. Every notice below is served and then PAID`);

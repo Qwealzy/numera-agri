@@ -1,5 +1,5 @@
 -- ============================================================================
--- Stage 4: closing the payout loop.
+-- Closing the payout loop.
 --
 -- Until now every trigger produced a PayoutApproved, the dispatcher
 -- unconditionally exercised PayoutApproved_MarkFailed on it (there was no
@@ -19,7 +19,7 @@
 -- ============================================================================
 
 -- Two terminal states. The 'eft_*' values below them are dead: they were
--- named for an Open Banking bridge that was removed in Stage 1 Cleanup and
+-- named for an Open Banking bridge that was removed early on and
 -- is not coming back. They stay in the enum only because Postgres cannot
 -- drop an enum value without recreating the type and every dependent
 -- object -- the same reason 'grace_period'/'suspended' still sit in
@@ -52,10 +52,11 @@ ALTER TABLE payout_events ADD COLUMN resolution_note TEXT;
 -- at the PayoutApproved that started the chain; when MarkFailed archives it
 -- and creates a review item, that item's contract id lands here rather than
 -- overwriting the original -- otherwise the link back to the payout is lost,
--- which is exactly the ambiguity Change D exists to fix on the ledger side.
+-- which is exactly the ambiguity the review item's sourcePayoutContractId
+-- fixes on the ledger side.
 ALTER TABLE payout_events ADD COLUMN review_contract_id TEXT;
 
--- Change E: the clock. created_at already records when the PayoutApproved
+-- The clock. created_at already records when the PayoutApproved
 -- was created; this records when it reached a terminal state. Elapsed time
 -- is derived from the pair at read time and never stored.
 --
@@ -73,7 +74,7 @@ CREATE INDEX idx_payout_events_unresolved
 -- automatic step, and is not now that the insurer reports outcomes by hand:
 -- a rejected report (a mistyped paidRole, say) consumed the payout's one
 -- and only settlement slot forever, leaving it permanently unreportable.
--- Found in this round's live verification, not by reading.
+-- Found in live verification, not by reading.
 --
 -- The guarantee that actually matters -- never two concurrent reports on
 -- one contract -- is unchanged. "A payout ends once" is enforced separately

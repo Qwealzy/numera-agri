@@ -65,15 +65,15 @@ data ArchiveInstants = ArchiveInstants
     recordClosedAt  : Time
   deriving (Eq, Show)
 
--- The tokenized policy (Module 1's Mint target). Module 2's tier matrix and
--- Module 3's archive/re-mint/burn lifecycle both live in
+-- The tokenized policy (the mint target). The tier matrix and the
+-- archive/re-mint/burn lifecycle both live in
 -- PolicyToken_EvaluateTrigger below.
 template PolicyToken
   with
     policyNo       : Text
     version        : Int
     predecessorRef : Optional Text
-    -- None on a first policy; a renewal (Stage 3 Part 4) mints a NEW token
+    -- None on a first policy; a renewal mints a NEW token
     -- with a NEW policyNo carrying its predecessor's policyNo here, rather
     -- than re-minting the same one, so the chain stays traceable
     -- on-ledger. The predecessor token itself is never touched by the
@@ -131,7 +131,7 @@ template PolicyToken
     oracleOperator : Party
 
     coverages : [Coverage]
-    -- Stage 2 Part 2: a policy is a package of independent coverages, not
+    -- A policy is a package of independent coverages, not
     -- one implicit coverage -- sumInsured/remainingLimit/payoutTiers/
     -- payoutDestination/mortgageeClaimAmount all moved onto Coverage
     -- (Types.daml). There is exactly one source of truth per value now;
@@ -144,7 +144,7 @@ template PolicyToken
     -- independently, a fire payout can never draw down glass's limit.
 
     termStart             : Time
-    -- Stage 4: the policy term's START instant, added so a premium refund
+    -- The policy term's START instant, added so a premium refund
     -- under TTK 6102 m. 1419 has the facts it needs recorded on-ledger.
     -- The token carried expiry and coverageValidThrough but never a start,
     -- so "days run" and "days unrun" could not be derived from the contract
@@ -185,7 +185,7 @@ template PolicyToken
     --
     -- **None means cover has not begun.** Minting therefore no longer means
     -- the policy is live: it means the contract exists. That is a change to
-    -- Stage 1's founding assumption, and it is deliberate -- m. 1422 (the
+    -- the original design's assumption, and it is deliberate -- m. 1422 (the
     -- insurer earns no premium where the risk became impossible before
     -- liability began) and m. 1430(3) (the sigorta ettiren may withdraw
     -- before liability begins, against half the premium) both presuppose a
@@ -215,7 +215,7 @@ template PolicyToken
 
     noticeServiceDate : Optional Time
     noticeRecordedAt  : Optional Time
-    -- Stage 3 Part 2: set together, once, by PolicyToken_ServeNotice --
+    -- Set together, once, by PolicyToken_ServeNotice --
     -- both None on any policy that has never had notice served. Persist
     -- unchanged through termination and reinstatement: a permanent record
     -- that notice WAS served and when, not a flag that gets reset.
@@ -227,7 +227,7 @@ template PolicyToken
     -- one timestamp.
 
     noticeCount : Int
-    -- Stage 4, m. 1434(4): a second notice in the SAME insurance period
+    -- m. 1434(4): a second notice in the SAME insurance period
     -- gives the insurer a further right, implemented in v20 by
     -- PolicyToken_ElectTwoNoticeTermination below.
     --
@@ -332,7 +332,7 @@ template PolicyToken
 
     terminationInstant : Optional Time
     unrunDays          : Optional Int
-    -- Stage 4, set together by PolicyToken_Terminate and never afterwards.
+    -- Set together by PolicyToken_Terminate and never afterwards.
     -- terminationInstant is DERIVED FROM THE NOTICE, not from a clock:
     -- the externally supplied service date plus the policy's own grace
     -- period. unrunDays is the whole days between that instant and expiry.
@@ -367,7 +367,7 @@ template PolicyToken
     -- lists: what matters is whether the insurer currently owes an answer.
     mortgageeInfoRequestedAt    : Optional Time
     mortgageeInfoProvidedAt     : Optional Time
-    -- Stage 4, m. 1456(4) and (5). All three are RECORDED facts, never
+    -- m. 1456(4) and (5). All three are RECORDED facts, never
     -- actions: this system generates and sends nothing. mortgageeNotifiedAt
     -- is the insurer's reported date for having notified a known real-right
     -- holder of the default and the notice served. The continuation window
@@ -377,7 +377,7 @@ template PolicyToken
     -- implemented.
 
     status            : PolicyStatus
-    -- Claim/term axis ONLY as of Stage 3 Part 3: active, partially paid,
+    -- Claim/term axis ONLY: active, partially paid,
     -- claimed and closed, expired (plus cancelled / manual review). The
     -- premium-default states moved to defaultState below -- the two are
     -- orthogonal and a payout must never disturb the default axis. See
@@ -388,7 +388,7 @@ template PolicyToken
     documentHash      : Optional Text
     amendmentReason   : Optional EndorsementReason
     -- amendmentReason records WHY the most recent endorsement happened
-    -- (Stage 3 Part 3 wires this up via PolicyToken_Amend; before that it
+    -- (PolicyToken_Amend sets it; before that choice existed it
     -- was declared but never set by anything). None on a token that has
     -- never been amended.
   where
@@ -471,7 +471,7 @@ template PolicyToken
       -- Both m. 1434(4) states require the election that produced them.
       ((defaultState /= DS_TwoNoticeElected && defaultState /= DS_TwoNoticeTerminated)
          || isSome twoNoticeElectionAt) &&
-      -- A policy cannot succeed itself. Renewal (Stage 3 Part 4) mints a
+      -- A policy cannot succeed itself. Renewal mints a
       -- new token with a NEW policyNo pointing back at the one it renews;
       -- a token whose predecessorRef is its own policyNo would be a cycle
       -- in the supersession chain, and would make the chain unwalkable in
@@ -510,7 +510,7 @@ template PolicyToken
     -- insurer isn't the controller: consequences of an exercise are
     -- authorized by (choice controller UNION contract signatories).
     --
-    -- Stage 2 Part 2: a trigger names exactly one coverage and evaluates
+    -- A trigger names exactly one coverage and evaluates
     -- only that coverage's own tiers and remaining limit; every other
     -- coverage is carried into the re-mint byte-for-byte unchanged. The
     -- policy only closes (no re-mint) once every coverage -- not just the
@@ -542,7 +542,7 @@ template PolicyToken
         -- review item's flaggedAt -- is the transaction's ledger time, not a
         -- value the caller supplies.
         now <- getTime
-        -- Stage 3 Part 3: two independent checks now, one per axis, because
+        -- Two independent checks, one per axis, because
         -- claimability genuinely depends on both. On the claim/term axis
         -- the policy must not be in a terminal state; on the default axis
         -- coverage must not have stopped. A loss during the grace period
@@ -719,7 +719,7 @@ template PolicyToken
                 isFullSettlement = allExhausted
                 -- Snapshotted from the coverage that actually triggered, so a
                 -- later settlement report can be checked on-ledger against the
-                -- destination this policy specified (Stage 4).
+                -- destination this policy specified.
                 payoutDestination = targetCoverage.payoutDestination
                 approvedAt = now
                 eventStart
@@ -847,7 +847,7 @@ template PolicyToken
           else do
             -- Touches the CLAIM axis only. defaultState is carried over
             -- unchanged by `create this with` -- deliberately, and this is
-            -- the whole point of Stage 3 Part 3's split: a policy that was
+            -- the whole point of splitting the two axes: a policy that was
             -- in its grace period when the loss happened is still in its
             -- grace period afterwards, so graceSweeper.js can still find
             -- and terminate it. The premium does not become paid because a
@@ -867,8 +867,8 @@ template PolicyToken
               payouts = legs
               unroutedRemainder = remainderOpt
 
-    -- Module 3: the final burn on premium default -- PHASE TWO of
-    -- termination, and until Stage 4 this choice existed, compiled, was
+    -- The final burn on premium default -- PHASE TWO of
+    -- termination. For a long time this choice existed, compiled, was
     -- tested, and was called by nothing.
     --
     -- Termination (PolicyToken_Terminate) ends the CONTRACT. It deliberately
@@ -915,8 +915,8 @@ template PolicyToken
               contractEndedAt = ended
               recordClosedAt = now
 
-    -- Module 3: full burn at natural expiry with no outstanding claim.
-    -- reason (Stage 3 Part 1) records why on-ledger, and since v22 the
+    -- Full burn at natural expiry with no outstanding claim.
+    -- reason records why on-ledger, and since v22 the
     -- returned ArchiveInstants records when -- before this, an expiry archive
     -- was indistinguishable from any other archive of this choice.
     -- Regardless of what remaining limit any
@@ -940,12 +940,12 @@ template PolicyToken
           contractEndedAt = expiry
           recordClosedAt = now
 
-    -- The premium-default flow, rebuilt in Stage 4 to match TTK 6102
+    -- The premium-default flow, rebuilt to match TTK 6102
     -- m. 1434(3). Notice served -> DS_GracePeriod, where coverage CONTINUES
     -- IN FULL and a loss is payable. The notice period elapsing unpaid ->
     -- DS_Terminated: the contract is `feshedilmiş olur`, deemed terminated.
     --
-    -- What this replaced, and why. Until Stage 4 the period elapsing moved
+    -- What this replaced, and why. Previously the period elapsing moved
     -- the policy to a SUSPENDED state in which coverage stopped but the
     -- contract survived and could be reinstated. That model conflicts with
     -- 1434(3) on three counts: the statute terminates rather than suspends;
@@ -1280,7 +1280,7 @@ template PolicyToken
     -- `status` is left exactly as found -- a policy that was partially paid
     -- before it defaulted is still partially paid after.
     --
-    -- Stage 4 NARROWED this: it used to be reachable from the suspended
+    -- This was NARROWED: it used to be reachable from the suspended
     -- state as well, i.e. it could revive a policy after the period had
     -- elapsed. Under m. 1434(3) there is nothing to revive at that point --
     -- the contract is terminated, and what would follow is a NEW contract,
@@ -1551,7 +1551,7 @@ template PolicyToken
           -- the note at the head of this block. Archiving would encode a
           -- holding on retroactivity that the text does not support.
 
-    -- Stage 3 Part 3, Part B: an endorsement (zeyilname) -- a change to a
+    -- An endorsement (zeyilname) -- a change to a
     -- LIVE policy's terms, archive-and-re-mint with version + 1 and the
     -- reason recorded on the new token. Distinct from a renewal, which is
     -- a new policy with a new term carrying a predecessorRef, and which is

@@ -40,8 +40,8 @@ before(async () => {
     { grantActAs: true }
   );
   grantedActAs.push(insurerPartyId);
-  // Stage 3 Part 1: this fixture never allocated an oracle_operator_party
-  // before -- harmless while every test here only ever exercised
+  // This fixture once allocated no oracle_operator_party
+  // -- harmless while every test here only ever exercised
   // handleActivation, but handleTrigger's actAs comes from this column, so
   // the expiry-after-partial-payout test below (the first test in this
   // file to exercise a trigger) needs a real, distinct party here, same as
@@ -52,7 +52,7 @@ before(async () => {
     { grantActAs: true }
   );
   grantedActAs.push(oracleOperatorPartyId);
-  // Stage 3 Part 2: default_grace_period_days is required for activation to
+  // default_grace_period_days is required for activation to
   // succeed at all now (handleActivation refuses to mint a policy whose
   // grace period is configured nowhere -- see resolveGracePeriodDays). 14 is
   // a fixture value chosen for this test file only, NOT a statutory figure
@@ -82,15 +82,14 @@ before(async () => {
 // and the leak gate (leakGate.test.mjs) fails the run on any row left in it,
 // so each writing test file removes its own. When this was written
 // the tests still wrote to the working database, where a fixture policy
-// carrying `fake-cid` (or no contract id) while still `active` read as
-// ORPHAN_SQL on /debug/dashboard; that page reads the working database, so
-// these rows no longer reach it.
+// carrying `fake-cid` (or no contract id) while still `active` read as an
+// orphan in the /debug/contracts reconciliation; that reads the working
+// database, so these rows no longer reach it.
 //
 // Scoped by this file's own insurerId, so each writing test file can delete
 // only its own rows, and nothing outside the fixtures is touched. Deleting by
-// insurer also sweeps the role registry whole, which matters: the v13 round
-// showed a mortgagee's or beneficiary's `policyholders` row survives a
-// policyholder-only sweep as residue.
+// insurer also sweeps the role registry whole, which matters: a mortgagee's or beneficiary's `policyholders` row survives a
+// policyholder-only sweep as residue otherwise.
 //
 // Two ordering traps, both learned by having them bite: `policy_events`
 // references `oracle_readings`, so outbox rows must go BEFORE the readings
@@ -233,8 +232,8 @@ async function createPolicyholder() {
   return rows[0];
 }
 
-// Stage 2 Part 2: sum_insured/product_code/peril_type/cell_ids/
-// payout_tiers_snapshot moved from `policies` to `policy_coverages` --
+// sum_insured/product_code/peril_type/cell_ids/
+// payout_tiers_snapshot live in `policy_coverages`, not `policies` --
 // this fixture now inserts one coverage row too, same values as before,
 // just relocated.
 // v22: the ledger refuses an expiry archive before the token's expiry,
@@ -274,7 +273,7 @@ async function activate(policyId, expectedVersion = 0) {
   );
 }
 
-// Stage 3 Part 1: adds a second coverage to a policy createPolicy() already
+// Adds a second coverage to a policy createPolicy() already
 // set up with one -- for the multi-coverage expiry test, which needs to
 // prove expiry archives the whole policy regardless of how many coverages
 // it has, not just the one-coverage case every other fixture here uses.
@@ -303,7 +302,7 @@ async function insertExpiryEvent(policyId) {
   );
 }
 
-// Stage 3 Part 2: the same rows routes/policies.js's /notice and
+// The same rows routes/policies.js's /notice and
 // /reinstate endpoints write, and the one graceSweeper.js writes. Inserted
 // directly here so these tests exercise the dispatcher's handlers rather
 // than the HTTP layer or the sweeper's query (both covered elsewhere --
@@ -454,8 +453,8 @@ test('unimplemented event types are rejected explicitly, not silently skipped', 
   const ph = await createPolicyholder();
   const policy = await createPolicy(ph.id);
 
-  // 'notice' left this list in Stage 3 Part 2, 'endorsement' in Part 3, and
-  // 'renewal' in Part 4 -- all three have real handlers now. 'release'
+  // 'notice', 'endorsement' and 'renewal' have left this list -- all three
+  // have real handlers now. 'release'
   // (evidence only, no ledger action) is the last one still unimplemented.
   for (const eventType of ['release']) {
     await pool.query(
@@ -473,7 +472,7 @@ test('unimplemented event types are rejected explicitly, not silently skipped', 
   assert.equal(rows.length, 1);
   for (const row of rows) {
     assert.equal(row.status, 'failed');
-    assert.match(row.error, /not implemented in stage 1/);
+    assert.match(row.error, /is not implemented/);
   }
 
   // None of these should have touched the policy at all.
@@ -633,7 +632,7 @@ test('a trigger during the grace period pays normally', async () => {
 
   const { rows } = await pool.query('SELECT status, default_state FROM policies WHERE id = $1', [policy.id]);
   assert.equal(rows[0].status, 'partially_paid', 'a loss during the grace period is payable');
-  // Stage 3 Part 3, the defect this round fixes: the payout must move the
+  // The defect the axis split fixes: the payout must move the
   // claim axis WITHOUT clearing the default axis. Before the split, this
   // overwrote 'grace_period' and dropped the policy out of the default flow
   // entirely -- never suspended, and unable to receive a second notice.
@@ -731,7 +730,7 @@ test('a trigger the ledger refuses only because its event has not ended yet is r
   );
 });
 
-// Stage 4 replaced the suspension tests that used to sit here. There is no
+// The suspension tests that used to sit here are gone. There is no
 // suspension state any more: TTK 6102 m. 1434(3) TERMINATES the contract at
 // the end of the notice period (`feshedilmiş olur`), and m. 1452(3) makes
 // that non-derogable against the insured. What follows tests the two-phase
@@ -966,7 +965,7 @@ test('reinstatement from the grace period restores coverage without changing dat
   assert.ok(rows[0].notice_service_date, 'the notice history stays on the record after reinstatement');
 });
 
-// Stage 4: the branch where payment arrives INSIDE the notice period. No
+// The branch where payment arrives INSIDE the notice period. No
 // termination happens at all -- the sweeper never sees the policy, because
 // reinstatement took it out of grace_period before the period elapsed.
 test('payment within the notice period reinstates and no termination is ever recorded', async () => {
@@ -1076,7 +1075,7 @@ test('the mortgagee path refuses on a policy with no mortgagee, and termination 
 });
 
 // ---------------------------------------------------------------------------
-// Stage 3 Part 3, Part A -- the two status axes move independently
+// The two status axes move independently
 // ---------------------------------------------------------------------------
 
 // Before the split, the notice index keyed on "this policy has never had a
@@ -1117,7 +1116,7 @@ test('a reinstated policy can receive a second notice', async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Stage 3 Part 3, Part B -- endorsements
+// Endorsements
 // ---------------------------------------------------------------------------
 
 async function endorse(policyId, payload) {
@@ -1493,7 +1492,7 @@ test('an endorsement row carrying remainingLimit fails before the ledger; on a m
 });
 
 // ---------------------------------------------------------------------------
-// Stage 3 Part 4 -- renewal
+// Renewal
 // ---------------------------------------------------------------------------
 
 // Builds the successor policy row + coverages the way routes/policies.js's
@@ -1933,7 +1932,7 @@ for (const [label, oracleValue] of [
 }
 
 // ---------------------------------------------------------------------------
-// Stage 4 -- closing the payout loop
+// Closing the payout loop
 // ---------------------------------------------------------------------------
 
 // Drives a policy to a real PayoutApproved and returns its payout_events row.
@@ -2040,7 +2039,7 @@ test('a reported settlement closes the payout and it cannot be settled twice', a
   assert.ok(after.resolved_at, 'resolved_at stamps when the payout reached a terminal state');
 
   // A second report on the same payout is refused by handleSettlement's own
-  // resolved_at guard. Since Stage 4 the settlement index is scoped to
+  // resolved_at guard. The settlement index is scoped to
   // in-flight rows (so a REJECTED report never permanently bricks a payout
   // -- see migration 012), which means a second report can be queued; what
   // stops it is the guard, and the ledger behind it, where the settled
@@ -2478,8 +2477,8 @@ test('a retried settlement row sends the same digest: the salt is stored when th
 // Role intake: mortgagee and beneficiary become reachable
 // ---------------------------------------------------------------------------
 //
-// Both roles have been on the token since the roles round and neither could
-// ever be set -- dispatcher.js minted every policy with both null. These
+// Both roles were on the token long before either could
+// be set -- dispatcher.js minted every policy with both null. These
 // cover the intake path, the party-reuse rules (one party per person, whatever
 // roles and policies it holds), and the m. 1456 flows that had never run
 // against a policy that actually has a mortgagee.
@@ -2564,7 +2563,7 @@ test('a policy with a mortgagee and per-coverage claim amounts mints with both o
   assert.equal(Number(charged.mortgageeClaimAmount), 4000);
   // A None Optional inside a nested record comes back with the key ABSENT,
   // not as null -- unlike a None at template level, which is present and
-  // null. Found by this round's wire check, so assert the real shape.
+  // null. Found by a wire check, so assert the real shape.
   assert.equal(
     uncharged.mortgageeClaimAmount ?? null,
     null,
@@ -2744,7 +2743,7 @@ test('an activation grants no CanActAs to the policyholder, insured, mortgagee o
   );
 });
 
-// Stage 1 of the ledger-outage handling. Through an outage the
+// The ledger-outage handling. Through an outage the
 // dispatcher claims nothing, so a pending row stays pending instead of being
 // burned to `failed`, which the table's own trigger makes terminal.
 test('a failed ledger probe claims nothing, and the row runs once the ledger answers', async () => {
@@ -2778,7 +2777,7 @@ test('a failed ledger probe claims nothing, and the row runs once the ledger ans
   assert.ok(minted.daml_contract_id, 'the same row minted once the ledger answered');
 });
 
-// These three choices have existed since the termination round and have never
+// These three choices long existed without ever having
 // run against a policy that actually has a mortgagee -- every previous run
 // hit "there is no mortgagee on this policy to notify".
 test('the m. 1456 flows run end to end on a policy that has a mortgagee', async () => {
@@ -4538,7 +4537,7 @@ test('an unrecognized enforcement route is refused rather than stored', async ()
 // Frozen at module load, deliberately. A helper that re-reads the clock
 // returns a DIFFERENT instant for the same argument each call, so recording a
 // date and then asserting on it compares two values milliseconds apart -- the
-// same bug the v18 round hit with a per-site fix. Pinning the base fixes the
+// same bug an earlier test hit and fixed per site. Pinning the base fixes the
 // whole class.
 const INFO_BASE = Date.now();
 const infoDaysAgo = (n) => new Date(INFO_BASE - n * 86400000).toISOString();

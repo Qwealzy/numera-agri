@@ -1,13 +1,13 @@
 -- ============================================================================
--- Stage 3 Part 3: split the status axes (Part A), then endorsements (Part B).
+-- Split the status axes (part A), then endorsements (part B).
 --
 -- PART A. `policy_status` carried two orthogonal facts at once: the
 -- claim/term state (active, partially paid, ...) and the premium-default
 -- state (grace period, suspended). A policy can legitimately be BOTH
 -- partially paid AND in its grace period, which one column cannot express.
 --
--- The consequence was a real defect, found in live verification at the end
--- of Part 2, not by reading the code: a payout during the grace period
+-- The consequence was a real defect, found in live verification of the
+-- premium-default flow, not by reading the code: a payout during the grace period
 -- re-minted with status = 'partially_paid', erasing 'grace_period'.
 -- graceSweeper.js filtered on that same column, so it never saw the policy
 -- again and never suspended it -- while the premium was still unpaid -- and
@@ -59,12 +59,12 @@ UPDATE policies SET status = CASE
 
 CREATE INDEX idx_policies_default_state ON policies(default_state);
 
--- Part A: the notice idempotency key moves off "this policy has never had
+-- Part A (status axes): the notice idempotency key moves off "this policy has never had
 -- a notice row" and onto the default state. A policy that was reinstated
 -- (default_state back to 'none') must be able to receive a LATER notice --
 -- the old UNIQUE(policy_no) WHERE event_type = 'notice' index made a second
 -- default cycle impossible, which was flagged as a known limitation in
--- Part 2 and is fixed here.
+-- migration 009 and is fixed here.
 --
 -- What replaces it: a policy may have at most one notice/suspension/
 -- reinstatement row that is not yet terminal. Once a row reaches
@@ -85,14 +85,14 @@ CREATE UNIQUE INDEX idx_policy_events_reinstatement_key
   ON policy_events (policy_no)
   WHERE event_type = 'reinstatement' AND status IN ('pending', 'processing');
 
--- Part B: same in-flight-only shape for endorsements. A policy is amended
+-- Part B (endorsements): same in-flight-only shape for endorsements. A policy is amended
 -- many times over its life, so keying on (policy_no) alone would be wrong
 -- from the start here.
 CREATE UNIQUE INDEX idx_policy_events_endorsement_key
   ON policy_events (policy_no)
   WHERE event_type = 'endorsement' AND status IN ('pending', 'processing');
 
--- Part B: mirrors the token's own amendmentReason, written by the
+-- Part B (endorsements): mirrors the token's own amendmentReason, written by the
 -- dispatcher's handleEndorsement write-back. NULL on a policy that has
 -- never been endorsed. Reuses the endorsement_reason enum that has existed
 -- since migration 002.

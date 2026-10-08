@@ -1,5 +1,5 @@
 -- ============================================================================
--- Stage 3 Part 2: premium default, grace period, suspension, reinstatement.
+-- Premium default, grace period, suspension, reinstatement.
 --
 -- Three distinct states, not two: 'grace_period' (notice served, coverage
 -- continues in full) is a new status, added alongside the already-existing
@@ -21,7 +21,7 @@ ALTER TYPE policy_status ADD VALUE 'grace_period';
 ALTER TYPE event_type ADD VALUE 'suspension';
 ALTER TYPE event_type ADD VALUE 'reinstatement';
 
--- Change D: grace period is per-policy config, falling back to an
+-- The grace period is per-policy config, falling back to an
 -- insurer-level default -- never a hardcoded number anywhere. Nullable on
 -- both: a policy row may specify its own override at creation, and an
 -- insurer may have no default at all, in which case dispatch/dispatcher.js's
@@ -29,7 +29,7 @@ ALTER TYPE event_type ADD VALUE 'reinstatement';
 ALTER TABLE policies ADD COLUMN grace_period_days INTEGER;
 ALTER TABLE insurers ADD COLUMN default_grace_period_days INTEGER;
 
--- Mirrors of the two notice fields Stage 3 Part 2 added to the Daml token
+-- Mirrors of the two notice fields this change added to the Daml token
 -- (PolicyToken.noticeServiceDate/noticeRecordedAt) -- same "SQL mirrors
 -- what the ledger already holds, for querying without touching the ledger"
 -- principle as policies.expiry (migration 008). The grace-period sweeper

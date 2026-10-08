@@ -1,5 +1,5 @@
 -- ============================================================================
--- Stage 4: termination for non-payment (TTK 6102 m. 1434(3)).
+-- Termination for non-payment (TTK 6102 m. 1434(3)).
 --
 -- Replaces the suspension model, which was wrong on the statute. m. 1434(3):
 -- at the end of the notice period the contract is `feshedilmiş olur` --

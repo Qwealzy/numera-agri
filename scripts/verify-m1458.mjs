@@ -118,7 +118,7 @@ const PACKAGE = `\`${packageName}\` (id \`${process.env.DAML_PACKAGE_ID}\`)`;
 const out = [];
 const say = (s = '') => { out.push(s); console.log(s); };
 
-say('## 3m. Live verification run (v16 — retroactive cover)');
+say('## Live verification run (retroactive cover, m. 1458)');
 say('');
 say('Through the real HTTP API against the real participant, package');
 say(`${PACKAGE}.`);

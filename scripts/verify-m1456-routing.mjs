@@ -153,7 +153,7 @@ const PACKAGE = `\`${packageName}\` (id \`${process.env.DAML_PACKAGE_ID}\`)`;
 const out = [];
 const say = (s = '') => { out.push(s); console.log(s); };
 
-say('## 3n. Live verification run (v17 — payout routing to the mortgagee)');
+say('## Live verification run (payout routing to the mortgagee, m. 1456)');
 say('');
 say('Through the real HTTP API against the real participant, package');
 say(`${PACKAGE}. A -2 reading pays 25% of the remaining`);

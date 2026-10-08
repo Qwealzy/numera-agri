@@ -93,7 +93,7 @@ const out = [];
 const say = (s = '') => { out.push(s); console.log(s); };
 const short = (p) => String(p).split('::')[0].slice(0, 22);
 
-say('## 3o. Live verification run (v18 — policyholder substitution, m. 1431(4))');
+say('## Live verification run (policyholder substitution, m. 1431(4))');
 say('');
 say('Through the real HTTP API against the real participant, package');
 say(`${PACKAGE}.`);

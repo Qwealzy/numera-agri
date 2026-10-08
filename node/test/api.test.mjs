@@ -1600,7 +1600,7 @@ test('every other reported instant sent as a bare date is 400, and nothing is qu
   }
 });
 
-// --- reading payouts (Stage 2 Part 3) ----------------------------------------
+// --- reading payouts ----------------------------------------
 //
 // The two GET endpoints the insurer pulls approved payouts from. They READ:
 // nothing here may leave a policy_events row behind. The rows they read are
@@ -2682,7 +2682,7 @@ test('story-data is 200 with its top-level keys, and writes nothing', async () =
   assert.equal(status, 200, text);
   assert.deepEqual(Object.keys(body).sort(), ['checkedAt', 'evaluations', 'header', 'payouts']);
   assert.deepEqual(Object.keys(body.header).sort(), ['dataSource', 'network', 'packageIdPrefix']);
-  assert.equal(body.header.network, 'Canton LocalNet, this machine');
+  assert.equal(body.header.network, 'Canton LocalNet (local test network)');
   assert.equal(body.header.packageIdPrefix.length, 12);
   // oracleBot.js marks its source STAND-IN; the label is read from there.
   assert.equal(body.header.dataSource.interim, true);

@@ -3,7 +3,7 @@ import { pool } from '../db.js';
 import { allocateParty, insurerEndpoint, oracleEndpoint, oracleIsOnItsOwnParticipant } from '../damlClient.js';
 
 // One-off admin CLI: onboard a new insurer client onto the platform.
-// This is the prerequisite step for Module 1 -- POST /api/v1/policies/:policyId/activate
+// This is the prerequisite step for minting -- POST /api/v1/policies/:policyId/activate
 // and /renew refuse to mint (and the lifecycle and payout reports refuse to
 // queue) until the insurer has an allocated Canton party.
 //
