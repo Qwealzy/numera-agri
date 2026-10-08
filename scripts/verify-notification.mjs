@@ -1,4 +1,4 @@
-// Live verification of the payout notification loop (Stage 2), driven through
+// Live verification of the payout notification loop, driven through
 // the real HTTP API against the real participant: approval -> signed webhook
 // -> the insurer's receiver reads the payout with its API key -> /settle ->
 // settled, with no human input. Then the receiver's half of idempotency: the
@@ -6,7 +6,7 @@
 //
 // The receiver is opened by this script, on 127.0.0.1, with the same checks
 // scripts/mock-insurer.mjs runs (scripts/lib/webhookVerify.mjs).
-// The standing rule: nothing goes to a real
+// By design, nothing goes to a real
 // insurer address. The demo insurer's webhook_url is pointed at the receiver
 // for the run and written back exactly as it was, in a finally, whatever
 // happens in between.
@@ -227,13 +227,13 @@ let failure = null;
 try {
   await pool.query('UPDATE insurers SET webhook_url = $1 WHERE id = $2', [receiverUrl, insurer.id]);
 
-  say('## Live verification run (Stage 2 — the payout notification loop)');
+  say('## Live verification run (the payout notification loop)');
   say('');
   say('Through the real HTTP API against the real participant, with the sender');
   say('running inside `npm start`. The receiver is this script\'s own, on');
   say('127.0.0.1, running the checks of scripts/lib/webhookVerify.mjs: the same');
   say('code scripts/mock-insurer.mjs runs. Invented data throughout; no real');
-  say('insurer address (the standing rule).');
+  say('insurer address (by design).');
   say('');
   say('```');
   say(`  demo insurer                = ${insurer.id}`);

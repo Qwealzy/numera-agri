@@ -280,8 +280,9 @@
         (n.deliveredAt ? ' · notified at ' + fmtTime(n.deliveredAt) : ''));
     }
     if (!p.notifications.length) detail(d, 'Notification', null);
-    detail(d, 'Settled at (insurer-reported)', p.closure.settledAt && fmtTime(p.closure.settledAt));
-    detail(d, 'Closed at', p.closure.resolvedAt && fmtTime(p.closure.resolvedAt));
+    const closedUnpaid = p.closure.status === 'closed_unpaid';
+    if (!closedUnpaid) detail(d, 'Settled at (insurer-reported)', p.closure.settledAt && fmtTime(p.closure.settledAt));
+    if (!closedUnpaid || p.closure.resolvedAt) detail(d, 'Closed at', p.closure.resolvedAt && fmtTime(p.closure.resolvedAt));
     // Window CLOSED -> approved on the ledger. Nothing before the
     // first of those two instants is in it.
     detail(d, 'Pipeline time (window closed → approved)',
@@ -291,7 +292,7 @@
     return c;
   }
 
-  const OUTCOME_CLASS = { matched: 'out-matched', refused: 'out-refused' };
+  const OUTCOME_CLASS = { matched: 'out-matched', refused: 'out-refused', 'accepted, not recorded': 'out-refused' };
 
   // The second list: windows that were evaluated, whatever came of them. The
   // cards above are only the ones that paid, so without this a demo cannot

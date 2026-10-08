@@ -1,7 +1,7 @@
 // Does sql/schema.sql apply to an EMPTY database, and sql/seed.sql after it?
 //
-// The project requires it after every schema.sql edit, and schema.sql was
-// unrunnable from the initial commit until someone ran it. This is that run:
+// schema.sql must apply to an empty database after every edit; it once did
+// not, unnoticed until it was actually run. This is that run:
 // it creates a throwaway database, applies schema.sql and then seed.sql with
 // psql -v ON_ERROR_STOP=1, and fails if either step exits non-zero or writes
 // anything to stderr -- a NOTICE included. The throwaway is dropped on the way

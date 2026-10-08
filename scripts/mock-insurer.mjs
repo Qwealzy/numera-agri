@@ -1,9 +1,9 @@
-// A FAKE insurer on this machine: it receives payout notifications, checks
+// A FAKE insurer on the local machine: it receives payout notifications, checks
 // them the way the contract says a receiver must (scripts/lib/webhookVerify.mjs),
 // reads each new payout with the insurer's API key, and optionally reports it
-// settled. The standing rule: until the lawyer
-// answers, the demo posts only to a fake receiver on this machine, with
-// invented data. So this binds to 127.0.0.1 and nothing else.
+// settled. By design, until a legal review is complete the demo posts only
+// to a fake receiver on the local machine, with invented data. So this binds
+// to 127.0.0.1 and nothing else.
 //
 // Node built-ins and global fetch only; it is a separate process and shares
 // no code with the platform.

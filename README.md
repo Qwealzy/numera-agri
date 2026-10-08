@@ -4,11 +4,11 @@
 
 **Numera: parametric insurance payout infrastructure on Canton.** Parametric policies and their payouts are Daml contracts on Canton; the insurer is notified of each approved payout and pays through its own systems. Track 1.
 
-- **Disclosure.** The Daml contracts and the policy lifecycle existed before the hackathon, up to the tag `hackathon-baseline`. Everything after it is delivery-phase work, shown by `git diff hackathon-baseline HEAD` (this repository has two commits, so `git log hackathon-baseline..HEAD` shows only the one). Among others: the payout notification sender and its HMAC signature, with the `set-webhook` CLI; the insurer's read endpoints `GET /api/v1/payouts` and `GET /api/v1/payouts/:id`; the contract `docs/api/notifications-v1.openapi.json`, held by structural tests; a fake insurer receiver (`scripts/mock-insurer.mjs`) and `scripts/verify-notification.mjs`, run by `npm run verify-all`; the read-only story page `/debug/story`; this section, `LICENSE` and the tool that builds the public copy, which is not part of the copy itself. The Daml package changed in the delivery phase too: v22 added the `PayoutSettled` and `PayoutClosedUnpaid` records, linear payout tiers (`TS_Linear`) and the check that an event has ended on the ledger's clock before it is evaluated.
-- **AI disclosure.** Most of the code was written with Claude Code, under human direction. The development process records and the agent configuration are kept private and are not part of this repository.
+- **Disclosure.** The Daml contracts and the policy lifecycle existed before the hackathon, up to the tag `hackathon-baseline`. Everything after it is delivery-phase work, shown by `git diff hackathon-baseline HEAD` (this repository has three commits; `git log hackathon-baseline..HEAD` lists the two after the baseline). Among others: the payout notification sender and its HMAC signature, with the `set-webhook` CLI; the insurer's read endpoints `GET /api/v1/payouts` and `GET /api/v1/payouts/:id`; the contract `docs/api/notifications-v1.openapi.json`, held by structural tests; a fake insurer receiver (`scripts/mock-insurer.mjs`) and `scripts/verify-notification.mjs`, run by `npm run verify-all`; the read-only story page `/debug/story`; this section and `LICENSE`. The Daml package changed in the delivery phase too: v22 added the `PayoutSettled` and `PayoutClosedUnpaid` records, linear payout tiers (`TS_Linear`) and the check that an event has ended on the ledger's clock before it is evaluated.
+- **AI disclosure.** Most of the code was written with Claude Code, an AI coding assistant, under human direction. The development process records and the agent configuration are kept private and are not part of this repository.
 - **Honest status.** It runs end to end on a Canton LocalNet. The data source today is a temporary forecast service, not a measurement. The platform holds no funds and instructs no payments. Open legal questions are kept in the development process records, which are not part of this repository; nothing here claims legal or regulatory conformity.
-- **Public mirror.** This is a new git repository with exactly two commits, taken from a private development repository: a baseline commit holding the project as of 2026-09-18, tagged `hackathon-baseline`, and a submission commit holding it as of 2026-10-02. The history between them is not published. It holds only the product: the README, `LICENSE`, `multi-package.yaml`, the Daml packages and their tests, the Node service, the SQL, the API contract and the demo, verify and maintenance scripts. The development process records, the agent configuration, internal notes and the statute texts are not part of it; where the code or the documents mention them, they are not in this copy.
-- **Run it.** Setup below; on Windows the stack runs through WSL2 and Docker Desktop (see Setup and "Running on Windows with a Turkish system locale"). Demo, with `npm start` running in `node/`:
+- **Public mirror.** This is a new git repository with three commits, taken from a private development repository: a baseline commit holding the project as of 2026-09-18, tagged `hackathon-baseline`; a submission commit holding it as of 2026-10-02; and a final update of 2026-10-08 with the changes made since then and a documentation revision. The history between them is not published. It holds only the product: the README, `LICENSE`, `multi-package.yaml`, the Daml packages and their tests, the Node service, the SQL, the API contract and the demo, verify and maintenance scripts. The development process records, the agent configuration, internal notes and the statute texts are not part of it; where the code or the documents mention them, they are not in this copy.
+- **Run it.** Setup below; on Windows the stack runs through WSL2 and Docker Desktop (see Setup and "Running on Windows"). Demo, with `npm start` running in `node/`:
 
 ```bash
 cd node && npm run set-webhook -- <insurerId> http://127.0.0.1:9099/webhook   # prints the signing secret once
@@ -18,9 +18,11 @@ MOCK_INSURER_API_KEY=<insurer-api-key> MOCK_INSURER_WEBHOOK_SECRET=<secret-print
 # /debug (story page, roles page, dashboard) is off by default: DEBUG_ROUTES_ENABLED=true in node/.env turns it on
 ```
 
+  These addresses work after you run the stack on your own machine (see Setup). To see the system without installing it, watch the demo video: [Numera demo video](https://youtu.be/0npkRoUI_ZA).
+
 - **A recorded night.** Provider responses recorded by `scripts/recordProviderResponses.mjs` are replayed, with their recorded times, against a demo policy whose cover began before that night: the policy is made and its first premium reported paid before the first hour you record, the night is recorded, and the recording is replayed once the event window holding it has closed. Cover begins at the reported payment instant, which can be no later than now, and a reading from before cover began is stored but never folded into a window. Start the API with `CLIMATE_API_URL` empty, so the live oracle writes no reading to the demo cell and every reading shown is a replayed one (its source ends in `REPLAY(recorded …)`). The demo terms in `scripts/demo/` are synthetic. From `node/`, with `DEMO_INSURER_API_KEY` set to the demo insurer's key:
 
-  Give the demo an insurer of its own, and give that insurer's key to no verify script. `scripts/verify-notification.mjs` repoints the webhook address of whichever insurer its key names, for the length of its run, and every notification of that insurer still waiting for an address is delivered there while it is pointed away — which is how a demo payout's notification once left for a receiver that had nothing to do with the demo. `--demo-insurer-name` onboards one and gives it the key already in `DEMO_INSURER_API_KEY`; no key is printed or typed back. A freshly onboarded insurer has no `default_grace_period_days`: it is a legally constrained period with no default anywhere here, so the script stops until `--grace-period-days` supplies the value you want.
+  Give the demo an insurer of its own, and give that insurer's key to no verify script. `scripts/verify-notification.mjs` repoints the webhook address of whichever insurer its key names, for the length of its run, and every notification of that insurer still waiting for an address is delivered there while it is pointed away, so a demo payout's notification can reach a receiver that has nothing to do with the demo. `--demo-insurer-name` onboards one and gives it the key already in `DEMO_INSURER_API_KEY`; no key is printed or typed back. A freshly onboarded insurer has no `default_grace_period_days`: it is a legally constrained period with no default anywhere here, so the script stops until `--grace-period-days` supplies the value you want.
 
 ```bash
 # BEFORE the night. DEMO_INSURER_API_KEY holds a key you generated; --demo-insurer-name onboards the demo's own insurer under it
@@ -76,10 +78,10 @@ approved the insurer pays through its own systems and then *reports* the
 settlement back; the platform records what it was told. Canton is
 authorization and ledger-of-record only.
 
-For anything below in detail — how a single request moves through the whole
-stack, why each design decision was made, the live verification runs, and the
-known gaps — see the system walkthrough, which is not part of this copy.
-This file is the short version.
+This README is the short version. The detailed system walkthrough written
+during development (how a single request moves through the whole stack, why
+each design decision was made, the verification runs, and the known gaps) is
+not part of this repository.
 
 ## Layout
 
@@ -101,8 +103,8 @@ This file is the short version.
 | `node/src/routes/debug.js`, `node/public/` | Node.js | Read-only reconciliation dashboard (SQL mirror vs. the live ledger); `/debug/story`, one payout's steps from reading to closure, for the demo. Mounted only when `DEBUG_ROUTES_ENABLED=true` |
 | `node/public/konsol/` | Browser | Read-only insurer console prototype at `/konsol`: the insurer's own policies and payouts through the four GET endpoints, with the key it pastes (kept in sessionStorage). Not behind `DEBUG_ROUTES_ENABLED` |
 | `node/src/scripts/onboardInsurer.js` | Node.js | Admin CLI to onboard an insurer + allocate its two Parties |
-| `scripts/` | Node.js | One-off operational scripts — package-migration steps and live-verification runs. Kept in the repo rather than improvised per session, because every one of them has been needed twice |
-| `docs/` | — | The walkthrough, the package-migration runbook, and the legal cross-check (not part of this copy) |
+| `scripts/` | Node.js | Operational scripts — setup and schema checks, the demo, package-migration steps and verification runs against LocalNet. Kept in the repository rather than improvised, because each of them has been needed more than once |
+| `docs/api/` | — | OpenAPI contracts: `notifications-v1` (the payout and policy reads and the webhook) and `terms-v1` (the insurer's terms and payout tier sets) |
 
 ## API
 
@@ -234,9 +236,10 @@ source ~/.bashrc
 canton builder start                 # first run downloads images, ~5 min
 canton builder deploy daml/.daml/dist/insurance-tokenization-v22-1.0.0.dar
 # canton builder deploy's own JWT helper has a bug (base64 without -w 0
-# corrupts the token on longer payloads) that broke this for us -- if the
-# deploy 400s, POST the DAR to :3975/v2/packages and :2975/v2/packages
-# yourself with a correctly-generated HS256 token instead.
+# corrupts the token on longer payloads) that can break this step. If the
+# deploy answers 400, upload with `node scripts/uploadDar.mjs <dar>`, which
+# posts the DAR to :3975/v2/packages and :2975/v2/packages with a correctly
+# generated HS256 token.
 
 # 4. Node.js
 cd node
@@ -290,8 +293,8 @@ rebuild**, and a stale value produces contracts nothing can read.
 
 `DAML_JSON_API_URL_ORACLE` is the second participant, where the oracle
 operator parties are hosted and where the trigger is submitted. Leave it
-**empty** for the single-participant configuration this system ran on until
-now; nothing changes. Set it (LocalNet's App User participant is
+**empty** for the single-participant configuration (the default); nothing
+changes. Set it (LocalNet's App User participant is
 `http://localhost:2975`) and:
 
 - `npm run onboard-insurer` allocates the oracle party there and grants its
@@ -332,8 +335,9 @@ cd node && TEST_DAML_JSON_API_URL_ORACLE=http://localhost:2975 \
 
 ## Deploying a change to the Daml package
 
-Read the package-migration runbook (not part of this copy) before you do
-this. The short version, learned by burning three package names:
+The package-migration runbook written during development is not part of this
+repository. Its main points, each learned at the cost of a package name (three
+in all):
 
 - **A field or choice-signature change needs a package RENAME, not a version
   bump.** Daml's Smart Contract Upgrade check rejects renamed or removed
@@ -375,9 +379,9 @@ this. The short version, learned by burning three package names:
   `approved_at` mirrors the ledger's `PayoutApproved.approvedAt` rather than
   the SQL write time. The sender (`notifications/sender.js`, part of `npm
   start`) posts a signed thin envelope, loopback addresses only, with every
-  other field behind an authenticated GET (the standing rule of
-  2026-09-18); the only receivers so far are fake ones on
-  this machine (`scripts/mock-insurer.mjs`, `scripts/verify-notification.mjs`).
+  other field behind an authenticated GET; the only receivers so far are fake
+  ones on the local machine (`scripts/mock-insurer.mjs`,
+  `scripts/verify-notification.mjs`).
 - **One payout record, one contract, held together by a test.** Both GET
   endpoints return the same record, built by
   `notifications/payoutRecord.js` from an explicit whitelist; the webhook body
@@ -462,7 +466,7 @@ this. The short version, learned by burning three package names:
   source; changing a tier only affects a policy created, or a renewal
   requested, afterward.
 - **A reading that matches no tier pays nothing.** `sql/seed.sql` inserts only
-  the two tiers the brief specified, leaving −4 °C..−2 °C undefined; a reading
+  the two tiers the original product specification gave, leaving −4 °C..−2 °C undefined; a reading
   landing there fails closed until a row is added. That is intentional, rather
   than inventing an actuarial number.
 - **Minting records that the contract exists, not that cover began.**
@@ -605,8 +609,8 @@ this. The short version, learned by burning three package names:
 - **m. 1456(7) needed nothing built, and that is a finding.** m. 1416 is an
   addressing rule — notices go to the last address *notified to the insurer* —
   which allocates risk to the person who moved without saying so. It requires
-  nobody to hold an address, so the standing rule to hold none was never
-  in tension with it, and `mortgagee_notified_at` already records the only
+  nobody to hold an address, so the platform's rule of holding no address was
+  never in tension with it, and `mortgagee_notified_at` already records the only
   thing a non-insurer can honestly record.
 - **One party per person per insurer, across all three roles.** `mortgagee`
   and `beneficiary` resolve through the same registry as the policyholder, so
@@ -658,22 +662,20 @@ this. The short version, learned by burning three package names:
   database dump carries no signing secret and rotation is a version bump
   (`npm run set-webhook -- --rotate`); the CLI prints the secret once. The
   body is the thin envelope only. An address that is not loopback is marked
-  failed without a request unless `WEBHOOK_ALLOW_NON_LOOPBACK=true`: that
-  gate is the standing rule (2026-09-18: nothing to a real
-  insurer address before the lawyer answers) made
-  mechanical, not a network setting.
+  failed without a request unless `WEBHOOK_ALLOW_NON_LOOPBACK=true`. The
+  gate makes a project rule mechanical (nothing goes to a real insurer address
+  until a legal review is complete); it is not a network setting.
 
 ## Verification status
 
-The pipeline is **verified end to end against a running Canton LocalNet**, not merely reviewed: `dpm build
---all` and `dpm test` (SDK 3.5.1, 154 Script tests, counted from its raw output on
-2026-10-02) plus `npm test` (134 + 438 tests and the leak gate;
-the 5 two-participant tests among the 438 skip themselves without
-`TEST_DAML_JSON_API_URL_ORACLE`) and `npm run test:db` (161), counted on
-2026-10-02, under the v22
-package; `npm run
-verify-all` (7/7) was run on 2026-09-23 (UTC), after the v21 → v22 switch
-merged,
+The pipeline is **verified end to end against a running Canton LocalNet**, not
+merely reviewed: `dpm build --all` and `dpm test` (SDK 3.5.1, 154 Script tests,
+counted from its raw output on 2026-10-02) plus `npm test` (134 + 438 tests and
+the leak gate; the 5 two-participant tests among the 438 skip themselves
+without `TEST_DAML_JSON_API_URL_ORACLE`) and `npm run test:db` (161), counted on
+2026-10-02 on the code in this repository, under the v22 package (the update of
+2026-10-08 adds and removes no test); `npm run verify-all` (7/7) was run on
+2026-09-23 (UTC), after the switch from the v21 to the v22 package,
 against a real Canton Builder Tool LocalNet — Canton 3.4.12, Protocol Version
 34, via WSL2 + Docker Desktop — with real party allocation, real mints,
 partial-payout re-mints, endorsement, renewal, settlement, both branches of
@@ -685,8 +687,8 @@ end, all three m. 1457 attachment routing cases with a refused settlement, and
 the
 m. 1458 retroactive-cover check in all four of its outcomes — refused,
 passed on data, passed vacuously, not run — driven through the actual HTTP
-API with SQL persisted throughout. The runs are
-recorded in the system walkthrough (not part of this copy).
+API with SQL persisted throughout. The run records
+belong to the development records and are not part of this repository.
 Since 2026-09-18 `npm run verify-all` has run seven scripts, the
 seventh being `scripts/verify-notification.mjs`: approval → signed webhook to a loopback
 receiver → the record read with the insurer's API key → `/settle` → settled,
@@ -714,19 +716,18 @@ Fixed in code; worth knowing if you hit them on another network.
   or reads as: `allocateParty` calls `grantUserRights`
   (`POST /v2/users/{userId}/rights`, `CanActAs`) only when passed
   `grantActAs: true`, which the insurer and its oracle operator are. A
-  policyholder that is only an observer needs none: the 2026-09-11 wire
-  check minted, triggered and archived against an ungranted one, and only
+  policyholder that is only an observer needs none: a wire check minted, triggered and archived against an ungranted one, and only
   reading *as* it was refused, with a `403` ("A security-sensitive error has
   been received").
 - **A user is capped at 1000 rights.** Only the insurer and its oracle
   operator are granted a standing one; nothing in the running system revokes
   it, and the read-as right `/debug/roles-data` takes is revoked within the
-  request. Until a fix every
-  activation granted one to each role party it allocated, which is how a
-  development participant reached the cap. Since a later fix the test fixtures
-  give back the rights they take, so what accumulates now is each onboarded
-  insurer's pair and what a scale-measuring script kept outside this repository grants, which it does
-  not give back. A grant past the cap
+  request. Earlier versions
+  granted one to each role party an activation allocated, which is how a
+  development participant reached the cap. The test fixtures now give back
+  the rights they take, so what accumulates is each onboarded insurer's pair
+  and the rights a scale-measurement script (not part of this repository)
+  grants and does not give back. A grant past the cap
   fails with `TOO_MANY_USER_RIGHTS` -- onboarding an insurer or the dispatcher
   test's fixture, not a mint, which grants nothing. Revoke with
   `PATCH /v2/users/{userId}/rights`; there is no `/rights/delete`.
@@ -748,9 +749,10 @@ Fixed in code; worth knowing if you hit them on another network.
 - Template addressing needs the raw package-id hash (`<hash>:<Module>:<Entity>`),
   not `#package-name:...`, which is PV35-only.
 
-### Running on Windows with a Turkish system locale
+### Running on Windows
 
-Two real gotchas, neither a bug in this codebase:
+With a Turkish (or other non-English) system locale, two known issues apply,
+neither caused by this codebase:
 
 - PostgreSQL's Windows `initdb` rejects the auto-detected locale name
   (`Turkish_Türkiye.1254` contains a non-ASCII `ü`) — force `--locale C` at
@@ -761,14 +763,14 @@ Two real gotchas, neither a bug in this codebase:
   `$env:JAVA_TOOL_OPTIONS = "-Duser.language=en -Duser.country=US"` before
   `dpm build` / `dpm test`. It does not persist across terminal windows.
 
-`dpm` also refuses to start when its working directory's path is very long
-("Dizin adı geçersiz" / "The directory name is invalid"). To build an
+On any Windows system, `dpm` refuses to start when its working directory's path
+is very long ("The directory name is invalid", shown in the system language). To build an
 isolated copy, put it under a short path such as `%TEMP%\insb`.
 
 ## Known limitations
 
-These come from a code review of the payout event loop made on 2026-09-18, and
-each was checked against the code again before it was written here.
+These come from a code review of the payout event loop; each was checked
+against the code again before it was listed here.
 
 - **The evidence shows that a record has not changed, not where it came from.**
   The oracle stores the bytes of the response it received and their SHA-256; the
@@ -797,7 +799,7 @@ each was checked against the code again before it was written here.
   reported (the full window is sent). The token itself moves its cover end only
   when the termination is recorded, so a caller that bypasses Node could still
   have such a trigger accepted until then. Moving the deadline onto the ledger
-  is left for v23.
+  is left for a later package version (v23).
 - **What a tier percentage applies to is chosen per coverage, with no
   default.** Each coverage names the remaining limit or the sum insured; either
   way a payout never exceeds the remaining limit. Coverages that existed before

@@ -16,9 +16,9 @@
 //      same insurer the verify scripts use. scripts/verify-notification.mjs
 //      repoints THAT insurer's webhook_url at its own receiver for the length
 //      of its run, and every notification of that insurer still waiting for an
-//      address is delivered there while it is pointed away -- which is how the
-//      demo's own payout notification left for a receiver that had nothing to
-//      do with the demo. A separate insurer, whose key the verify scripts are
+//      address is delivered there while it is pointed away, so a demo payout's
+//      notification could reach a receiver that has nothing to do with the
+//      demo. A separate insurer, whose key the verify scripts are
 //      never given, is not repointed at all.
 //   1. A second insurer ("outsider", for the roles page's fourth column): if no
 //      other insurer holds an allocated party, it is onboarded by running

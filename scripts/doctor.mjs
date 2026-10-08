@@ -20,7 +20,8 @@
 //   node scripts/doctor.mjs          the report; exit 2 if it stopped early
 //                                    (the checks after the one that threw did
 //                                    not run), else 1 if any line is FAIL
-//   node scripts/doctor.mjs --hook   the same report as SessionStart hook JSON,
+//   node scripts/doctor.mjs --hook   the same report wrapped as session-start
+//                                    hook JSON for an editor integration,
 //                                    always exit 0
 
 import fs from 'node:fs';
@@ -162,7 +163,7 @@ function checkEnv() {
     report('WARN', 'env', 'WEBHOOK_SIGNING_MASTER_KEY is empty: the notification sender does not start, and no payout notification is delivered');
   }
   if (env.WEBHOOK_ALLOW_NON_LOOPBACK === 'true') {
-    report('WARN', 'env', 'WEBHOOK_ALLOW_NON_LOOPBACK is true: the sender posts to addresses that are not loopback. The standing rule: nothing goes to a real insurer address before the lawyer answers');
+    report('WARN', 'env', 'WEBHOOK_ALLOW_NON_LOOPBACK is true: the sender posts to addresses that are not loopback. By design, nothing goes to a real insurer address until a legal review is complete');
   }
   if (env.DEBUG_ROUTES_ENABLED === 'true') {
     report('WARN', 'env', 'DEBUG_ROUTES_ENABLED is true: the /debug routes are mounted (party ids and contract payloads, no authentication, loopback only); off in any deployment');
@@ -636,8 +637,8 @@ function checkPackage() {
   } else if (env.DAML_PACKAGE_ID === id) {
     report('OK', 'daml', `DAML_PACKAGE_ID matches ${darName} (${id.slice(0, 12)}...)`);
   } else {
-    // The full id, because the fix is pasting it into node/.env -- which the
-    // agent may not edit -- and a package id is a public content hash.
+    // The full id, because the fix is pasting it into node/.env by hand --
+    // this script never edits it -- and a package id is a public content hash.
     report('FAIL', 'daml', `DAML_PACKAGE_ID ${env.DAML_PACKAGE_ID.slice(0, 12)}... is not ${darName}'s id; if ${darName} is the one deployed, set DAML_PACKAGE_ID=${id} in node/.env`);
   }
   const newestSource = newestMtime(path.join(ROOT, 'daml', 'daml'), '.daml');
